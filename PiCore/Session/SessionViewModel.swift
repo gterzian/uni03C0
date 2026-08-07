@@ -29,6 +29,12 @@ public final class SessionViewModel {
     public let cwd: URL
     public let controller: PiProcessController
 
+    /// AppKit-side hook: the transcript coordinator sets this and is called on
+    /// the main actor whenever `entries` has been mutated. The SwiftUI body
+    /// deliberately never reads `entries`, so a streamed delta does not touch
+    /// the SwiftUI graph at all — updates flow model → AppKit directly.
+    public var onTranscriptChange: (() -> Void)?
+
     private var eventTask: Task<Void, Never>?
     private var streamingEntryID: String?
 
@@ -96,6 +102,12 @@ public final class SessionViewModel {
         thinkingLevel = level
     }
 
+    /// Aborts the current agent operation — the in-flight LLM turn (including
+    /// thinking) and any running tool execution.
+    public func abort() async throws {
+        _ = try await controller.send(.abort())
+    }
+
     /// Reload = ask the running process what its own session file is, then
     /// `switch_session` to that same path (re-reads state from disk without
     /// restarting the process), then repopulate messages.
@@ -136,6 +148,7 @@ public final class SessionViewModel {
             return
         }
         rebuildEntries(from: payload.messages)
+        onTranscriptChange?()
     }
 
     // MARK: - Event folding
@@ -143,9 +156,7 @@ public final class SessionViewModel {
     private func fold(_ frame: RPCFrame) {
         switch frame.type {
         case "response":
-            break // matched responses consumed by send(); stray responses ignored
-
-        case "agent_start", "turn_start":
+            break // matched responses consumed by send(); stray responses ignored        case "agent_start", "turn_start":
             isStreaming = true
         case "agent_end", "turn_end", "agent_settled":
             isStreaming = false
@@ -182,6 +193,7 @@ public final class SessionViewModel {
         default:
             break // compaction/queue/extension events: not surfaced in v1
         }
+        onTranscriptChange?()
     }
 
     private func beginMessage(_ message: AgentMessage) {

@@ -2,42 +2,55 @@ import AppKit
 import PiCore
 import SwiftUI
 
-/// The transcript: an `NSTableView` (row virtualization + cell reuse) wrapped
-/// in `NSViewRepresentable`. This is the one deliberate AppKit component in
-/// the app, and it exists for three reasons (per the design):
+/// The transcript: an `NSTableView` wrapped in `NSViewRepresentable`.
 ///
-/// 1. Cost of rendering is a function of *visible row count*, never total
-///    transcript length — `heightOfRow` is only asked for visible rows.
-/// 2. A streaming delta on the last message invalidates only that row's
-///    height (`reconfigureItems`, not `reloadData`) — nothing below it
-///    re-measures or re-lays-out.
-/// 3. Scroll position is explicitly preserved unless the user was already at
-///    the bottom: `wasAtBottom` is captured *before* the snapshot is applied
-///    and `scrollToBottom()` happens *after*, in the completion handler.
+/// Deliberately NOT driven by SwiftUI re-renders — this is the whole point of
+/// the AppKit choice. The SwiftUI body never reads the transcript entries, so
+/// a streamed delta does not invalidate the SwiftUI graph at all. Updates flow
+/// model → coordinator directly: the view model calls `onTranscriptChange`,
+/// and the coordinator applies AppKit-native incremental operations:
+///
+/// - appended rows → `insertRows(at:withAnimation:)`
+/// - a row whose content changed in place (the streaming row, almost always)
+///   → reconfigure the visible cell + `noteHeightOfRows(withIndexesChanged:)`,
+///   which re-measures only that row — nothing below it re-lays-out
+/// - wholesale changes (session switch / history rebuild) → `reloadData()`
+///
+/// No diffable data source: on macOS its `reloadItems` degenerates to
+/// `reloadFromSnapshot → _reloadData`, a full re-tile + full height pass on
+/// every delta — the exact hot path the TUI profiled.
 struct TranscriptView: NSViewRepresentable {
-    let entries: [TranscriptEntry]
+    let viewModel: SessionViewModel
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        context.coordinator.makeScrollView()
+        context.coordinator.makeScrollView(viewModel: viewModel)
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        context.coordinator.apply(entries)
+        // The representable's inputs are stable (same viewModel reference);
+        // handle a window-value swap defensively.
+        if context.coordinator.viewModel !== viewModel {
+            context.coordinator.rebind(viewModel: viewModel)
+        }
     }
 }
 
 // MARK: - Coordinator
 
-final class Coordinator: NSObject, NSTableViewDelegate {
+final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
-    private var dataSource: NSTableViewDiffableDataSource<Int, String>!
     private let heights = HeightCache()
+    private var entries: [TranscriptEntry] = []
     private var known: [String: TranscriptEntry] = [:]
+    weak var viewModel: SessionViewModel?
+    private var isApplying = false
 
-    func makeScrollView() -> NSScrollView {
+    func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
+        self.viewModel = viewModel
+
         let tv = NSTableView()
         tv.headerView = nil
         tv.selectionHighlightStyle = .none
@@ -60,67 +73,126 @@ final class Coordinator: NSObject, NSTableViewDelegate {
 
         tableView = tv
         scrollView = sv
+        tv.dataSource = self
         tv.delegate = self
-        configureDataSource()
+
+        viewModel.onTranscriptChange = { [weak self] in
+            self?.applyModelChanges()
+        }
+        applyModelChanges() // initial state (usually empty; populate happens after)
+
         return sv
     }
 
-    private func configureDataSource() {
-        dataSource = NSTableViewDiffableDataSource<Int, String>(tableView: tableView) {
-            [weak self] tableView, _, _, id in
-            self?.makeCell(for: id, in: tableView) ?? NSView()
+    func rebind(viewModel: SessionViewModel) {
+        self.viewModel?.onTranscriptChange = nil
+        self.viewModel = viewModel
+        viewModel.onTranscriptChange = { [weak self] in
+            self?.applyModelChanges()
         }
+        applyModelChanges()
     }
 
-    // MARK: Applying snapshots
+    // MARK: - NSTableViewDataSource
 
-    func apply(_ entries: [TranscriptEntry]) {
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        entries.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard entries.indices.contains(row) else { return nil }
+        return makeCell(for: entries[row], in: tableView)
+    }
+
+    // MARK: - Model → table (main actor)
+
+    func applyModelChanges() {
+        guard let viewModel, !isApplying else { return }
+        isApplying = true
+        defer { isApplying = false }
+
+        let newEntries = viewModel.entries
+        guard newEntries != entries else { return }
+
         // Anchor state captured BEFORE the mutation.
         let wasAtBottom = scrollView.isNearBottom(threshold: 4)
+        let oldIDs = entries.map(\.id)
+        let newIDs = newEntries.map(\.id)
 
-        var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
-        snapshot.appendSections([0])
-        snapshot.appendItems(entries.map(\.id), toSection: 0)
+        // Our live flow is: appends + the last row mutating in place. A session
+        // switch replaces everything (different ids), which we treat as a full
+        // reload — rare, so the cost is fine.
+        var common = 0
+        while common < oldIDs.count, common < newIDs.count, oldIDs[common] == newIDs[common] {
+            common += 1
+        }
+        if common != oldIDs.count || newIDs.count < oldIDs.count {
+            applyFullReload(newEntries, wasAtBottom: wasAtBottom)
+            return
+        }
 
-        // Rows whose content changed in place (the streaming row, almost
-        // always) get reconfigured — not reloaded. This is what avoids a full
-        // relayout pass on every streamed delta.
-        var reconfigure: [String] = []
-        let ids = Set(entries.map(\.id))
-        for entry in entries {
-            if let old = known[entry.id] {
-                if old.kind != entry.kind {
-                    reconfigure.append(entry.id)
-                    heights.invalidate(entry.id)
-                }
-            } else {
+        // In-place content changes within the common prefix (the streaming row,
+        // tool-card state changes).
+        var changedRows = IndexSet()
+        for i in 0..<common {
+            let entry = newEntries[i]
+            if known[entry.id]?.kind != entry.kind {
+                changedRows.insert(i)
+                heights.invalidate(entry.id)
+                updateVisibleCell(at: i)
+            }
+            known[entry.id] = entry
+        }
+
+        // Appended rows.
+        if newIDs.count > oldIDs.count {
+            let range = oldIDs.count..<newIDs.count
+            for i in range {
+                known[newIDs[i]] = newEntries[i]
+                heights.invalidate(newIDs[i])
+            }
+            tableView.insertRows(at: IndexSet(integersIn: range), withAnimation: [])
+        }
+
+        // Height invalidation for the changed row(s) only — nothing below
+        // re-measures or re-lays-out.
+        if !changedRows.isEmpty {
+            tableView.noteHeightOfRows(withIndexesChanged: changedRows)
+        }
+
+        entries = newEntries
+        if wasAtBottom { scrollView.scrollToBottom() }
+    }
+
+    private func applyFullReload(_ newEntries: [TranscriptEntry], wasAtBottom: Bool) {
+        let newIDs = Set(newEntries.map(\.id))
+        for entry in newEntries {
+            if known[entry.id]?.kind != entry.kind {
                 heights.invalidate(entry.id)
             }
             known[entry.id] = entry
         }
-        for stale in known.keys where !ids.contains(stale) {
+        for stale in known.keys where !newIDs.contains(stale) {
             known.removeValue(forKey: stale)
         }
-        if !reconfigure.isEmpty {
-            // AppKit's diffable snapshots reload only the identified rows (the
-            // iOS `reconfigureItems` API doesn't exist on macOS); either way
-            // the untouched rows are not re-laid-out.
-            snapshot.reloadItems(reconfigure)
-        }
-
-        dataSource.apply(snapshot, animatingDifferences: false) { [weak self] in
-            guard let self, wasAtBottom else { return }
-            self.scrollView.scrollToBottom()
-        }
+        entries = newEntries
+        tableView.reloadData()
+        if wasAtBottom { scrollView.scrollToBottom() }
     }
 
-    // MARK: NSTableViewDelegate
+    private func updateVisibleCell(at row: Int) {
+        guard entries.indices.contains(row),
+              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
+        configure(cell, with: entries[row], in: tableView)
+    }
+
+    // MARK: - NSTableViewDelegate
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        guard let id = dataSource.itemIdentifier(forRow: row),
-              let entry = known[id] else { return 24 }
+        guard entries.indices.contains(row) else { return 24 }
+        let entry = entries[row]
         let width = max(tableView.bounds.width, 320)
-        return heights.height(for: id, width: width) {
+        return heights.height(for: entry.id, width: width) {
             entry.kind.measuredHeight(forWidth: width)
         }
     }
@@ -129,10 +201,9 @@ final class Coordinator: NSObject, NSTableViewDelegate {
         false // read-only transcript
     }
 
-    // MARK: Cells
+    // MARK: - Cells
 
-    private func makeCell(for id: String, in tableView: NSTableView) -> NSView {
-        guard let entry = known[id] else { return NSView() }
+    private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
         switch entry.kind {
         case .userMessage(let text):
             let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
@@ -149,6 +220,17 @@ final class Coordinator: NSObject, NSTableViewDelegate {
             view.identifier = .toolRow
             view.configure(card: card)
             return view
+        }
+    }
+
+    private func configure(_ cell: NSView, with entry: TranscriptEntry, in tableView: NSTableView) {
+        switch entry.kind {
+        case .userMessage(let text):
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false)
+        case .assistantMessage(let text, let thinking, let isStreaming):
+            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
+        case .toolCall(let card):
+            (cell as? ToolCallHostView)?.configure(card: card)
         }
     }
 }

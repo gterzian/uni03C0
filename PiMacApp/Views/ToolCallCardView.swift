@@ -50,9 +50,15 @@ struct ToolCallCardView: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if card.state == .running {
+                // Static indicator — deliberately no ProgressView: an animated
+                // spinner inside an NSHostingView keeps its (child) SwiftUI
+                // graph invalidating every frame for the whole tool run.
                 HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("running…").font(.caption).foregroundStyle(.secondary)
+                    Image(systemName: "circle.dotted")
+                        .font(.system(size: 10))
+                    Text("running…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }

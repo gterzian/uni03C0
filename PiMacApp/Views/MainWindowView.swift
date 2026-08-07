@@ -34,7 +34,7 @@ struct SessionView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let viewModel {
-                TranscriptView(entries: viewModel.entries)
+                TranscriptView(viewModel: viewModel)
                     .background(Color(nsColor: .textBackgroundColor))
 
                 Divider()
@@ -56,6 +56,9 @@ struct SessionView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let viewModel {
+                    if viewModel.isStreaming {
+                        stopButton(viewModel)
+                    }
                     reloadButton(viewModel)
                     modelMenu(viewModel)
                     thinkingMenu(viewModel)
@@ -114,6 +117,15 @@ struct SessionView: View {
     }
 
     // MARK: Toolbar
+
+    private func stopButton(_ vm: SessionViewModel) -> some View {
+        Button {
+            Task { try? await vm.abort() }
+        } label: {
+            Label("Stop", systemImage: "stop.fill")
+        }
+        .help("Abort the current operation (thinking + tool execution)")
+    }
 
     private func reloadButton(_ vm: SessionViewModel) -> some View {
         Button {
