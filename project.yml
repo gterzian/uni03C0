@@ -1,0 +1,68 @@
+name: PiNative
+options:
+  bundleIdPrefix: com.gterzian.pimac
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: "0.1.0"
+packages:
+  Subprocess:
+    url: https://github.com/swiftlang/swift-subprocess
+    from: "1.0.0"
+targets:
+  PiCore:
+    type: framework
+    platform: macOS
+    sources:
+      - PiCore
+    dependencies:
+      - package: Subprocess
+        product: Subprocess
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiCore
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        SKIP_INSTALL: YES
+  PiMacApp:
+    type: application
+    platform: macOS
+    sources:
+      - PiMacApp
+    dependencies:
+      - target: PiCore
+        embed: true
+      - package: Subprocess
+        product: Subprocess
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_CFBundleDisplayName: "Pi"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+  PiCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - PiCLI
+    dependencies:
+      - target: PiCore
+      - package: Subprocess
+        product: Subprocess
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiCLI
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)"
