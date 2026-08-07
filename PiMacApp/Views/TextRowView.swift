@@ -122,6 +122,17 @@ final class TextRowView: NSView {
         needsLayout = true
     }
 
+    /// The row height implied by this cell's own text layout (usedRect +
+    /// insets). The coordinator seeds the height cache from this so the table
+    /// never needs a separate CoreText measurement for visible streaming rows.
+    var contentHeight: CGFloat {
+        guard let container = textView.textContainer, let layoutManager = textView.layoutManager else {
+            return bounds.height
+        }
+        layoutManager.ensureLayout(for: container)
+        return layoutManager.usedRect(for: container).height + textView.textContainerInset.height * 2
+    }
+
     override func layout() {
         super.layout()
         guard let container = textView.textContainer, let layoutManager = textView.layoutManager else { return }

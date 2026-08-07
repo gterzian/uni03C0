@@ -12,9 +12,10 @@ struct PromptInputView: NSViewRepresentable {
     let cwd: URL
     let isEnabled: Bool
     let onSubmit: (String) -> Void
+    let onAbort: () -> Void
 
     func makeCoordinator() -> PromptCoordinator {
-        PromptCoordinator(cwd: cwd, onSubmit: onSubmit)
+        PromptCoordinator(cwd: cwd, onSubmit: onSubmit, onAbort: onAbort)
     }
 
     func makeNSView(context: Context) -> PromptContainerView {
@@ -95,6 +96,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var cwd: URL
     var isEnabled = true
     private let onSubmit: (String) -> Void
+    private let onAbort: () -> Void
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
@@ -102,9 +104,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     private var completionSelected = 0
     private var tokenStart: Int?
 
-    init(cwd: URL, onSubmit: @escaping (String) -> Void) {
+    init(cwd: URL, onSubmit: @escaping (String) -> Void, onAbort: @escaping () -> Void) {
         self.cwd = cwd
         self.onSubmit = onSubmit
+        self.onAbort = onAbort
     }
 
     func attach(container: PromptContainerView) {
@@ -163,7 +166,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
                 dismissCompletion()
                 return true
             }
-            return false
+            // Esc aborts the in-flight turn (thinking + tools); idle is a
+            // harmless no-op on the pi side.
+            onAbort()
+            return true
 
         default:
             return false

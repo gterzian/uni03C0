@@ -176,15 +176,23 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             appended = true
         }
 
+        // The user just sent a message: jump to the bottom so it (and the
+        // response) is visible, regardless of where the user had scrolled.
+        let appendedUserMessage = appended && {
+            if case .userMessage = newEntries[newEntries.count - 1].kind { return true }
+            return false
+        }()
+
         // Height invalidation for the changed row(s) only — nothing below
-        // re-measures or re-lays-out.
+        // re-measures or re-lays-out. (HeightCache was seeded from the cell's
+        // own layout in updateVisibleCell, so these re-queries hit the cache.)
         if !changedRows.isEmpty {
             tableView.noteHeightOfRows(withIndexesChanged: changedRows)
         }
 
         entries = newEntries
 
-        if wasAtBottom && (appended || !changedRows.isEmpty) {
+        if (wasAtBottom || appendedUserMessage) && (appended || !changedRows.isEmpty) {
             scheduleScrollToBottom()
         } else if !wasAtBottom {
             restoreOffset(previousOffset)
@@ -242,6 +250,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) {
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
         configure(cell, with: entry, in: tableView)
+        cell.layoutSubtreeIfNeeded()
+        // Reuse the cell's own layout for the row height instead of a separate
+        // CoreText measure: seed the height cache so noteHeightOfRows' internal
+        // re-queries (span cache + tile) hit instead of re-measuring the whole
+        // growing string — that duplicate measure was the 100%-CPU hot path.
+        if let textRow = cell as? TextRowView {
+            let width = max(tableView.bounds.width, 320)
+            heights.store(entry.id, width: width, height: textRow.contentHeight + 2)
+        }
     }
 
     // MARK: - NSTableViewDelegate
@@ -316,6 +333,13 @@ final class HeightCache {
 
     func invalidate(_ id: String) {
         cache.removeValue(forKey: id)
+    }
+
+    /// Pre-seeds the cache from an authoritative source (e.g. the visible
+    /// cell's own layout) so later `height(for:width:measure:)` calls hit
+    /// without running the measure closure.
+    func store(_ id: String, width: CGFloat, height: CGFloat) {
+        cache[id] = Entry(width: width, height: height)
     }
 }
 

@@ -42,7 +42,8 @@ struct SessionView: View {
                 PromptInputView(
                     cwd: cwd,
                     isEnabled: inputEnabled(viewModel),
-                    onSubmit: submit
+                    onSubmit: submit,
+                    onAbort: { Task { try? await viewModel.abort() } }
                 )
                 .frame(height: 104)
                 .padding(.horizontal, 12)
@@ -56,9 +57,7 @@ struct SessionView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let viewModel {
-                    if viewModel.isStreaming {
-                        stopButton(viewModel)
-                    }
+                    stopButton(viewModel)
                     reloadButton(viewModel)
                     modelMenu(viewModel)
                     thinkingMenu(viewModel)
@@ -118,13 +117,25 @@ struct SessionView: View {
 
     // MARK: Toolbar
 
+    /// Persistent stop button: spinner while a turn is in flight, disabled
+    /// when idle. Same action as Esc in the prompt bar.
     private func stopButton(_ vm: SessionViewModel) -> some View {
         Button {
             Task { try? await vm.abort() }
         } label: {
-            Label("Stop", systemImage: "stop.fill")
+            if vm.isStreaming {
+                Label {
+                    Text("Stop")
+                } icon: {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            } else {
+                Label("Stop", systemImage: "stop")
+            }
         }
-        .help("Abort the current operation (thinking + tool execution)")
+        .disabled(!vm.isStreaming)
+        .help("Abort the current operation (Esc)")
     }
 
     private func reloadButton(_ vm: SessionViewModel) -> some View {
