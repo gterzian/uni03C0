@@ -1,50 +1,22 @@
 import AppKit
 import PiCore
 
-/// Deterministic height measurement for transcript rows. Must stay in sync
-/// with how `TextRowView` / `ToolCallCardView` render. Cached per
-/// (id, width) in the transcript coordinator's `HeightCache`, so measurement
-/// runs once per genuine content change — never per frame.
+/// Deterministic height measurement for transcript rows, driven entirely by
+/// `TranscriptText` so measurement always matches rendering exactly. Cached per
+/// (id, width) in the transcript coordinator's `HeightCache`; the streaming
+/// row's entry is invalidated (at a throttled rate) as deltas arrive.
 extension TranscriptEntryKind {
     func measuredHeight(forWidth width: CGFloat) -> CGFloat {
         switch self {
         case .userMessage(let text):
-            return Self.textHeight(text, font: .systemFont(ofSize: 13), width: width, verticalInset: 12)
+            return TranscriptText.measuredHeight(text: text, thinking: nil, role: .user, isStreaming: false, width: width)
 
-        case .assistantMessage(let text, let thinking, _):
-            var height = Self.textHeight(text, font: .systemFont(ofSize: 13), width: width, verticalInset: 12)
-            if !thinking.isEmpty {
-                height += Self.textHeight(thinking, font: .systemFont(ofSize: 12), width: width - 16, verticalInset: 0) + 14
-            }
-            return max(height, 30)
+        case .assistantMessage(let text, let thinking, let isStreaming):
+            return TranscriptText.measuredHeight(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, width: width)
 
         case .toolCall(let card):
             return Self.toolCallHeight(card, width: width)
         }
-    }
-
-    /// Matches TextRowView: lineFragmentPadding 8 each side, textContainerInset
-    /// vertical `verticalInset` (6 top + 6 bottom = 12).
-    private static func textHeight(
-        _ text: String,
-        font: NSFont,
-        width: CGFloat,
-        verticalInset: CGFloat
-    ) -> CGFloat {
-        guard !text.isEmpty else { return verticalInset + font.pointSize }
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
-        paragraph.lineBreakMode = .byWordWrapping
-        let attributed = NSAttributedString(string: text, attributes: [
-            .font: font,
-            .paragraphStyle: paragraph,
-        ])
-        let usableWidth = max(width - 16, 60)
-        let bounds = attributed.boundingRect(
-            with: NSSize(width: usableWidth, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        )
-        return ceil(bounds.height) + verticalInset
     }
 
     /// Matches ToolCallCardView layout: header + args (≤2 lines) + output

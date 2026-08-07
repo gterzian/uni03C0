@@ -47,6 +47,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var known: [String: TranscriptEntry] = [:]
     weak var viewModel: SessionViewModel?
     private var isApplying = false
+    /// Throttle for streaming-row refreshes: deltas arrive far faster than the
+    /// eye needs. Re-measuring and re-laying the growing row is the dominant
+    /// cost while streaming, so coalesce to ~20Hz instead of every delta.
+    private let streamingRefreshInterval: TimeInterval = 0.05
+    private var lastStreamingRefresh: TimeInterval = 0
 
     func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
         self.viewModel = viewModel
@@ -132,16 +137,27 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
 
         // In-place content changes within the common prefix (the streaming row,
-        // tool-card state changes).
+        // tool-card state changes). Streaming rows are throttled: both the cell
+        // reconfigure and the height re-measure happen at ~20Hz, so each delta
+        // is O(1) work. Non-streaming changes (e.g. a tool card finishing) apply
+        // immediately.
         var changedRows = IndexSet()
+        let now = ProcessInfo.processInfo.systemUptime
+        let refreshDue = now - lastStreamingRefresh >= streamingRefreshInterval
         for i in 0..<common {
             let entry = newEntries[i]
             if known[entry.id]?.kind != entry.kind {
-                changedRows.insert(i)
-                heights.invalidate(entry.id)
-                updateVisibleCell(at: i)
+                known[entry.id] = entry
+                let isStreamingRow = entry.kind.isStreaming
+                if !isStreamingRow || refreshDue {
+                    changedRows.insert(i)
+                    heights.invalidate(entry.id)
+                    updateVisibleCell(at: i)
+                    if isStreamingRow { lastStreamingRefresh = now }
+                }
+            } else {
+                known[entry.id] = entry
             }
-            known[entry.id] = entry
         }
 
         // Appended rows.
