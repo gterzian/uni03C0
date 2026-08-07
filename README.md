@@ -1,9 +1,9 @@
-# π — native macOS client for the pi coding agent
+# uni03C0 — native macOS client for the pi coding agent
 
 A lightweight macOS client for the [pi coding agent](https://github.com/earendil-works/pi).
 It spawns `pi --mode rpc` as a subprocess and renders the conversation natively
 instead of running the terminal TUI. The point: a smooth, low-CPU way to work
-with an agent.
+with agents.
 
 ## Features
 
@@ -46,14 +46,12 @@ with an agent.
   decoding built on documented pi RPC behavior. Nothing spawns a real `pi`
   process or hits a live model.
 
-See `AGENTS.md` for the full architecture write-up.
-
 ## Requirements
 
 - macOS 26 (Tahoe), Xcode 26.x.
 - `pi` / `node` on PATH (global npm install) — the app spawns the same binary
   the TUI uses; nothing is bundled.
-- Auth is already set up in the terminal (`ANTHROPIC_API_KEY` / etc.); the app
+- Auth is already set up in the terminal; the app
   inherits it via the environment.
 
 ## Build & run from the repo
@@ -74,8 +72,7 @@ xcodebuild -project Client.xcodeproj -scheme Client -configuration Debug build
 open "$(find ~/Library/Developer/Xcode/DerivedData/Client-*/Build/Products/Debug -maxdepth 1 -name Client.app)"
 ```
 
-Tests (all deterministic, no real pi, no live model — responses are mocked
-from documented RPC shapes):
+Tests:
 
 ```bash
 xcodebuild -project Client.xcodeproj -scheme ClientTests test
@@ -85,7 +82,7 @@ xcodebuild -project Client.xcodeproj -scheme ClientTests test
 
 - **Startup**: opens the last project you selected, or a picker if you've never
   chosen one. A window spawns its pi subprocess only once a project is open.
-  A new session begins on DeepSeek V4 Flash with max thinking.
+  A new session begins by default on DeepSeek V4 Flash with max thinking.
 - **Prompt bar**: type a prompt, Return sends, Shift+Return = newline. Input is
   disabled while a turn is in flight. `Tab` completes paths against the local
   filesystem; multiple matches show a list (Tab/↑/↓ cycle, Return commits, Esc
@@ -96,29 +93,3 @@ xcodebuild -project Client.xcodeproj -scheme ClientTests test
   process), Resume (recent sessions + "View Full History…").
 - **Menu bar** (terminal icon): quick-prompt launcher.
 
-## Verified against pi 0.84.1
-
-Empirical corrections to the protocol assumptions:
-
-| Assumed | Reality |
-|---|---|
-| `prompt` with `"prompt"` key | `{"type":"prompt","message":"..."}` |
-| `switch_session` with `"path"` | `{"type":"switch_session","sessionPath":"..."}` |
-| `ready` frame at startup | none — the process is immediately ready |
-| `set_thinking_level` key | `{"type":"set_thinking_level","level":"low"}` |
-
-Context stats come from `get_session_stats`, which returns `contextUsage`
-(`{ tokens, contextWindow, percent }`).
-
-Session-format notes: tool results may arrive as separate messages with
-`role: "toolResult"` carrying `toolCallId`/`toolName`/`isError`; assistant
-tool-call blocks use `type: "toolCall"` with an `arguments` object (string JSON
-on some providers — the decoder handles both).
-
-## Known scope cuts
-
-- No auth handling, no bundling of node/pi, no packaging/signing/notarization.
-- Slash commands other than what the native menus expose are not surfaced.
-- Seatbelt sandboxing of the pi subprocess is not implemented.
-- `toolcall_*` deltas (assistant content streaming) are not rendered
-  separately; tool-call cards render from `tool_execution_*` events.
