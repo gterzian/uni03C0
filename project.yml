@@ -1,6 +1,6 @@
-name: PiNative
+name: Client
 options:
-  bundleIdPrefix: com.gterzian.pimac
+  bundleIdPrefix: com.gterzian.client
   deploymentTarget:
     macOS: "26.0"
   createIntermediateGroups: true
@@ -22,70 +22,70 @@ packages:
     url: https://github.com/swiftlang/swift-subprocess
     from: "1.0.0"
 targets:
-  PiCore:
+  Core:
     type: framework
     platform: macOS
     sources:
-      - PiCore
+      - Core
     dependencies:
       - package: Subprocess
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client.Core
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
-  PiMacApp:
+  Client:
     type: application
     platform: macOS
     sources:
-      - PiMacApp
+      - Client
     dependencies:
-      - target: PiCore
+      - target: Core
         embed: true
       - package: Subprocess
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
-        INFOPLIST_KEY_CFBundleDisplayName: "Pi"
+        INFOPLIST_KEY_CFBundleDisplayName: "π"
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
-  PiTests:
+  ClientTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - PiTests
+      - ClientTests
     dependencies:
-      - target: PiCore
+      - target: Core
       - package: Subprocess
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client.ClientTests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
 
 schemes:
-  PiMacApp:
+  Client:
     build:
       targets:
-        PiMacApp: all
+        Client: all
     run:
       config: Debug
     test:
       config: Debug
       targets:
-        - PiTests
-  PiTests:
+        - ClientTests
+  ClientTests:
     build:
       targets:
-        PiCore: all
-        PiTests: [test]
+        Core: all
+        ClientTests: [test]
     test:
       config: Debug
       targets:
-        - PiTests
+        - ClientTests

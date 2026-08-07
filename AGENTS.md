@@ -19,11 +19,45 @@ operation) is needed, say so and let the human run it.
 
 ## What this is
 
-**PiNative** is a native macOS client for the [`pi` coding
+**π (Client)** is a native macOS client for the [`pi` coding
 agent](https://github.com/earendil-works/pi). It spawns `pi --mode rpc` as a
 subprocess and renders the conversation natively (SwiftUI + AppKit) instead of
 running the terminal TUI. A SwiftUI shell with one deliberately hand-rolled
 AppKit piece: the transcript table.
+
+## Naming: no blanket prefixes
+
+The app is a client for a *coding agent*. Today that agent happens to be
+`pi` — the executable the app spawns and the RPC protocol it speaks — but the
+app's own concepts are **not** named after pi.
+
+A prefix that's applied to *everything* carries no information and is noise.
+Give each component a short, concrete name; don't spray a shared prefix over
+unrelated things.
+
+- **Targets/modules are short and unprefixed:** `Core` (framework),
+  `Client` (app), `ClientTests`. No `PiCore`/`AgentCore`, no `PiMacApp`.
+- **Internal types are concrete, not prefixed:** the process actor is
+  `ProcessController`, errors are `ProcessError`, client defaults are
+  `Defaults`. Don't reach for a `Core`/`Client`/`Agent` prefix just because a
+  name sounds generic — a concrete name is better than a prefixed one.
+- **`pi` appears only where the code actually talks to the binary or its
+  RPC protocol:** `pi --mode rpc`, `PiExecutable.resolve()`, `~/.pi`,
+  `get_messages`, `switch_session`. Saying "send `get_state` to pi" or "the
+  pi subprocess" is correct; naming *app* components after pi is not.
+- **Protocol types exchanged with pi keep the names pi's protocol uses**
+  (`AgentMessage`, `ContentBlock`, `RPCFrame`, `ModelInfo`, …). Those are not
+  app concepts — they're the wire format, so they follow its conventions.
+- **User-visible framing is neutral** — "agent"/"session"/"transcript" —
+  not "pi". The app is titled "π".
+
+## Defaults
+
+A fresh session starts on the client's chosen model and thinking level
+(`Defaults` in `Core`): **DeepSeek V4 Flash** (`deepseek` /
+`deepseek-v4-flash`) and **thinking = max**. Applied once at spawn by
+`SessionViewModel.applyDefaults()`, so resume/reload never override the user's
+choices for a running session.
 
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
@@ -32,19 +66,23 @@ parallel that it doesn't derive from the event stream.
 
 Three targets (see `project.yml`):
 
-- **PiCore** (framework, default *nonisolated*): the protocol + process layer
-  and the data side of the transcript. No AppKit.
-- **PiMacApp** (app, default *MainActor*): the SwiftUI shell + AppKit views.
-- **PiTests** (unit-test bundle, XCTest): unit tests for framing/request
-  encoding/store folding, plus live-pi integration tests that skip when pi
-  isn't installed. Run via `xcodebuild -scheme PiTests test`.
+- **Core** (framework, default *nonisolated*): the protocol + process
+  layer and the data side of the transcript. No AppKit.
+- **Client** (app, default *MainActor*): the SwiftUI shell + AppKit views.
+  Display name "π".
+- **ClientTests** (unit-test bundle, XCTest): deterministic unit tests for
+  framing/request encoding/store folding, plus mock-based response decoding
+  built on documented pi RPC behavior. Tests **never** spawn a real `pi`
+  process or hit a live model — pi's behavior is faked from its documented
+  protocol. Run via `xcodebuild -scheme ClientTests test`.
 
 Concurrency defaults are set per target in `project.yml`:
-`PiCore = nonisolated`, `PiMacApp = MainActor`, both Swift 6 strict concurrency.
+`Core = nonisolated`, `Client = MainActor`, both Swift 6 strict
+concurrency.
 
-### PiCore
+### Core
 
-- `PiProcessController` — an actor wrapping
+- `ProcessController` — an actor wrapping
   [`swift-subprocess`](https://github.com/swiftlang/swift-subprocess). Spawns
   `pi --mode rpc`, encodes outbound RPC commands, demuxes inbound frames by id
   (`response` frames resolve awaited sends; everything else is yielded on an
@@ -67,13 +105,17 @@ Concurrency defaults are set per target in `project.yml`:
 - `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
 - `PathCompletion` — filesystem path tab-completion for the prompt bar.
 
-### PiMacApp
+### Client
 
 - `MainWindowView` / `SessionView` — the per-project window. On startup it
   opens the **last selected project folder** (`AppState.shared.lastProject`,
   persisted to UserDefaults), or the picker if none has been chosen.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
+- `SessionStatusBar` — the thin bar under the prompt input: context-window
+  usage % on the left, and the **model** + **thinking level** pickers on the
+  right. These selectors live at the bottom (next to the input), not the
+  toolbar.
 - `TextRowView` / `ToolCallCardView` — cells.
 - `TranscriptText` — the single source of truth for styling **and**
   measurement, so measured height exactly matches rendered height.
@@ -130,23 +172,34 @@ Behavior details that matter:
 - **Height cache.** Keyed by `(id, width)`, seeded from the visible cell's
   layout (avoids a duplicate CoreText measure — that was the original 100%-CPU
   hot path). `noteHeightOfRows` queries hit the cache.
+- **Zero rendering when off-screen.** When the window is occluded, minimized,
+  or the app is hidden, the coordinator does **no** per-delta work: `applyModelChanges`
+  bails and only sets `needsCatchUp`. The store keeps folding off-main; on return
+  to the foreground one catch-up pass materializes the tail and refreshes the
+  streaming row. (Visibility = occlusion state + not minimized + not hidden.)
+- **Context % at the bottom.** `SessionViewModel.refreshContextStats()` polls
+  `get_session_stats` when a turn settles (and after load/reload) and surfaces
+  `contextUsage.percent` in the status bar under the prompt input.
 - **Session switch** is a `generation` bump → full `reloadData()` positioned at
   the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
 
 Validation notes: a `sample` during a long streaming turn should show the main
 thread mostly idle in the event loop (the per-tick work is confined to the
 streaming row); a large-context session should scroll smoothly and open
-instantly.
+instantly; streaming while the window is occluded should do no render work.
 
 ## Conventions
 
 - `project.yml` drives `xcodegen` — regenerate the project after adding/removing
   files: `xcodegen generate`.
-- Keep PiCore free of AppKit. Height measurement and rendering stay in
-  PiMacApp.
+- Keep Core free of AppKit. Height measurement and rendering stay in
+  Client.
+- Follow the naming rule above: app concepts use `Agent`/`Session`/`Transcript`/
+  `Client` stems, never `Pi`; `pi` only appears where the code actually talks
+  to the binary or its RPC.
 - Build/launch: `./run.sh` (generates the project, builds, opens the app).
 
 ## Design docs
 
 - `scratchpad/transcript-architecture.md` — the architecture write-up.
-- `scratchpad/pi-transcript-overview.md` — a plain-terms overview.
+- `scratchpad/transcript-overview.md` — a plain-terms overview.

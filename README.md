@@ -1,9 +1,9 @@
-# PiNative — native macOS client for the pi coding agent
+# π — native macOS client for the pi coding agent
 
 A lightweight macOS client for the [pi coding agent](https://github.com/earendil-works/pi).
 It spawns `pi --mode rpc` as a subprocess and renders the conversation natively
 instead of running the terminal TUI. The point: a smooth, low-CPU way to work
-with pi.
+with an agent.
 
 ## Features
 
@@ -17,24 +17,34 @@ with pi.
   - Streaming replies flow smoothly without bouncing, and you can scroll up to
     read while a turn is in flight (the view stops auto-following the moment
     you do).
+- **Zero rendering off-screen.** When the window is occluded, minimized, or the
+  app is hidden, the transcript does no per-tick work at all; it catches up in
+  one pass when you come back.
+- **Context length % in the status bar** under the prompt input, refreshed when
+  a turn settles.
+- **Model and thinking level pick right next to the input** at the bottom of
+  the window. A new session starts on **DeepSeek V4 Flash** with **max**
+  thinking.
 - **One pi subprocess per project window**, cwd = the project directory.
 - **Prompt bar** with Tab path completion (Shift+Return for a newline).
-- **Toolbar menus**: reload the session from disk, switch model, set thinking
-  level, resume a recent session (plus a full-history sheet).
+- **Toolbar menus**: reload the session from disk, resume a recent session
+  (plus a full-history sheet).
 - **Projects menu** and a menu-bar quick-prompt launcher.
 - **Resumes where you left off** — opens in the last selected project folder.
 
 ## Stack
 
-- **PiCore** (framework): `PiProcessController` actor on
+- **Core** (framework): `ProcessController` actor on
   [`swift-subprocess`](https://github.com/swiftlang/swift-subprocess), manual
   LF-only JSONL framing, RPC frame decoding, an off-main `TranscriptStore` that
   folds the event stream into rows, session listing, path completion. No AppKit.
-- **PiMacApp** (app): SwiftUI shell; the AppKit transcript
+- **Client** (app): SwiftUI shell; the AppKit transcript
   (`NSViewRepresentable` + `NSTableView` + a `Coordinator` that renders a
-  windowed slice of the store); AppKit prompt bar; toolbar menus.
-- **PiTests** (unit-test bundle): unit tests for framing, request encoding, and
-  transcript-store folding, plus live-pi integration tests.
+  windowed slice of the store); AppKit prompt bar; bottom status bar.
+- **ClientTests** (unit-test bundle): deterministic unit tests for framing,
+  request encoding, and transcript-store folding, plus mock-based response
+  decoding built on documented pi RPC behavior. Nothing spawns a real `pi`
+  process or hits a live model.
 
 See `AGENTS.md` for the full architecture write-up.
 
@@ -53,35 +63,37 @@ See `AGENTS.md` for the full architecture write-up.
 ./run.sh
 
 # Or by hand:
-xcodegen generate                     # project.yml -> PiNative.xcodeproj
-open PiNative.xcodeproj               # run the PiMacApp scheme
+xcodegen generate                     # project.yml -> Client.xcodeproj
+open Client.xcodeproj            # run the Client scheme
 ```
 
 Headless build + launch:
 
 ```bash
-xcodebuild -project PiNative.xcodeproj -scheme PiMacApp -configuration Debug build
-open "$(find ~/Library/Developer/Xcode/DerivedData/PiNative-*/Build/Products/Debug -maxdepth 1 -name PiMacApp.app)"
+xcodebuild -project Client.xcodeproj -scheme Client -configuration Debug build
+open "$(find ~/Library/Developer/Xcode/DerivedData/Client-*/Build/Products/Debug -maxdepth 1 -name Client.app)"
 ```
 
-Tests (unit + integration; integration spawns a real pi and skips if it's not
-installed):
+Tests (all deterministic, no real pi, no live model — responses are mocked
+from documented RPC shapes):
 
 ```bash
-xcodebuild -project PiNative.xcodeproj -scheme PiTests test
+xcodebuild -project Client.xcodeproj -scheme ClientTests test
 ```
 
 ## Usage
 
 - **Startup**: opens the last project you selected, or a picker if you've never
   chosen one. A window spawns its pi subprocess only once a project is open.
+  A new session begins on DeepSeek V4 Flash with max thinking.
 - **Prompt bar**: type a prompt, Return sends, Shift+Return = newline. Input is
   disabled while a turn is in flight. `Tab` completes paths against the local
   filesystem; multiple matches show a list (Tab/↑/↓ cycle, Return commits, Esc
   dismisses).
+- **Status bar** (under the prompt): context-window usage % on the left; the
+  model and thinking-level pickers on the right.
 - **Toolbar**: Reload (re-reads the session from disk without restarting the
-  process), Model and Thinking menus, Resume (recent sessions +
-  "View Full History…").
+  process), Resume (recent sessions + "View Full History…").
 - **Menu bar** (terminal icon): quick-prompt launcher.
 
 ## Verified against pi 0.84.1
@@ -94,6 +106,9 @@ Empirical corrections to the protocol assumptions:
 | `switch_session` with `"path"` | `{"type":"switch_session","sessionPath":"..."}` |
 | `ready` frame at startup | none — the process is immediately ready |
 | `set_thinking_level` key | `{"type":"set_thinking_level","level":"low"}` |
+
+Context stats come from `get_session_stats`, which returns `contextUsage`
+(`{ tokens, contextWindow, percent }`).
 
 Session-format notes: tool results may arrive as separate messages with
 `role: "toolResult"` carrying `toolCallId`/`toolName`/`isError`; assistant
