@@ -184,7 +184,7 @@ public actor PiProcessController {
                 for try await buffer in execution.standardError {
                     for record in framer.feed(Data(buffer: buffer)) {
                         if let line = String(data: record, encoding: .utf8) {
-                            self.eventsContinuation.yield(self.syntheticFrame(type: "stderr", text: line))
+                                            self.eventsContinuation.yield(self.syntheticFrame(type: "stderr", text: line))
                         }
                     }
                 }

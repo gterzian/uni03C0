@@ -34,6 +34,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiCore
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
   PiMacApp:
     type: application
