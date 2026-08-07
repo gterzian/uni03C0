@@ -47,11 +47,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var known: [String: TranscriptEntry] = [:]
     weak var viewModel: SessionViewModel?
     private var isApplying = false
-    /// Throttle for streaming-row refreshes: deltas arrive far faster than the
-    /// eye needs. Re-measuring and re-laying the growing row is the dominant
-    /// cost while streaming, so coalesce to ~20Hz instead of every delta.
-    private let streamingRefreshInterval: TimeInterval = 0.05
-    private var lastStreamingRefresh: TimeInterval = 0
+    /// Throttle for in-place row refreshes (streaming text AND tool cards):
+    /// deltas arrive far faster than the eye needs, and each refresh is a full
+    /// CoreText re-measure + cell re-layout. Coalescing to ~20Hz keeps every
+    /// delta O(1) and leaves the main thread free to actually paint.
+    private let refreshInterval: TimeInterval = 0.05
+    private var lastRefresh: TimeInterval = 0
+    /// Coalesced async scroll-to-bottom (tile + scroll happen once per run-loop
+    /// turn at most, after the table has laid out).
+    private var scrollToBottomPending = false
 
     func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
         self.viewModel = viewModel
@@ -119,11 +123,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let newEntries = viewModel.entries
         guard newEntries != entries else { return }
 
-        // Anchor state captured BEFORE the mutation: whether the user was
-        // pinned to the bottom, and the exact scroll offset. After applying,
-        // either re-pin to the true bottom (flow along) or restore the offset
-        // exactly (sticky), whichever the user was doing.
-        let wasAtBottom = scrollView.isNearBottom(threshold: 4)
+        // Anchor state captured BEFORE the mutation. A pending coalesced scroll
+        // means the user is pinned even if the viewport hasn't landed yet.
+        var wasAtBottom = scrollView.isNearBottom(threshold: 4) || scrollToBottomPending
         let previousOffset = scrollView.contentView.bounds.origin
         let oldIDs = entries.map(\.id)
         let newIDs = newEntries.map(\.id)
@@ -141,30 +143,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
 
         // In-place content changes within the common prefix (the streaming row,
-        // tool-card state changes). Streaming rows are throttled: both the cell
-        // reconfigure and the height re-measure happen at ~20Hz, so each delta
-        // is O(1) work. Non-streaming changes (e.g. a tool card finishing) apply
-        // immediately.
+        // tool-card output). ALL of these are throttled to ~20Hz: each delta is
+        // O(1) work, and the cell re-layout + height re-measure run once per
+        // tick. Off-tick deltas just advance the model.
         var changedRows = IndexSet()
         let now = ProcessInfo.processInfo.systemUptime
-        let refreshDue = now - lastStreamingRefresh >= streamingRefreshInterval
+        let refreshDue = now - lastRefresh >= refreshInterval
         for i in 0..<common {
             let entry = newEntries[i]
             if known[entry.id]?.kind != entry.kind {
                 known[entry.id] = entry
-                let isStreamingRow = entry.kind.isStreaming
-                if !isStreamingRow || refreshDue {
+                if refreshDue {
                     changedRows.insert(i)
                     heights.invalidate(entry.id)
-                    updateVisibleCell(at: i)
-                    if isStreamingRow { lastStreamingRefresh = now }
+                    updateVisibleCell(at: i, with: entry)
                 }
             } else {
                 known[entry.id] = entry
             }
         }
+        if refreshDue { lastRefresh = now }
 
-        // Appended rows.
+        // Appended rows (new messages / tool cards) — cheap, apply immediately.
+        var appended = false
         if newIDs.count > oldIDs.count {
             let range = oldIDs.count..<newIDs.count
             for i in range {
@@ -172,6 +173,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 heights.invalidate(newIDs[i])
             }
             tableView.insertRows(at: IndexSet(integersIn: range), withAnimation: [])
+            appended = true
         }
 
         // Height invalidation for the changed row(s) only — nothing below
@@ -181,30 +183,40 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
 
         entries = newEntries
-        restoreScroll(wasAtBottom: wasAtBottom, previousOffset: previousOffset)
+
+        if wasAtBottom && (appended || !changedRows.isEmpty) {
+            scheduleScrollToBottom()
+        } else if !wasAtBottom {
+            restoreOffset(previousOffset)
+        }
     }
 
     /// Sticky-or-follow scroll anchoring.
     ///
-    /// - If the user was at the bottom: force the table to recompute its
-    ///   document frame from the updated row heights (otherwise
-    ///   `documentView.frame.height` is stale and we under-scroll by the
-    ///   streaming row's growth, which silently un-pins the user), then scroll
-    ///   to the true bottom so the viewport flows along with new content.
-    /// - Otherwise: restore the exact previous offset, so reading position is
-    ///   preserved no matter what changed (append-only updates never shift it,
-    ///   but a session-switch reload might).
-    private func restoreScroll(wasAtBottom: Bool, previousOffset: CGPoint) {
-        if wasAtBottom {
-            tableView.tile()
-            scrollView.scrollToBottom()
-        } else {
-            let docHeight = scrollView.documentView?.frame.height ?? 0
-            let maxY = max(0, docHeight - scrollView.contentView.bounds.height)
-            let y = min(previousOffset.y, maxY)
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+    /// Follow: coalesce into a single async tile+scroll per run-loop turn, so
+    /// `documentView.frame.height` is current (after layout) and the viewport
+    /// lands exactly on the bottom — no under-scroll that silently un-pins the
+    /// user mid-stream, no per-delta tile.
+    ///
+    /// Sticky: restore the exact previous offset; append-only updates never
+    /// shift it, but a session-switch reload might.
+    private func scheduleScrollToBottom() {
+        guard !scrollToBottomPending else { return }
+        scrollToBottomPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scrollToBottomPending = false
+            self.tableView.tile()
+            self.scrollView.scrollToBottom()
         }
+    }
+
+    private func restoreOffset(_ offset: CGPoint) {
+        let docHeight = scrollView.documentView?.frame.height ?? 0
+        let maxY = max(0, docHeight - scrollView.contentView.bounds.height)
+        let y = min(offset.y, maxY)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private func applyFullReload(_ newEntries: [TranscriptEntry], wasAtBottom: Bool, previousOffset: CGPoint) {
@@ -220,13 +232,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
         entries = newEntries
         tableView.reloadData()
-        restoreScroll(wasAtBottom: wasAtBottom, previousOffset: previousOffset)
+        if wasAtBottom {
+            scheduleScrollToBottom()
+        } else {
+            restoreOffset(previousOffset)
+        }
     }
 
-    private func updateVisibleCell(at row: Int) {
-        guard entries.indices.contains(row),
-              let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
-        configure(cell, with: entries[row], in: tableView)
+    private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) {
+        guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
+        configure(cell, with: entry, in: tableView)
     }
 
     // MARK: - NSTableViewDelegate
