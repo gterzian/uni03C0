@@ -119,8 +119,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let newEntries = viewModel.entries
         guard newEntries != entries else { return }
 
-        // Anchor state captured BEFORE the mutation.
+        // Anchor state captured BEFORE the mutation: whether the user was
+        // pinned to the bottom, and the exact scroll offset. After applying,
+        // either re-pin to the true bottom (flow along) or restore the offset
+        // exactly (sticky), whichever the user was doing.
         let wasAtBottom = scrollView.isNearBottom(threshold: 4)
+        let previousOffset = scrollView.contentView.bounds.origin
         let oldIDs = entries.map(\.id)
         let newIDs = newEntries.map(\.id)
 
@@ -132,7 +136,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             common += 1
         }
         if common != oldIDs.count || newIDs.count < oldIDs.count {
-            applyFullReload(newEntries, wasAtBottom: wasAtBottom)
+            applyFullReload(newEntries, wasAtBottom: wasAtBottom, previousOffset: previousOffset)
             return
         }
 
@@ -177,10 +181,33 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
 
         entries = newEntries
-        if wasAtBottom { scrollView.scrollToBottom() }
+        restoreScroll(wasAtBottom: wasAtBottom, previousOffset: previousOffset)
     }
 
-    private func applyFullReload(_ newEntries: [TranscriptEntry], wasAtBottom: Bool) {
+    /// Sticky-or-follow scroll anchoring.
+    ///
+    /// - If the user was at the bottom: force the table to recompute its
+    ///   document frame from the updated row heights (otherwise
+    ///   `documentView.frame.height` is stale and we under-scroll by the
+    ///   streaming row's growth, which silently un-pins the user), then scroll
+    ///   to the true bottom so the viewport flows along with new content.
+    /// - Otherwise: restore the exact previous offset, so reading position is
+    ///   preserved no matter what changed (append-only updates never shift it,
+    ///   but a session-switch reload might).
+    private func restoreScroll(wasAtBottom: Bool, previousOffset: CGPoint) {
+        if wasAtBottom {
+            tableView.tile()
+            scrollView.scrollToBottom()
+        } else {
+            let docHeight = scrollView.documentView?.frame.height ?? 0
+            let maxY = max(0, docHeight - scrollView.contentView.bounds.height)
+            let y = min(previousOffset.y, maxY)
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
+    private func applyFullReload(_ newEntries: [TranscriptEntry], wasAtBottom: Bool, previousOffset: CGPoint) {
         let newIDs = Set(newEntries.map(\.id))
         for entry in newEntries {
             if known[entry.id]?.kind != entry.kind {
@@ -193,7 +220,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
         entries = newEntries
         tableView.reloadData()
-        if wasAtBottom { scrollView.scrollToBottom() }
+        restoreScroll(wasAtBottom: wasAtBottom, previousOffset: previousOffset)
     }
 
     private func updateVisibleCell(at row: Int) {
