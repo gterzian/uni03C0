@@ -49,6 +49,10 @@ xcodebuild -project PiNative.xcodeproj -scheme PiCLI -configuration Debug build
 
 ## Usage
 
+- **Startup**: the app opens a project *picker* and spawns nothing until you
+  explicitly choose a directory. macOS may restore the last window you had
+  open (only ever a project you explicitly chose). The menu-bar item is a
+  launcher, not a session — it starts pi only when you click a project.
 - **Projects** menu (main menu bar): set the projects root once ("Choose
   Projects Folder…"), then open a project window from the list. Windows are
   per-project: one `pi --mode rpc` subprocess each, cwd = project.
@@ -59,8 +63,9 @@ xcodebuild -project PiNative.xcodeproj -scheme PiCLI -configuration Debug build
 - **Toolbar**: Reload (get_state → switch_session to the same file — re-reads
   the session from disk without restarting the process), Model and Thinking
   menus (RPC `get_available_models` / `get_available_thinking_levels`), Resume
-  (recent `~/.pi/agent/sessions/--<project>--/` files → `switch_session`).
-- **Menu bar** (terminal icon): quick-prompt window reusing the same view.
+  (recent `~/.pi/agent/sessions/--<project>--/` files → `switch_session`,
+  plus "View Full History…" for the unbounded list).
+- **Menu bar** (terminal icon): quick-prompt launcher — last project + list.
 
 ## Verified against pi 0.84.1
 
@@ -73,6 +78,12 @@ Empirical corrections to the design doc:
 | `ready` frame at startup | none — process is immediately ready |
 | `set_thinking_level` key uncertain | `{"type":"set_thinking_level","level":"low"}` |
 | `reconfigureItems` on macOS | `reloadItems(_:)` (iOS-only API); reloads only the identified rows |
+
+Session-format notes from real sessions (deepseek / openai-completions
+provider): tool results arrive as separate messages with `role: "toolResult"`
+carrying `toolCallId`/`toolName`/`isError`; assistant tool-call content blocks
+use `type: "toolCall"` with an `arguments` object (string JSON on some
+providers — the decoder handles both).
 
 ## Known scope cuts (per design)
 

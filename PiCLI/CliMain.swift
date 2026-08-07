@@ -4,10 +4,91 @@ import PiCore
 /// Smoke test for the process/protocol layer (build order step 1):
 /// spawn `pi --mode rpc`, confirm a round-trip, then run one real prompt and
 /// print the event stream. No UI involved.
+/// Thread-safe-enough event accumulator for CLI diagnostics (single producer
+/// task, single consumer after termination).
+final class EventLog: @unchecked Sendable {
+    private var storage: [String] = []
+    func append(_ entry: String) { storage.append(entry) }
+    var values: [String] { storage }
+}
+
 @main
 struct PiCLITest {
     static func main() async {
         setbuf(stdout, nil)
+        let args = CommandLine.arguments
+        if let resumeIndex = args.firstIndex(of: "--resume"), args.indices.contains(resumeIndex + 1) {
+            await runResumeCheck(path: args[resumeIndex + 1])
+            exit(0)
+        }
+        await runSmokeTest()
+    }
+
+    /// Verifies the resume path against a real session file: switch_session to
+    /// it, pull messages, and validate that the decoder handles every content
+    /// shape in the file (including toolResult-role messages and string args).
+    static func runResumeCheck(path: String) async {
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let controller = PiProcessController(
+            executablePath: PiExecutable.resolve(),
+            arguments: ["--mode", "rpc"],
+            workingDirectory: cwd.path
+        )
+        let log = EventLog()
+        let eventTask = Task {
+            for try await frame in controller.events { log.append(frame.type) }
+        }
+        defer { eventTask.cancel() }
+
+        do {
+            await controller.start()
+            let switched = try await controller.send(.switchSession(path: path))
+            print("switch_session success=\(switched.success ?? false)")
+            let messages = try await controller.send(.getMessages())
+            guard let payload = messages.dataPayload(MessagesPayload.self) else {
+                print("RESUME CHECK FAILED: no messages payload")
+                exit(1)
+            }
+            var roles: [String: Int] = [:]
+            var blockTypes: [String: Int] = [:]
+            var stringArgs = 0
+            var parsedArgs = 0
+            var textBlocks = 0
+            for message in payload.messages {
+                roles[message.role, default: 0] += 1
+                for block in message.content ?? [] {
+                    blockTypes[block.type, default: 0] += 1
+                    if block.isToolCall {
+                        if case .string = block.toolArguments {
+                            stringArgs += 1
+                            let pretty = block.toolArgumentsPretty(maxChars: 120)
+                            if !pretty.isEmpty { parsedArgs += 1 }
+                        }
+                        if block.name == nil { print("  WARNING: tool call without name") }
+                    }
+                    if block.type == "text", !(block.text ?? "").isEmpty { textBlocks += 1 }
+                }
+            }
+            print("messages: \(payload.messages.count), roles: \(roles)")
+            print("block types: \(blockTypes)")
+            print("tool calls with string args: \(stringArgs), parsed OK: \(parsedArgs), text blocks: \(textBlocks)")
+            let toolResults = payload.messages.filter { $0.role == "toolResult" }.count
+            let toolCalls = payload.messages.flatMap { $0.content ?? [] }.filter { $0.isToolCall }.count
+            print("tool calls: \(toolCalls), toolResult messages: \(toolResults)")
+            await controller.terminate()
+            if payload.messages.count > 0 && blockTypes.keys.count > 0 {
+                print("RESUME CHECK PASSED")
+            } else {
+                print("RESUME CHECK FAILED: nothing decoded")
+                exit(1)
+            }
+        } catch {
+            print("RESUME CHECK FAILED: \(error)")
+            exit(1)
+        }
+    }
+
+    static func runSmokeTest() async {
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let controller = PiProcessController(
             executablePath: PiExecutable.resolve(),
@@ -15,14 +96,14 @@ struct PiCLITest {
             workingDirectory: cwd.path
         )
 
-        var eventLog: [String] = []
+        let log = EventLog()
         let eventTask = Task {
             do {
                 for try await frame in controller.events {
-                    eventLog.append(frame.type)
+                    log.append(frame.type)
                 }
             } catch {
-                eventLog.append("stream-error: \(error)")
+                log.append("stream-error: \(error)")
             }
         }
 
@@ -68,10 +149,10 @@ struct PiCLITest {
             await controller.terminate()
             await eventTask.value
 
-            print("event sequence: \(eventLog.joined(separator: " → "))")
+            print("event sequence: \(log.values.joined(separator: " → "))")
 
             let expected = ["agent_start", "turn_start", "message_start", "message_update", "message_end", "turn_end", "agent_end", "agent_settled"]
-            let got = Set(eventLog)
+            let got = Set(log.values)
             let missing = expected.filter { !got.contains($0) }
             if missing.isEmpty {
                 print("SMOKE TEST PASSED")

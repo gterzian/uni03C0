@@ -194,6 +194,11 @@ public final class SessionViewModel {
             if !text.isEmpty {
                 entries.append(TranscriptEntry(id: message.id ?? makeID("user"), kind: .userMessage(text: text)))
             }
+        } else if message.role == "toolResult" {
+            // openai-completions providers deliver tool results as separate
+            // messages; attach to the matching execution card.
+            let text = blocks.compactMap { $0.text }.joined(separator: "\n")
+            attachToolResult(id: message.toolCallId, name: message.toolName, text: text, failed: message.isError ?? false)
         } else if message.role == "assistant" {
             let text = blocks.filter { $0.type == "text" }.compactMap { $0.text }.joined(separator: "\n\n")
             let thinking = blocks.filter { $0.type == "thinking" }.compactMap { $0.thinking }.joined(separator: "\n")
@@ -270,6 +275,26 @@ public final class SessionViewModel {
         entries[index] = entry
     }
 
+    private func attachToolResult(id: String?, name: String?, text: String, failed: Bool) {
+        guard let id,
+              let index = entries.lastIndex(where: {
+                  if case .toolCall(let card) = $0.kind { return card.id == id }
+                  return false
+              }) else {
+            // No execution card yet (e.g. resumed history): create one.
+            if let id {
+                var card = ToolCallCard(id: id, toolName: name ?? "tool", arguments: "")
+                card.output = text
+                card.state = failed ? .failed : .done
+                entries.append(TranscriptEntry(id: id, kind: .toolCall(card: card)))
+            }
+            return
+        }
+        var entry = entries[index]
+        entry.attachToolOutput(text, failed: failed)
+        entries[index] = entry
+    }
+
     private func appendBashOutput(id: String?, delta: String) {
         if let id, let index = entries.lastIndex(where: { $0.id == id }) {
             var entry = entries[index]
@@ -342,13 +367,34 @@ public final class SessionViewModel {
                         let card = ToolCallCard(
                             id: cardID,
                             toolName: block.name ?? "tool",
-                            arguments: block.toolArguments?.prettyPrinted() ?? "",
+                            arguments: block.toolArgumentsPretty(),
                             state: .done
                         )
                         result.append(TranscriptEntry(id: cardID, kind: .toolCall(card: card)))
                         pendingToolCalls.append(cardID)
                     default:
                         break
+                    }
+                }
+            } else if message.role == "toolResult" {
+                // Attach the output to the matching tool-call card (by id).
+                let text = blocks.compactMap { $0.text }.joined(separator: "\n")
+                let failed = message.isError ?? false
+                if let id = message.toolCallId,
+                   let index = result.lastIndex(where: {
+                       if case .toolCall(let card) = $0.kind { return card.id == id }
+                       return false
+                   }) {
+                    result[index].attachToolOutput(text, failed: failed)
+                } else if !text.isEmpty {
+                    // No matching card (e.g. card ids differ across providers):
+                    // attach to the most recent tool call.
+                    if let last = pendingToolCalls.last,
+                       let index = result.lastIndex(where: {
+                           if case .toolCall(let card) = $0.kind { return card.id == last }
+                           return false
+                       }) {
+                        result[index].attachToolOutput(text, failed: failed)
                     }
                 }
             }

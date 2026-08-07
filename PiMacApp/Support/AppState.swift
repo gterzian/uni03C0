@@ -48,9 +48,10 @@ final class AppState {
         }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
     }
 
-    /// Where a new window defaults when no project is selected.
-    func defaultProject() -> URL {
-        lastProject ?? projectsRoot ?? FileManager.default.homeDirectoryForCurrentUser
+    /// Where a new window defaults when no project is selected: the last
+    /// explicitly opened project, or nil (the picker is shown, nothing spawns).
+    func defaultProject() -> URL? {
+        lastProject
     }
 
     /// Opens the directory picker; stores the result. Not sandboxed, so this

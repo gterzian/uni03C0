@@ -11,7 +11,9 @@
 		045725391EFA53A575EFBE3C /* RPCRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 135B4D1B753DC224555E8894 /* RPCRequest.swift */; };
 		088CF35373EC492FF33E8A0D /* PiCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA0F422EDE49252A55D6D9E1 /* PiCore.framework */; };
 		1711A04059A178BE82166E67 /* ToolCallCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C435E2F8DA2F0CCD33CF825 /* ToolCallCardView.swift */; };
+		19481FE252646929296395B2 /* SessionHistorySheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E52EA4FAD55F111E3FD5F07 /* SessionHistorySheet.swift */; };
 		1E20005CD3BCD9277205A771 /* TextRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 329DEDDA66BD2CFC68455CD7 /* TextRowView.swift */; };
+		20FDF47582938625A5CCF5C9 /* ProjectPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CE0795497871238B81C9CE8 /* ProjectPickerView.swift */; };
 		2266AE64D66881BDDFBBDB7B /* PiCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EA0F422EDE49252A55D6D9E1 /* PiCore.framework */; };
 		306AE2E7B934ADD26495306E /* Subprocess in Frameworks */ = {isa = PBXBuildFile; productRef = 02B6C8ACDD3D6AED8ABA231B /* Subprocess */; };
 		44D4EDC3B4F3607FE30BB84A /* PiProcessController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 720247DFC974ABAF5A25A499 /* PiProcessController.swift */; };
@@ -70,9 +72,11 @@
 /* Begin PBXFileReference section */
 		090FF221FE9438A502C38BE4 /* PromptInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PromptInputView.swift; sourceTree = "<group>"; };
 		0C435E2F8DA2F0CCD33CF825 /* ToolCallCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCallCardView.swift; sourceTree = "<group>"; };
+		0E52EA4FAD55F111E3FD5F07 /* SessionHistorySheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionHistorySheet.swift; sourceTree = "<group>"; };
 		135B4D1B753DC224555E8894 /* RPCRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCRequest.swift; sourceTree = "<group>"; };
 		198BE49713122BD5D296EF2B /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		1C9E1946C4B78E9E4E466ED0 /* PiMacApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PiMacApp.swift; sourceTree = "<group>"; };
+		1CE0795497871238B81C9CE8 /* ProjectPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectPickerView.swift; sourceTree = "<group>"; };
 		329DEDDA66BD2CFC68455CD7 /* TextRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextRowView.swift; sourceTree = "<group>"; };
 		3B37AD2A2E4CC0B0DDCC4132 /* QuickPromptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickPromptView.swift; sourceTree = "<group>"; };
 		3D8AB3567E3D8731BFE30FEF /* RPCFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCFrame.swift; sourceTree = "<group>"; };
@@ -184,8 +188,10 @@
 			isa = PBXGroup;
 			children = (
 				9BCA090986F82F163611C22A /* MainWindowView.swift */,
+				1CE0795497871238B81C9CE8 /* ProjectPickerView.swift */,
 				090FF221FE9438A502C38BE4 /* PromptInputView.swift */,
 				3B37AD2A2E4CC0B0DDCC4132 /* QuickPromptView.swift */,
+				0E52EA4FAD55F111E3FD5F07 /* SessionHistorySheet.swift */,
 				329DEDDA66BD2CFC68455CD7 /* TextRowView.swift */,
 				0C435E2F8DA2F0CCD33CF825 /* ToolCallCardView.swift */,
 				89176AAA700905C93B7F452C /* TranscriptEntry+Measurement.swift */,
@@ -362,8 +368,10 @@
 				BFC127D3DE857525BD44E1A5 /* AppStorage.swift in Sources */,
 				AA3C4B22EBC1A122075BC970 /* MainWindowView.swift in Sources */,
 				45B4DDB18BC052DD60F0E05B /* PiMacApp.swift in Sources */,
+				20FDF47582938625A5CCF5C9 /* ProjectPickerView.swift in Sources */,
 				BE5683D33E93DF6A11C9B33E /* PromptInputView.swift in Sources */,
 				5E1D1D20525B14E5BAF5001D /* QuickPromptView.swift in Sources */,
+				19481FE252646929296395B2 /* SessionHistorySheet.swift in Sources */,
 				1E20005CD3BCD9277205A771 /* TextRowView.swift in Sources */,
 				1711A04059A178BE82166E67 /* ToolCallCardView.swift in Sources */,
 				F9EFF4A7033922EF71F91585 /* TranscriptEntry+Measurement.swift in Sources */,

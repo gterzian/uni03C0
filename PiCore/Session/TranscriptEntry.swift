@@ -58,13 +58,13 @@ public struct ToolCallCard: Hashable, Sendable, Identifiable {
 public extension TranscriptEntry {
     /// Attaches tool-result output to a tool-call card (used when rebuilding
     /// history from `get_messages`, where tool results arrive as later
-    /// user-message content blocks).
-    mutating func attachToolOutput(_ text: String) {
+    /// user/toolResult messages).
+    mutating func attachToolOutput(_ text: String, failed: Bool = false) {
         guard case .toolCall(var card) = kind else { return }
         if !text.isEmpty {
             card.output = text
-            card.state = .done
         }
+        card.state = failed ? .failed : .done
         kind = .toolCall(card: card)
     }
 }

@@ -141,6 +141,11 @@ public struct AgentMessage: Codable, Sendable, Equatable {
     public var role: String
     public var content: [ContentBlock]?
     public var id: String?
+    /// openai-completions providers deliver tool results as separate messages
+    /// with role "toolResult" carrying the originating call's id/name.
+    public var toolCallId: String?
+    public var toolName: String?
+    public var isError: Bool?
     public var timestamp: Int64?
 }
 
@@ -166,6 +171,20 @@ public struct ContentBlock: Codable, Sendable, Equatable {
 
     public var toolArguments: JSONValue? {
         arguments ?? input
+    }
+
+    /// Arguments for display: `arguments`/`input` may be a JSON object or a
+    /// JSON-encoded string (openai-completions providers send a string).
+    public func toolArgumentsPretty(maxChars: Int = 2000) -> String {
+        guard let raw = toolArguments else { return "" }
+        if case .string(let s) = raw {
+            if let data = s.data(using: .utf8),
+               let parsed = try? JSONDecoder().decode(JSONValue.self, from: data) {
+                return parsed.prettyPrinted(maxChars: maxChars)
+            }
+            return String(s.prefix(maxChars))
+        }
+        return raw.prettyPrinted(maxChars: maxChars)
     }
 
     /// Extracts plain text from a tool_result content payload, which may be

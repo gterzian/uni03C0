@@ -2,14 +2,34 @@ import AppKit
 import PiCore
 import SwiftUI
 
-/// One project window: transcript (AppKit) + prompt bar (AppKit-backed for Tab
-/// completion) + toolbar menus bound to this window's session.
+/// One project window. With no project chosen (`project.cwd == nil`) shows a
+/// picker and spawns nothing; once a project is selected, creates the session.
 struct MainWindowView: View {
+    @Binding var project: ProjectRef
+
+    var body: some View {
+        Group {
+            if let cwd = project.cwd {
+                SessionView(cwd: cwd)
+            } else {
+                ProjectPickerView { url in
+                    AppState.shared.lastProject = url
+                    project = ProjectRef(cwd: url)
+                }
+            }
+        }
+    }
+}
+
+/// A live session for one project: transcript (AppKit) + prompt bar (AppKit-
+/// backed for Tab completion) + toolbar menus bound to this session.
+struct SessionView: View {
     let cwd: URL
 
     @State private var viewModel: SessionViewModel?
     @State private var recentSessions: [SessionListing.Summary] = []
     @State private var isSending = false
+    @State private var showingHistory = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -43,8 +63,13 @@ struct MainWindowView: View {
                 }
             }
         }
-        .task { await start() }
+        .task(id: cwd) { await start() }
         .onDisappear { tearDown() }
+        .sheet(isPresented: $showingHistory) {
+            if let viewModel {
+                SessionHistorySheet(cwd: cwd, viewModel: viewModel)
+            }
+        }
     }
 
     private func inputEnabled(_ vm: SessionViewModel) -> Bool {
@@ -61,6 +86,14 @@ struct MainWindowView: View {
     }
 
     private func start() async {
+        // The task restarts when `cwd` changes (picker -> project, or the
+        // window's value is replaced): stop any stale session first.
+        if let existing = viewModel, existing.cwd != cwd {
+            LiveSessions.unregister(existing.controller)
+            await existing.stop()
+            viewModel = nil
+        }
+        guard viewModel == nil else { return }
         let vm = SessionViewModel(cwd: cwd)
         viewModel = vm
         LiveSessions.register(vm.controller)
@@ -147,6 +180,7 @@ struct MainWindowView: View {
                 }
             }
             Divider()
+            Button("View Full History…") { showingHistory = true }
             Button("Refresh List") { reloadSessions() }
         } label: {
             Label("Resume", systemImage: "clock.arrow.circlepath")

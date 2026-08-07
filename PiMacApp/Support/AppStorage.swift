@@ -31,20 +31,20 @@ struct AppCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Window") {
-                openWindow(id: "main", value: ProjectRef(cwd: appState.defaultProject()))
+                openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: nil))
             }
             .keyboardShortcut("n", modifiers: .command)
         }
 
         CommandMenu("Projects") {
             Button("New Window") {
-                openWindow(id: "main", value: ProjectRef(cwd: appState.defaultProject()))
+                openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: nil))
             }
             Divider()
             ForEach(appState.projects, id: \.self) { project in
                 Button(project.lastPathComponent) {
                     appState.lastProject = project
-                    openWindow(id: "main", value: ProjectRef(cwd: project))
+                    openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: project))
                 }
             }
             Divider()
