@@ -49,9 +49,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client
+        PRODUCT_NAME: "uni03C0"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
-        INFOPLIST_KEY_CFBundleDisplayName: "π"
+        INFOPLIST_KEY_CFBundleDisplayName: "uni03C0"
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
   ClientTests:
     type: bundle.unit-test

@@ -2,6 +2,11 @@ import SwiftUI
 
 /// Shown when a window has no project chosen. Spawns nothing — no `pi`
 /// process, no session — until the user picks an explicit project directory.
+///
+/// The "projects folder" is the *top-level* folder for all the projects the
+/// agent may work on: every project folder inside it is accessible. It can be
+/// as small as a single project — the root folder itself can be used directly
+/// as the project.
 struct ProjectPickerView: View {
     let onSelect: (URL) -> Void
     @State private var appState = AppState.shared
@@ -11,17 +16,29 @@ struct ProjectPickerView: View {
             Image(systemName: "folder")
                 .font(.system(size: 42))
                 .foregroundStyle(.secondary)
-            Text("Choose a project")
+            Text("Choose a projects folder")
                 .font(.title2.weight(.semibold))
+
+            Text("This is the top-level folder for all the projects the agent can work on. Every project folder inside it is accessible — and it can be just one project if that's all you have.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 440)
 
             if let root = appState.projectsRoot {
                 Text(root.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
                 if appState.projects.isEmpty {
-                    Text("No project folders found in this directory.")
+                    Text("No project folders found inside this folder yet. Add a project folder to it, choose another folder, or use this folder itself as the project.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 440)
+                    Button("Use This Folder as the Project") {
+                        onSelect(root)
+                    }
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 2) {
@@ -47,14 +64,12 @@ struct ProjectPickerView: View {
                     }
                     .frame(maxHeight: 340)
                 }
+
                 Divider()
                 Button("Change Projects Folder…") {
                     appState.chooseProjectsRoot()
                 }
             } else {
-                Text("No projects folder set. Choose one to get started.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
                 Button("Choose Projects Folder…") {
                     appState.chooseProjectsRoot()
                 }

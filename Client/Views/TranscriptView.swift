@@ -55,12 +55,24 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private let heights = HeightCache()
     weak var viewModel: SessionViewModel?
     private var isApplying = false
-    /// Throttle for in-place row refreshes (streaming text AND tool cards):
-    /// deltas arrive far faster than the eye needs, and each refresh is a full
-    /// CoreText re-measure + cell re-layout. Coalescing to ~20Hz keeps every
-    /// delta O(1) and leaves the main thread free to actually paint.
-    private let refreshInterval: TimeInterval = 0.05
-    private var lastRefresh: TimeInterval = 0
+    /// Streaming batching: the tail row is refreshed at most every
+    /// `streamBatchInterval` seconds (a few words for a typical stream), and
+    /// the new chunk crossfades in. The interval is a HARD cap — a per-delta
+    /// word gate made fast streams re-layout the whole (possibly huge)
+    /// streaming row on nearly every delta, which is the 100%-CPU path in
+    /// samples.
+    private let streamBatchInterval: TimeInterval = 0.25
+    private var lastStreamedAt: TimeInterval = 0
+    /// The tail entry (by id) whose streaming content was last rendered, and
+    /// that content. Thinking streams on its own (empty text), so BOTH text
+    /// and thinking are compared when deciding whether a new chunk is big
+    /// enough to show — otherwise thinking deltas never trigger a refresh.
+    private var lastStreamedID: String?
+    private var lastStreamedContent: (text: String, thinking: String)?
+    /// Whether the last render was a streaming one — the flag flip to final
+    /// must re-render the cell even when the text is unchanged (otherwise the
+    /// old streaming version, caret included, blinks forever).
+    private var lastStreamedWasStreaming = false
     /// Coalesced async scroll-to-bottom (tile + scroll happen once per run-loop
     /// turn at most, after the table has laid out).
     private var scrollToBottomPending = false
@@ -111,7 +123,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
         self.viewModel = viewModel
 
-        let tv = NSTableView()
+        let tv = TranscriptTableView()
         tv.headerView = nil
         tv.selectionHighlightStyle = .none
         tv.usesAutomaticRowHeights = false // we own height, not AppKit layout
@@ -125,7 +137,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         column.width = 640
         tv.addTableColumn(column)
 
-        let sv = NSScrollView()
+        let sv = TranscriptScrollView()
         sv.documentView = tv
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
@@ -135,6 +147,19 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scrollView = sv
         tv.dataSource = self
         tv.delegate = self
+
+        // Arrow-Down jumps to the bottom of the conversation in one step (and
+        // re-engages following). Scrolling the transcript takes key focus so
+        // Down works right after a trackpad scroll — focus otherwise stays on
+        // the prompt bar.
+        tv.onArrowDown = { [weak self] in
+            self?.jumpToBottom()
+        }
+        sv.onUserScroll = { [weak self] in
+            guard let self, let window = self.tableView.window,
+                  window.firstResponder !== self.tableView else { return }
+            window.makeFirstResponder(self.tableView)
+        }
 
         // Fetch older history (and refresh the tail) on scroll.
         NotificationCenter.default.addObserver(
@@ -153,6 +178,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         nc.addObserver(self, selector: #selector(visibilityMayHaveChanged), name: NSWindow.didDeminiaturizeNotification, object: nil)
         nc.addObserver(self, selector: #selector(visibilityMayHaveChanged), name: NSApplication.didHideNotification, object: nil)
         nc.addObserver(self, selector: #selector(visibilityMayHaveChanged), name: NSApplication.didUnhideNotification, object: nil)
+
+        // Re-measure all rows when the user changes the font size (View menu).
+        nc.addObserver(self, selector: #selector(fontSizeDidChange), name: FontSettings.didChangeNotification, object: nil)
 
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
@@ -215,7 +243,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func applyModelChanges() {
         guard let viewModel, !isApplying else { return }
         // Zero rendering while off-screen: just record that work is pending.
-        guard isWindowVisible else {
+        // Visibility is re-queried fresh on every delta — occlusion
+        // notifications are asynchronous and can be missed (a background
+        // window covered by other windows), so a stale flag must never leave
+        // the per-delta render running while nothing is on screen.
+        let visible = isOnScreen()
+        isWindowVisible = visible
+        guard visible else {
             needsCatchUp = true
             return
         }
@@ -231,11 +265,22 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         let newCount = store.count
         var didAppend = false
+        var appendedStart = windowEnd
+
+        // The store is otherwise append-only; the only shrink is a turn-start
+        // placeholder dropped when a turn aborts before any message_start.
+        // reloadData is fine here — heights are cached and it's rare.
+        if newCount < windowEnd {
+            windowEnd = newCount
+            tableView.reloadData()
+            return
+        }
 
         // Materialize the newly streamed tail (cheap, O(added)). Inserting at
         // the end never shifts the rows above, so a scrolled-up viewport is
         // untouched.
         if newCount > windowEnd {
+            appendedStart = windowEnd
             let oldEnd = windowEnd
             windowEnd = newCount
             let tableRange = (oldEnd - windowStart)..<(newCount - windowStart)
@@ -250,9 +295,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         // Re-engage following when the user just sent a message, and jump them
         // to the bottom even if they were scrolled up (explicit send = they
-        // want to see the response).
+        // want to see the response). The echoed user message is followed by
+        // the turn-start placeholder row, so scan the whole appended range.
         let appendedUserMessage = didAppend && {
-            if let last = store.entry(at: newCount - 1), case .userMessage = last.kind { return true }
+            for i in appendedStart..<newCount {
+                if let entry = store.entry(at: i), case .userMessage = entry.kind { return true }
+            }
             return false
         }()
         if appendedUserMessage {
@@ -266,31 +314,97 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // scrolls up; re-engaged when they return to the bottom or send.
         guard isFollowing else { return }
 
-        // Throttled in-place refresh of the streaming row. We seed its cached
-        // height from the cell's own layout rather than invalidating it first
-        // (invalidation can make the row flicker between the cell-derived and
-        // the re-measured height on successive ticks), so the row only ever
-        // grows — never oscillates.
+        // Batched in-place refresh of streaming rows: a few words at a time,
+        // not every delta, crossfaded in. Tool cards are now created the
+        // moment the model starts writing a call, so the still-streaming
+        // assistant text is NOT always the last row — refresh the last
+        // streaming text row AND the tail row (a tool card / final message)
+        // separately. We seed each cached height from the cell's own layout
+        // rather than invalidating it first (invalidation can make the row
+        // flicker between the cell-derived and the re-measured height on
+        // successive ticks), so rows only ever grow — never oscillate.
         let now = ProcessInfo.processInfo.systemUptime
         var didRefresh = false
-        if now - lastRefresh >= refreshInterval {
-            lastRefresh = now
-            let lastRow = windowEnd - windowStart - 1
-            if let lastEntry = store.entry(at: windowEnd - 1) {
-                // Batch the height change and the follow-scroll into one
-                // display pass so AppKit renders only the final state (row
-                // grown + scrolled) — never the intermediate "row taller but
-                // not scrolled yet" frame that reads as a bounce.
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                if !updateVisibleCell(at: lastRow, with: lastEntry) {
-                    heights.invalidate(lastEntry.id)
-                }
-                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: lastRow))
-                followTail()
-                CATransaction.commit()
-                didRefresh = true
+        var rowsToRefresh = IndexSet()
+
+        // 1. The last streaming assistant row. Once the message settles it
+        // stays matched by `lastStreamedID`, so its final text is rendered
+        // even when it is no longer the tail.
+        var streamingRow = -1
+        var streamingEntry: TranscriptEntry?
+        for i in (windowStart..<windowEnd).reversed() {
+            if let e = store.entry(at: i), e.kind.isStreaming || e.id == lastStreamedID {
+                streamingRow = i - windowStart
+                streamingEntry = e
+                break
             }
+        }
+        if let streamingEntry, streamingRow >= 0,
+           case .assistantMessage(let text, let thinking, let isStreaming) = streamingEntry.kind {
+            var shouldRefresh = false
+            if lastStreamedID != streamingEntry.id {
+                // A new streaming message: show its first chunk immediately.
+                lastStreamedID = streamingEntry.id
+                lastStreamedContent = (text, thinking)
+                lastStreamedWasStreaming = isStreaming
+                shouldRefresh = true
+            } else if let last = lastStreamedContent,
+                      last.text != text || last.thinking != thinking || lastStreamedWasStreaming != isStreaming {
+                // The flag flip (streaming → final) MUST re-render even when
+                // the text is unchanged — otherwise the cell keeps the old
+                // streaming version with its blinking caret forever. Live
+                // content batches at the hard interval; final content renders
+                // immediately.
+                shouldRefresh = !isStreaming || now - lastStreamedAt >= streamBatchInterval
+            }
+            if shouldRefresh {
+                lastStreamedAt = now
+                lastStreamedContent = (text, thinking)
+                lastStreamedWasStreaming = isStreaming
+                rowsToRefresh.insert(streamingRow)
+            }
+        }
+
+        // 2. The tail row, when it isn't the streaming row above: a running
+        // tool card streams args/output; a finished one shows its final state.
+        let lastRow = windowEnd - windowStart - 1
+        if lastRow >= 0, lastRow != streamingRow,
+           let lastEntry = store.entry(at: windowEnd - 1) {
+            var shouldRefresh = false
+            if case .toolCall(let card) = lastEntry.kind {
+                if card.state != .running {
+                    // Tool finished: show the final state and output now.
+                    shouldRefresh = true
+                } else {
+                    // Running tool cards stream output like text; batch at the
+                    // same interval so bash output doesn't repaint per delta.
+                    shouldRefresh = now - lastStreamedAt >= streamBatchInterval
+                }
+            }
+            if shouldRefresh {
+                rowsToRefresh.insert(lastRow)
+            }
+        }
+
+        if !rowsToRefresh.isEmpty {
+            // Batch the height changes, the follow-scroll, and the fade into
+            // one display pass so AppKit renders only the final state (rows
+            // grown + scrolled) — never an intermediate "row taller but not
+            // scrolled yet" frame that reads as a bounce.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for row in rowsToRefresh {
+                let storeIndex = windowStart + row
+                if let entry = store.entry(at: storeIndex) {
+                    if !updateVisibleCell(at: row, with: entry) {
+                        heights.invalidate(entry.id)
+                    }
+                }
+            }
+            tableView.noteHeightOfRows(withIndexesChanged: rowsToRefresh)
+            followTail()
+            CATransaction.commit()
+            didRefresh = true
         }
 
         if didAppend && !didRefresh {
@@ -443,27 +557,44 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             heights.store(entry.id, width: width, height: textRow.contentHeight + 2)
             return true
         }
-        return true // non-text cells: heightOfRow recomputes cheaply via cache miss
+        // Tool cards: arguments/output grow in place while the call runs, so a
+        // height cached at insertion is stale after every content change —
+        // invalidate and let `heightOfRow` re-measure (expansion included).
+        heights.invalidate(entry.id)
+        return true // tool cells are reconfigured above; heights are re-measured
     }
 
     /// Recomputes whether the window is on screen. When it transitions from
     /// invisible → visible, performs a single catch-up render pass for anything
     /// that streamed while hidden.
     @objc private func visibilityMayHaveChanged() {
-        // Before the table has a window (during setup) we're on screen by
-        // definition.
+        let wasVisible = isWindowVisible
+        isWindowVisible = isOnScreen()
+        guard !wasVisible && isWindowVisible else { return }
+        // Single catch-up pass for anything that streamed while hidden.
+        needsCatchUp = false
+        applyModelChanges()
+    }
+
+    /// Whether the window is actually on screen: not app-hidden, not
+    /// miniaturized, and not completely occluded by other windows. Queried
+    /// fresh (never cached), so a missed occlusion notification can't leave
+    /// rendering running while nothing is visible.
+    private func isOnScreen() -> Bool {
         let window = tableView.window
         let appHidden = NSApp.isHidden
         let miniaturized = window?.isMiniaturized ?? false
         let occluded = !(window?.occlusionState.contains(.visible) ?? true)
-        let visible = !appHidden && !miniaturized && !occluded
-        let wasVisible = isWindowVisible
-        isWindowVisible = visible
+        return !appHidden && !miniaturized && !occluded
+    }
 
-        guard !wasVisible && visible else { return }
-        // Single catch-up pass for anything that streamed while hidden.
-        needsCatchUp = false
-        applyModelChanges()
+    /// Font size changed (View → Font Size): the height cache is keyed by
+    /// content+width, so it is stale now. Clear it and re-render all
+    /// materialized rows; heights and cells both read `TranscriptText`, so
+    /// measured and rendered sizes stay in sync.
+    @objc private func fontSizeDidChange() {
+        heights.clear()
+        tableView.reloadData()
     }
 
     /// Anchors the bottom of the last (streaming) row to the bottom of the
@@ -497,7 +628,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .toolCall(let card):
             let view = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
             view.identifier = .toolRow
-            view.configure(card: card)
+            view.configure(card: card) { [weak self] in
+                self?.toggleToolCard(card.id)
+            }
             return view
         }
     }
@@ -509,8 +642,42 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .assistantMessage(let text, let thinking, let isStreaming):
             (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
         case .toolCall(let card):
-            (cell as? ToolCallHostView)?.configure(card: card)
+            (cell as? ToolCallHostView)?.configure(card: card) { [weak self] in
+                self?.toggleToolCard(card.id)
+            }
         }
+    }
+
+    // MARK: - Streaming fade, arrow-down, tool-card expansion
+
+    /// Arrow-Down: jump to the tail in one step and re-engage following. The
+    /// tail row is refreshed first so content that grew while scrolled up
+    /// renders at its true height before the jump.
+    private func jumpToBottom() {
+        isFollowing = true
+        let lastRow = windowEnd - windowStart - 1
+        if lastRow >= 0, let lastEntry = viewModel?.store.entry(at: windowEnd - 1) {
+            if !updateVisibleCell(at: lastRow, with: lastEntry) {
+                heights.invalidate(lastEntry.id)
+            }
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: lastRow))
+        }
+        scheduleScrollToBottom()
+    }
+
+    /// Expand/collapse a tool card: flip the shared expansion registry (which
+    /// `toolCallHeight` reads), then re-measure just that row.
+    private func toggleToolCard(_ id: String) {
+        ToolCardExpansion.shared.toggle(id)
+        guard let store = viewModel?.store else { return }
+        var row: Int?
+        for i in windowStart..<windowEnd where store.entry(at: i)?.id == id {
+            row = i - windowStart
+            break
+        }
+        guard let row else { return }
+        heights.invalidate(id)
+        tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
     }
 }
 
@@ -541,11 +708,47 @@ final class HeightCache {
         cache.removeValue(forKey: id)
     }
 
+    /// Drops every cached height (e.g. after a font-size change).
+    func clear() {
+        cache.removeAll()
+    }
+
     /// Pre-seeds the cache from an authoritative source (e.g. the visible
     /// cell's own layout) so later `height(for:width:measure:)` calls hit
     /// without running the measure closure.
     func store(_ id: String, width: CGFloat, height: CGFloat) {
         cache[id] = Entry(width: width, height: height)
+    }
+}
+
+// MARK: - Transcript table
+
+/// The transcript table. Arrow-Down jumps to the bottom of the conversation in
+/// one step (rather than the default line-by-line key navigation), so a
+/// scrolled-up user gets back to the live tail with one keypress.
+final class TranscriptTableView: NSTableView {
+    var onArrowDown: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 125 { // Down arrow
+            onArrowDown?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+/// The transcript scroll view. `onUserScroll` fires only for real wheel
+/// events (never for programmatic follow-scrolls), so scrolling the transcript
+/// can take key focus for Arrow-Down without fighting the prompt bar.
+final class TranscriptScrollView: NSScrollView {
+    var onUserScroll: (() -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        onUserScroll?()
+        super.scrollWheel(with: event)
     }
 }
 

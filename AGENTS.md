@@ -19,7 +19,7 @@ operation) is needed, say so and let the human run it.
 
 ## What this is
 
-**π (Client)** is a native macOS client for the [`pi` coding
+**uni03C0 (Client)** is a native macOS client for the [`pi` coding
 agent](https://github.com/earendil-works/pi). It spawns `pi --mode rpc` as a
 subprocess and renders the conversation natively (SwiftUI + AppKit) instead of
 running the terminal TUI. A SwiftUI shell with one deliberately hand-rolled
@@ -49,7 +49,7 @@ unrelated things.
   (`AgentMessage`, `ContentBlock`, `RPCFrame`, `ModelInfo`, …). Those are not
   app concepts — they're the wire format, so they follow its conventions.
 - **User-visible framing is neutral** — "agent"/"session"/"transcript" —
-  not "pi". The app is titled "π".
+  not "pi". The app is titled "uni03C0".
 
 ## Defaults
 
@@ -69,7 +69,7 @@ Three targets (see `project.yml`):
 - **Core** (framework, default *nonisolated*): the protocol + process
   layer and the data side of the transcript. No AppKit.
 - **Client** (app, default *MainActor*): the SwiftUI shell + AppKit views.
-  Display name "π".
+  Display name "uni03C0".
 - **ClientTests** (unit-test bundle, XCTest): deterministic unit tests for
   framing/request encoding/store folding, plus mock-based response decoding
   built on documented pi RPC behavior. Tests **never** spawn a real `pi`
@@ -109,17 +109,33 @@ concurrency.
 
 - `MainWindowView` / `SessionView` — the per-project window. On startup it
   opens the **last selected project folder** (`AppState.shared.lastProject`,
-  persisted to UserDefaults), or the picker if none has been chosen.
+  persisted to UserDefaults), or the picker if none has been chosen. The
+  toolbar (top right) carries the session controls: Stop, Reload, the
+  **model** + **thinking level** pickers (current choice shown beside the
+  icon, a "choose model/thinking level" prompt until one is set), and Resume.
+  The **context-window usage %** sits at the leading edge of the toolbar.
+  Sending a prompt is disabled until both a model and a thinking level have
+  been chosen.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
-- `SessionStatusBar` — the thin bar under the prompt input: context-window
-  usage % on the left, and the **model** + **thinking level** pickers on the
-  right. These selectors live at the bottom (next to the input), not the
-  toolbar.
+- `SessionStatusBar` — removed. The model + thinking-level pickers and the
+  context-% reading live in the window toolbar (top edge), not in a bar under
+  the prompt input.
 - `TextRowView` / `ToolCallCardView` — cells.
 - `TranscriptText` — the single source of truth for styling **and**
   measurement, so measured height exactly matches rendered height.
-- `PromptInputView` — AppKit prompt bar with Tab path completion.
+- `PromptInputView` — AppKit prompt bar with Tab path completion. Enabled
+  whenever the session is connected (even while a turn is in flight):
+  pressing Return while the agent is working queues a **steering message**
+  instead of sending (the whole queue is flushed as ONE combined prompt when
+  the turn settles — never one turn per queued message, unlike the TUI). The
+  queued-steering banner above the bar lists every queued message, each with
+  an edit button (restores it into the input; Return re-queues the edited
+  version) and a delete button.
+- `FontSettings` / `FontSizeCommands` — app-wide conversation font size
+  (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
+  read it; the transcript coordinator observes the change, clears its height
+  cache, and re-measures, so heights always match the rendered font.
 - `SessionHistorySheet` — unbounded session list.
 - `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
   and subprocess cleanup on termination (every live child gets EOF on quit).
@@ -165,21 +181,36 @@ Behavior details that matter:
   fills the viewport, so the last visible row can still be the tail even when
   scrolled up.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
-  views). The streaming row's cached height is seeded from the cell's own
-  layout and only ever grows (never oscillates). The height change and the
-  follow-scroll are applied in one atomic `CATransaction` so AppKit renders
-  only the final state — content flows off the top instead of bouncing.
+  views). Streaming text is **batched** — the tail row updates at most every
+  0.25s or once ~20 new characters accumulate (a few words), never per
+  character-delta — and each batched chunk **crossfades in**, so the text
+  materializes in word groups instead of popping character by character. The
+  streaming row's cached height is seeded from the cell's own layout and only
+  ever grows (never oscillates). The height change and the follow-scroll are
+  applied in one atomic `CATransaction` so AppKit renders only the final
+  state — content flows off the top instead of bouncing. Tool cards stream
+  output with the same batching (their cached height is invalidated on every
+  update — content grows in place — so the card actually grows as output
+  arrives).
+- **Arrow-Down jumps to the tail.** The transcript table overrides Down-arrow
+  to scroll to the bottom in one step and re-engage following.
 - **Height cache.** Keyed by `(id, width)`, seeded from the visible cell's
   layout (avoids a duplicate CoreText measure — that was the original 100%-CPU
-  hot path). `noteHeightOfRows` queries hit the cache.
+  hot path). `noteHeightOfRows` queries hit the cache. Tool-card heights are
+  invalidated on every content update (they grow in place); text rows are
+  seeded from the cell and only invalidated on genuine change.
+- **Tool cards show their content, expandable.** Output previews at 30 lines
+  (args at 2), with a chevron button in the card header that expands to the
+  full content (the row re-measures via a shared expansion registry).
+  User messages are highlighted light-blue to stand out from assistant replies.
 - **Zero rendering when off-screen.** When the window is occluded, minimized,
   or the app is hidden, the coordinator does **no** per-delta work: `applyModelChanges`
   bails and only sets `needsCatchUp`. The store keeps folding off-main; on return
   to the foreground one catch-up pass materializes the tail and refreshes the
   streaming row. (Visibility = occlusion state + not minimized + not hidden.)
-- **Context % at the bottom.** `SessionViewModel.refreshContextStats()` polls
+- **Context % in the toolbar.** `SessionViewModel.refreshContextStats()` polls
   `get_session_stats` when a turn settles (and after load/reload) and surfaces
-  `contextUsage.percent` in the status bar under the prompt input.
+  `contextUsage.percent` at the leading edge of the toolbar.
 - **Session switch** is a `generation` bump → full `reloadData()` positioned at
   the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
 
@@ -203,3 +234,9 @@ instantly; streaming while the window is occluded should do no render work.
 
 - `scratchpad/transcript-architecture.md` — the architecture write-up.
 - `scratchpad/transcript-overview.md` — a plain-terms overview.
+
+## TODO
+
+- **Code-block copy button.** Fenced code blocks (```) in assistant messages
+  should offer a copy button to grab the whole block, shown only when the
+  block is part of the main response (not inside thinking traces).

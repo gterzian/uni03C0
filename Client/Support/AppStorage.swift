@@ -36,6 +36,10 @@ struct AppCommands: Commands {
             .keyboardShortcut("n", modifiers: .command)
         }
 
+        CommandMenu("View") {
+            FontSizeCommands()
+        }
+
         CommandMenu("Projects") {
             Button("New Window") {
                 openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: nil))

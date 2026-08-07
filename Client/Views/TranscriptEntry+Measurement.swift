@@ -1,5 +1,6 @@
 import AppKit
 import Core
+import SwiftUI
 
 /// Deterministic height measurement for transcript rows, driven entirely by
 /// `TranscriptText` so measurement always matches rendering exactly. Cached per
@@ -19,29 +20,37 @@ extension TranscriptEntryKind {
         }
     }
 
-    /// Matches ToolCallCardView layout: header + args (≤2 lines) + output
-    /// (≤12 lines) + padding.
+    /// Measures the real SwiftUI card layout via `NSHostingController`
+    /// `sizeThatFits` — the previous line-counting estimate drifted from the
+    /// actual 11pt monospaced layout and left whitespace whenever a card
+    /// expanded or collapsed.
     private static func toolCallHeight(_ card: ToolCallCard, width: CGFloat) -> CGFloat {
-        var height: CGFloat = 10 + 18 + 6 // padding + header + spacing
+        let view = AnyView(ToolCallCardView(
+            card: card,
+            isInitiallyExpanded: ToolCardExpansion.shared.isExpanded(card.id)
+        ))
+        let controller = NSHostingController(rootView: view)
+        let size = controller.sizeThatFits(in: NSSize(width: max(width, 320), height: .greatestFiniteMagnitude))
+        // Round up so the table never clips the last line.
+        return max(ceil(size.height), 44)
+    }
+}
 
-        if !card.arguments.isEmpty {
-            height += 15 + 6 // one arg line + spacing
+/// Shared expansion state for tool-call cards, keyed by card id. The card's
+/// expand button toggles it (through the coordinator, so the row re-measures);
+/// `toolCallHeight` reads it. Lives here because it only affects measurement
+/// and presentation, not the wire protocol.
+final class ToolCardExpansion {
+    static let shared = ToolCardExpansion()
+    private var expanded: Set<String> = []
+
+    func toggle(_ id: String) {
+        if expanded.contains(id) {
+            expanded.remove(id)
+        } else {
+            expanded.insert(id)
         }
-        if !card.output.isEmpty {
-            let lineHeight: CGFloat = 15
-            let lines = min(lineCount(card.output), 12)
-            height += CGFloat(lines) * lineHeight + 6
-        } else if card.state == .running {
-            height += 18 // placeholder "running…" row
-        }
-        return max(height + 10, 44)
     }
 
-    private static func lineCount(_ string: String) -> Int {
-        var count = 1
-        for scalar in string.unicodeScalars where scalar == "\n" {
-            count += 1
-        }
-        return count
-    }
+    func isExpanded(_ id: String) -> Bool { expanded.contains(id) }
 }

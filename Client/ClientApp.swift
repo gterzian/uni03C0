@@ -15,7 +15,7 @@ struct ClientApp: App {
     @State private var appState = AppState.shared
 
     var body: some Scene {
-        WindowGroup("π", id: SceneIDs.mainWindow, for: ProjectRef.self) { $project in
+        WindowGroup("uni03C0", id: SceneIDs.mainWindow, for: ProjectRef.self) { $project in
             MainWindowView(project: $project)
         } defaultValue: {
             // Start in the last project that was selected before shutdown, so
@@ -28,7 +28,7 @@ struct ClientApp: App {
             AppCommands()
         }
 
-        MenuBarExtra("π", systemImage: "terminal.fill") {
+        MenuBarExtra("uni03C0", systemImage: "terminal.fill") {
             QuickPromptView()
         }
         .menuBarExtraStyle(.window)

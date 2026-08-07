@@ -111,10 +111,31 @@ public final class SessionViewModel {
         switch frame.type {
         case "agent_start", "turn_start":
             isStreaming = true
-        case "agent_end", "turn_end", "agent_settled":
+        case "agent_end", "turn_end":
+            // turn_end also fires BETWEEN tool rounds inside one agent run —
+            // that is not the end of the work, so nothing is flushed here
+            // (flushing here raced pi and collapsed the queue).
             isStreaming = false
-            // A turn settled → usage is attached to the new assistant messages,
-            // so the context reading is now accurate. Refresh it.
+
+        case "agent_settled":
+            // The whole agent run settled. Flush any queued steering as ONE
+            // combined prompt (never one turn per message like the TUI) — or,
+            // after an abort, return it to the input for editing instead.
+            isStreaming = false
+            if abortReturnsQueuedSteering {
+                // The user aborted: don't flush queued steering as a new
+                // prompt — return it to the input for editing instead.
+                abortReturnsQueuedSteering = false
+                if !queuedSteering.isEmpty {
+                    let restored = queuedSteeringText
+                    queuedSteering = []
+                    onRestoreSteeringToInput?(restored)
+                }
+            } else {
+                await flushQueuedSteering()
+            }
+            // The new assistant messages carry the context reading, so the
+            // usage is now accurate.
             await refreshContextStats()
 
         case "thinking_level_changed":
@@ -136,12 +157,65 @@ public final class SessionViewModel {
 
     // MARK: - Commands
 
+    /// Set when an abort ends the turn: queued steering is returned to the
+    /// prompt input instead of being flushed as a new prompt.
+    private var abortReturnsQueuedSteering = false
+
+    /// Hook for the prompt bar: called with the joined queued steering when an
+    /// abort returns it to the input.
+    public var onRestoreSteeringToInput: ((String) -> Void)?
+
     public func sendPrompt(_ text: String) async throws {
+        abortReturnsQueuedSteering = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let response = try await controller.send(.prompt(message: trimmed))
         if response.success == false {
             throw ProcessError.commandFailed(response.error ?? "prompt rejected")
+        }
+    }
+
+    // MARK: - Steering (queued while a turn is in flight)
+
+    /// Steering messages queued while a turn is in flight. They are never sent
+    /// individually: when the turn settles, the whole queue is flushed as one
+    /// combined prompt (`flushQueuedSteering`), so the agent never starts one
+    /// turn per queued message.
+    public private(set) var queuedSteering: [String] = []
+
+    /// True while at least one steering message is queued — drives the banner
+    /// above the prompt bar.
+    public var hasQueuedSteering: Bool { !queuedSteering.isEmpty }
+
+    /// The queued steering, joined for display and for the single flush.
+    public var queuedSteeringText: String { queuedSteering.joined(separator: "\n\n") }
+
+    /// Queue a steering message (Return while a turn is in flight). It is held
+    /// until the turn settles, then sent as part of one combined prompt.
+    public func queueSteering(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        queuedSteering.append(trimmed)
+    }
+
+    /// Remove one queued steering message (the per-row edit/delete buttons on
+    /// the queued-steering banner).
+    public func removeQueuedSteering(at index: Int) {
+        guard queuedSteering.indices.contains(index) else { return }
+        queuedSteering.remove(at: index)
+    }
+
+    /// Sends all queued steering messages as one combined prompt. On failure
+    /// the combined text is kept so the next settle retries instead of losing
+    /// the user's steering.
+    private func flushQueuedSteering() async {
+        guard !queuedSteering.isEmpty else { return }
+        let combined = queuedSteeringText
+        queuedSteering = []
+        do {
+            try await sendPrompt(combined)
+        } catch {
+            queuedSteering = [combined]
         }
     }
 
@@ -162,6 +236,7 @@ public final class SessionViewModel {
     /// Aborts the current agent operation — the in-flight LLM turn (including
     /// thinking) and any running tool execution.
     public func abort() async throws {
+        abortReturnsQueuedSteering = true
         _ = try await controller.send(.abort())
     }
 

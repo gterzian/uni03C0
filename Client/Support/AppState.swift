@@ -62,7 +62,7 @@ final class AppState {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
-        panel.message = "Choose the folder that contains your projects"
+        panel.message = "Choose the top-level folder that contains all your projects. The agent gets access to every project folder inside it — it can be a single project."
         if panel.runModal() == .OK, let url = panel.url {
             projectsRoot = url
         }

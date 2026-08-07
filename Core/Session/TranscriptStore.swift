@@ -27,6 +27,13 @@ public final class TranscriptStore: @unchecked Sendable {
 
     // Live-streaming state (meaningless after a rebuild).
     private var streamingEntryID: String?
+    /// `toolcall_*` events carry a `contentIndex` but deltas don't repeat the
+    /// call id, so map contentIndex → call id while the model generates it.
+    private var toolCallIDsByContentIndex: [Int: String] = [:]
+    /// Id of the placeholder streaming row created on `turn_start` — immediate
+    /// feedback (a pulsing caret) during time-to-first-token, before the real
+    /// `message_start` has arrived.
+    private var turnStartPlaceholderID: String?
     private var counter: UInt64 = 0
 
     public init() {}
@@ -85,7 +92,10 @@ public final class TranscriptStore: @unchecked Sendable {
                 changed = true
             }
         case "message_update":
-            if let event = frame.decodeAssistantEvent() { applyAssistantEvent(event); changed = true }
+            if let event = frame.decodeAssistantEvent() { applyAssistantEvent(event, message: frame.decodeMessage()); changed = true }
+
+        case "agent_end", "turn_end":
+            changed = endTurnPlaceholderOrFinalize()
 
         case "tool_execution_start":
             if let start = frame.decodeToolStart() { beginToolCall(start); changed = true }
@@ -203,6 +213,8 @@ public final class TranscriptStore: @unchecked Sendable {
         _version &+= 1
         _generation &+= 1
         streamingEntryID = nil
+        toolCallIDsByContentIndex.removeAll()
+        turnStartPlaceholderID = nil
         lock.unlock()
         return true
     }
@@ -219,6 +231,10 @@ public final class TranscriptStore: @unchecked Sendable {
             if !text.isEmpty {
                 _entries.append(TranscriptEntry(id: message.id ?? makeID("user"), kind: .userMessage(text: text)))
             }
+            // The user's message is echoed at the start of the turn — reserve
+            // the response slot right below it so the client can show the
+            // pulsing caret during time-to-first-token.
+            beginTurnPlaceholder()
         } else if message.role == "toolResult" {
             // openai-completions providers deliver tool results as separate
             // messages; attach to the matching execution card.
@@ -228,12 +244,25 @@ public final class TranscriptStore: @unchecked Sendable {
             let text = blocks.filter { $0.type == "text" }.compactMap { $0.text }.joined(separator: "\n\n")
             let thinking = blocks.filter { $0.type == "thinking" }.compactMap { $0.thinking }.joined(separator: "\n")
             let id = message.id ?? makeID("assistant")
-            _entries.append(TranscriptEntry(id: id, kind: .assistantMessage(text: text, thinking: thinking, isStreaming: true)))
+            // Promote the turn-start placeholder (wherever it sits — always
+            // right below the echoed user message) to the real message, so no
+            // orphaned empty row is left blinking forever.
+            if let placeholder = turnStartPlaceholderID,
+               let index = _entries.lastIndex(where: { $0.id == placeholder }) {
+                _entries[index] = TranscriptEntry(id: id, kind: .assistantMessage(text: text, thinking: thinking, isStreaming: true))
+            } else {
+                _entries.append(TranscriptEntry(id: id, kind: .assistantMessage(text: text, thinking: thinking, isStreaming: true)))
+            }
             streamingEntryID = id
+            turnStartPlaceholderID = nil
         }
     }
 
-    private func applyAssistantEvent(_ event: AssistantMessageEvent) {
+    private func applyAssistantEvent(_ event: AssistantMessageEvent, message: AgentMessage?) {
+        if event.isToolCall {
+            applyToolCallStreamEvent(event, message: message)
+            return
+        }
         guard let id = streamingEntryID,
               let index = _entries.lastIndex(where: { $0.id == id }) else { return }
         var entry = _entries[index]
@@ -266,10 +295,101 @@ public final class TranscriptStore: @unchecked Sendable {
         entry.kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)
         _entries[index] = entry
         streamingEntryID = nil
+        toolCallIDsByContentIndex.removeAll()
+        turnStartPlaceholderID = nil
+    }
+
+    /// Reserves the response slot after the echoed user message: a placeholder
+    /// streaming row whose caret gives feedback during time-to-first-token,
+    /// promoted to the real message by `message_start` (assistant) or dropped
+    /// by the turn end.
+    private func beginTurnPlaceholder() {
+        // Never while an assistant message is already streaming (steering
+        // echoes mid-turn), and never two placeholders.
+        if _entries.contains(where: { $0.kind.isStreaming }) { return }
+        let id = makeID("turn-start")
+        turnStartPlaceholderID = id
+        _entries.append(TranscriptEntry(id: id, kind: .assistantMessage(text: "", thinking: "", isStreaming: true)))
+    }
+
+    /// The turn ended. If a placeholder never became a message (abort before
+    /// `message_start`, extension command), drop it; otherwise finalize any
+    /// assistant entry still marked streaming (abort mid-thinking).
+    private func endTurnPlaceholderOrFinalize() -> Bool {
+        if let placeholder = turnStartPlaceholderID,
+           let index = _entries.lastIndex(where: { $0.id == placeholder }) {
+            _entries.remove(at: index)
+            turnStartPlaceholderID = nil
+            return true
+        }
+        guard let index = _entries.lastIndex(where: { $0.kind.isStreaming }),
+              case .assistantMessage(let text, let thinking, _) = _entries[index].kind else { return false }
+        _entries[index].kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)
+        turnStartPlaceholderID = nil
+        return true
+    }
+
+    /// pi streams tool-call generation as `toolcall_start` / `toolcall_delta` /
+    /// `toolcall_end` assistant-message events, well BEFORE `tool_execution_start`
+    /// (which fires only once the tool actually begins running). Creating the
+    /// card here makes the call appear the moment the model starts writing it,
+    /// instead of after pi's message-finalization + tool-preparation handoff.
+    /// The frame's `message` carries the authoritative content block — some
+    /// providers omit id/name on the events, and without them the card would
+    /// get a fabricated id that `tool_execution_start` can't match, leaving a
+    /// duplicate "tool" card above the real one.
+    private func applyToolCallStreamEvent(_ event: AssistantMessageEvent, message: AgentMessage?) {
+        let contentIndex = event.contentIndex ?? -1
+        // The partial message's content block at the event's contentIndex is
+        // the source of truth for id/name (it exists from toolcall_start on).
+        let block: ContentBlock? = {
+            guard let content = message?.content, content.indices.contains(contentIndex) else { return nil }
+            return content[contentIndex].isToolCall ? content[contentIndex] : nil
+        }()
+        let callID = event.id ?? block?.id ?? toolCallIDsByContentIndex[contentIndex] ?? makeID("tool")
+        let callName = event.toolName ?? block?.name ?? "tool"
+        switch event.type {
+        case "toolcall_start":
+            toolCallIDsByContentIndex[contentIndex] = callID
+            if _entries.lastIndex(where: { $0.id == callID }) == nil {
+                _entries.append(TranscriptEntry(
+                    id: callID,
+                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: callName, arguments: ""))
+                ))
+            }
+        case "toolcall_delta":
+            guard let delta = event.delta,
+                  let index = _entries.lastIndex(where: { $0.id == callID }),
+                  case .toolCall(var card) = _entries[index].kind else { return }
+            card.arguments += delta
+            _entries[index].kind = .toolCall(card: card)
+        case "toolcall_end":
+            guard let index = _entries.lastIndex(where: { $0.id == callID }),
+                  case .toolCall(var card) = _entries[index].kind else { return }
+            if let block {
+                let pretty = block.toolArgumentsPretty()
+                if !pretty.isEmpty { card.arguments = pretty }
+                if card.toolName == "tool" { card.toolName = block.name ?? card.toolName }
+            }
+            _entries[index].kind = .toolCall(card: card)
+            toolCallIDsByContentIndex[contentIndex] = nil
+        default:
+            break
+        }
     }
 
     private func beginToolCall(_ start: ToolExecutionStart) {
         let id = start.toolCallId ?? makeID("tool")
+        if let index = _entries.lastIndex(where: { $0.id == id }),
+           case .toolCall(var card) = _entries[index].kind {
+            // The card already exists from the streamed toolcall_* events:
+            // swap in the final pretty-printed args, keep it running.
+            card.arguments = start.args?.prettyPrinted() ?? card.arguments
+            card.toolName = start.toolName ?? card.toolName
+            card.state = .running
+            _entries[index].kind = .toolCall(card: card)
+            return
+        }
         let card = ToolCallCard(
             id: id,
             toolName: start.toolName ?? "tool",

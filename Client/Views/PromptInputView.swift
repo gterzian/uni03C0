@@ -11,11 +11,16 @@ struct PromptInputView: NSViewRepresentable {
 
     let cwd: URL
     let isEnabled: Bool
+    let fontSize: CGFloat
+    /// Mirror of the input's text (kept in sync by `onDraftChange`), used to
+    /// restore queued steering into the input for editing.
+    let draft: String
+    let onDraftChange: (String) -> Void
     let onSubmit: (String) -> Void
     let onAbort: () -> Void
 
     func makeCoordinator() -> PromptCoordinator {
-        PromptCoordinator(cwd: cwd, onSubmit: onSubmit, onAbort: onAbort)
+        PromptCoordinator(cwd: cwd, onSubmit: onSubmit, onAbort: onAbort, onDraftChange: onDraftChange)
     }
 
     func makeNSView(context: Context) -> PromptContainerView {
@@ -30,6 +35,15 @@ struct PromptInputView: NSViewRepresentable {
         context.coordinator.isEnabled = isEnabled
         nsView.textView.isEditable = isEnabled
         nsView.textView.textColor = isEnabled ? .labelColor : .tertiaryLabelColor
+        if nsView.textView.font?.pointSize != fontSize {
+            nsView.textView.font = .systemFont(ofSize: fontSize)
+        }
+        // An external draft (e.g. "edit queued steering" restored the text)
+        // is applied only when it differs from what's already in the input, so
+        // typing — which mirrors into `draft` — never clobbers the draft.
+        if nsView.textView.string != draft {
+            context.coordinator.setText(draft, in: nsView)
+        }
     }
 }
 
@@ -63,6 +77,7 @@ final class PromptContainerView: NSView {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
         textView.font = .systemFont(ofSize: 13)
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
 
@@ -97,6 +112,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var isEnabled = true
     private let onSubmit: (String) -> Void
     private let onAbort: () -> Void
+    private let onDraftChange: (String) -> Void
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
@@ -104,10 +120,11 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     private var completionSelected = 0
     private var tokenStart: Int?
 
-    init(cwd: URL, onSubmit: @escaping (String) -> Void, onAbort: @escaping () -> Void) {
+    init(cwd: URL, onSubmit: @escaping (String) -> Void, onAbort: @escaping () -> Void, onDraftChange: @escaping (String) -> Void) {
         self.cwd = cwd
         self.onSubmit = onSubmit
         self.onAbort = onAbort
+        self.onDraftChange = onDraftChange
     }
 
     func attach(container: PromptContainerView) {
@@ -170,6 +187,16 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             // harmless no-op on the pi side.
             onAbort()
             return true
+
+        case 8: // C
+            // Ctrl+C clears the draft (terminal-style interrupt); Cmd+C still
+            // copies via the default key binding.
+            if event.modifierFlags.contains(.control), !event.modifierFlags.contains(.command) {
+                textView.string = ""
+                onDraftChange("")
+                return true
+            }
+            return false
 
         default:
             return false
@@ -254,6 +281,17 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         completionItems = []
     }
 
+    // MARK: - Text replacement (e.g. restoring queued steering for editing)
+
+    func setText(_ text: String, in container: PromptContainerView) {
+        dismissCompletion()
+        let textView = container.textView
+        textView.string = text
+        textView.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        textView.scrollRangeToVisible(textView.selectedRange())
+        container.window?.makeFirstResponder(textView)
+    }
+
     // MARK: - Submit
 
     private func submit(from textView: NSTextView) {
@@ -261,12 +299,23 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         let trimmed = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         textView.string = ""
+        textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        onDraftChange("")
         onSubmit(trimmed)
     }
 
     // MARK: - NSTextViewDelegate
 
     func textDidChange(_ notification: Notification) {
+        // Keep the insertion point visible while typing: when the user has
+        // scrolled up in a long prompt, NSTextView can leave new text below
+        // the fold, so typing appears to hide part of the prompt. Scroll the
+        // minimum needed to reveal the caret.
+        if let textView {
+            textView.scrollRangeToVisible(textView.selectedRange())
+            // Mirror the draft up so "edit queued steering" can restore it.
+            onDraftChange(textView.string)
+        }
         // Live-refilter while the completion list is showing.
         guard completionActive, let textView else { return }
         guard let (range, fragment) = currentPathToken(in: textView) else {

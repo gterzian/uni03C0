@@ -232,6 +232,10 @@ public struct AssistantMessageEvent: Codable, Sendable, Equatable {
     public var contentIndex: Int?
     public var delta: String?
     public var content: String?
+    /// `toolcall_start` carries the call's id and tool name.
+    public var id: String?
+    public var toolName: String?
+    /// `toolcall_end` carries the final tool-call block.
     public var toolCall: JSONValue?
 
     public var isText: Bool { type.hasPrefix("text_") }

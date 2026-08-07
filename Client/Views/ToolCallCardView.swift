@@ -6,13 +6,24 @@ import SwiftUI
 /// edit/write/bash/read events — typed before/after data from tool events,
 /// not scraped terminal output.
 final class ToolCallHostView: NSView {
-    private var host: NSHostingView<ToolCallCardView>?
+    private var host: NSHostingView<AnyView>?
 
-    func configure(card: ToolCallCard) {
+    func configure(card: ToolCallCard, onToggleExpand: @escaping () -> Void) {
+        // `.id(card.id)` keeps the card's own expansion state alive across
+        // output updates for the same call, but resets it when a recycled cell
+        // is reused for a different call.
+        let root = AnyView(
+            ToolCallCardView(
+                card: card,
+                onToggleExpand: onToggleExpand,
+                isInitiallyExpanded: ToolCardExpansion.shared.isExpanded(card.id)
+            )
+            .id(card.id)
+        )
         if let host {
-            host.rootView = ToolCallCardView(card: card)
+            host.rootView = root
         } else {
-            let hosting = NSHostingView(rootView: ToolCallCardView(card: card))
+            let hosting = NSHostingView(rootView: root)
             hosting.sizingOptions = []
             hosting.translatesAutoresizingMaskIntoConstraints = false
             addSubview(hosting)
@@ -28,9 +39,21 @@ final class ToolCallHostView: NSView {
 }
 
 /// Structured card for a tool execution: name + state, arguments, output.
-/// Height matches `TranscriptEntryKind.toolCallHeight` (both must agree).
+/// Output is collapsed to a generous preview (30 lines) with an expand button
+/// to reveal the full content. The row height is measured from the REAL
+/// SwiftUI layout (`NSHostingController.sizeThatFits`), so expand/collapse
+/// never leaves whitespace.
 struct ToolCallCardView: View {
     let card: ToolCallCard
+    var onToggleExpand: () -> Void = {}
+
+    @State private var isExpanded: Bool
+
+    init(card: ToolCallCard, onToggleExpand: @escaping () -> Void = {}, isInitiallyExpanded: Bool = false) {
+        self.card = card
+        self.onToggleExpand = onToggleExpand
+        _isExpanded = State(initialValue: isInitiallyExpanded)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -39,14 +62,14 @@ struct ToolCallCardView: View {
                 Text(card.arguments)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(isExpanded ? nil : 2)
                     .textSelection(.enabled)
             }
             if !card.output.isEmpty {
                 Text(card.output)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(card.state == .failed ? Color.red : .primary)
-                    .lineLimit(12)
+                    .lineLimit(isExpanded ? nil : 30)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else if card.state == .running {
@@ -72,6 +95,16 @@ struct ToolCallCardView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(borderColor, lineWidth: 1)
         )
+        // The whole card is the click target (the chevron in the header just
+        // tracks the state); a drag still selects text. No animation — the row
+        // height snaps with the table, so animating the content would leave
+        // transient whitespace.
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !card.output.isEmpty || !card.arguments.isEmpty else { return }
+            isExpanded.toggle()
+            onToggleExpand()
+        }
         .padding(.vertical, 4)
     }
 
@@ -84,6 +117,13 @@ struct ToolCallCardView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.primary)
             Spacer()
+            if !card.output.isEmpty || !card.arguments.isEmpty {
+                // Passive state indicator — the whole card is the click target.
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help(isExpanded ? "Collapse" : "Show full content")
+            }
             HStack(spacing: 4) {
                 Image(systemName: stateIcon)
                     .font(.system(size: 10))
