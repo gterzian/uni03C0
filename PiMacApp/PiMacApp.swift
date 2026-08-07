@@ -18,9 +18,10 @@ struct PiNativeApp: App {
         WindowGroup("Pi", id: SceneIDs.mainWindow, for: ProjectRef.self) { $project in
             MainWindowView(project: $project)
         } defaultValue: {
-            // Always start at the picker: no implicit session anywhere until
-            // the user explicitly chooses a project directory.
-            ProjectRef(cwd: nil)
+            // Start in the last project that was selected before shutdown, so
+            // the app resumes where the user left off. Falls back to the
+            // picker when no project has ever been chosen.
+            ProjectRef(cwd: AppState.shared.lastProject)
         }
         .defaultSize(width: 920, height: 720)
         .commands {

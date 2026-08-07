@@ -12,3 +12,139 @@ Forbidden (anything that writes or changes state):
 
 The human owns the repository history. If a commit (or any other write
 operation) is needed, say so and let the human run it.
+
+---
+
+# Project design
+
+## What this is
+
+**PiNative** is a native macOS client for the [`pi` coding
+agent](https://github.com/earendil-works/pi). It spawns `pi --mode rpc` as a
+subprocess and renders the conversation natively (SwiftUI + AppKit) instead of
+running the terminal TUI. A SwiftUI shell with one deliberately hand-rolled
+AppKit piece: the transcript table.
+
+The RPC wire protocol is the single source of truth — the app holds nothing in
+parallel that it doesn't derive from the event stream.
+
+## Modules
+
+Three targets (see `project.yml`):
+
+- **PiCore** (framework, default *nonisolated*): the protocol + process layer
+  and the data side of the transcript. No AppKit.
+- **PiMacApp** (app, default *MainActor*): the SwiftUI shell + AppKit views.
+- **PiCLI** (tool): headless smoke test of the protocol layer against a live pi.
+
+Concurrency defaults are set per target in `project.yml`:
+`PiCore = nonisolated`, `PiMacApp = MainActor`, both Swift 6 strict concurrency.
+
+### PiCore
+
+- `PiProcessController` — an actor wrapping
+  [`swift-subprocess`](https://github.com/swiftlang/swift-subprocess). Spawns
+  `pi --mode rpc`, encodes outbound RPC commands, demuxes inbound frames by id
+  (`response` frames resolve awaited sends; everything else is yielded on an
+  `AsyncThrowingStream`).
+- `JSONLFramer` — manual LF-only framing. The stdlib treats U+2028/U+2029 as
+  line breaks, which are legal inside JSON strings and would corrupt the
+  stream, so framing is hand-rolled.
+- `RPCFrame` / `RPCRequest` — the decoded envelope; payloads decode lazily.
+- `TranscriptStore` — owns the **full conversation history**, off the main
+  thread (lock-guarded, `@unchecked Sendable`). Folds RPC frames into
+  `TranscriptEntry` rows and rebuilds the whole list from `get_messages` on
+  session switch. It is data-only; it never renders.
+- `SessionViewModel` — a thin `@MainActor` shim. Owns the connection, the RPC
+  commands (prompt/abort/model/thinking/reload/resume), and the small bits of
+  UI state SwiftUI reads (`isStreaming`, `model`, `isReloading`,
+  `isFetchingOlder`). It forwards frames to the store off-main and does **not**
+  hold the transcript.
+- `TranscriptEntry` / `TranscriptEntryKind` — the row model (user message,
+  assistant message with thinking, tool call card).
+- `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
+- `PathCompletion` — filesystem path tab-completion for the prompt bar.
+
+### PiMacApp
+
+- `MainWindowView` / `SessionView` — the per-project window. On startup it
+  opens the **last selected project folder** (`AppState.shared.lastProject`,
+  persisted to UserDefaults), or the picker if none has been chosen.
+- `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
+  transcript section below.
+- `TextRowView` / `ToolCallCardView` — cells.
+- `TranscriptText` — the single source of truth for styling **and**
+  measurement, so measured height exactly matches rendered height.
+- `PromptInputView` — AppKit prompt bar with Tab path completion.
+- `SessionHistorySheet` — unbounded session list.
+- `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
+  and subprocess cleanup on termination (every live child gets EOF on quit).
+
+## The transcript design (the load-bearing part)
+
+The design goal, kept simple: **rendering cost is a function of the visible
+rows, never of the context size.** A 600-message session opens and streams
+like a two-message one.
+
+Three pieces, each with one job:
+
+1. **`TranscriptStore`** (off-main) owns the whole history. It folds events and
+   rebuilds on session switch in a background task. The UI reads it through
+   lock-guarded accessors; the store never draws.
+2. **`SessionViewModel`** (main) is a thin shim — connection, commands, UI
+   state. It forwards each frame to the store via `Task.detached`, yielding
+   the main thread so a delta never blocks the UI.
+3. **`Coordinator`** (main) renders a window `[windowStart, windowEnd)` of
+   store indices. `numberOfRows` is the window size; every cell/height is a
+   store lookup. SwiftUI never reads the transcript entries — updates flow
+   store → coordinator → `NSTableView` directly.
+
+Behavior details that matter:
+
+- **Append-only reality.** pi's stream is append-only, so a change is always
+  "something at the end changed." No index diffing is needed — just a monotonic
+  `version` (per tail mutation) and a `generation` (per wholesale rebuild).
+- **Tail always streams in.** New rows append via `insertRows` (cheap,
+  O(added)); inserting at the end never shifts existing rows, so a scrolled-up
+  viewport is untouched.
+- **Older history loads in compounding blocks.** `windowStart` only ever
+  decreases. When the viewport nears the top of the fetched region, a spinner
+  appears above the conversation and a block is prepended; the block size
+  doubles each time (capped), so sustained scrolling eventually pulls the whole
+  conversation into memory. Fetched rows are **never evicted** — scrolling back
+  down reuses cached heights, so it's always fast.
+- **Sticky follow.** Following is on by default. The moment the user scrolls
+  *up*, following disengages so streaming doesn't drag them back down; it
+  re-engages when they return to the bottom. Sending a message always jumps to
+  the bottom. Direction is detected from the scroll position (whether content
+  remains below the viewport), **not** from row indices — a tall streaming row
+  fills the viewport, so the last visible row can still be the tail even when
+  scrolled up.
+- **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
+  views). The streaming row's cached height is seeded from the cell's own
+  layout and only ever grows (never oscillates). The height change and the
+  follow-scroll are applied in one atomic `CATransaction` so AppKit renders
+  only the final state — content flows off the top instead of bouncing.
+- **Height cache.** Keyed by `(id, width)`, seeded from the visible cell's
+  layout (avoids a duplicate CoreText measure — that was the original 100%-CPU
+  hot path). `noteHeightOfRows` queries hit the cache.
+- **Session switch** is a `generation` bump → full `reloadData()` positioned at
+  the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
+
+Validation notes: a `sample` during a long streaming turn should show the main
+thread mostly idle in the event loop (the per-tick work is confined to the
+streaming row); a large-context session should scroll smoothly and open
+instantly.
+
+## Conventions
+
+- `project.yml` drives `xcodegen` — regenerate the project after adding/removing
+  files: `xcodegen generate`.
+- Keep PiCore free of AppKit. Height measurement and rendering stay in
+  PiMacApp.
+- Build/launch: `./run.sh` (generates the project, builds, opens the app).
+
+## Design docs
+
+- `scratchpad/transcript-architecture.md` — the architecture write-up.
+- `scratchpad/pi-transcript-overview.md` — a plain-terms overview.

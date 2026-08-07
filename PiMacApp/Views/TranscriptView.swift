@@ -7,18 +7,28 @@ import SwiftUI
 /// Deliberately NOT driven by SwiftUI re-renders — this is the whole point of
 /// the AppKit choice. The SwiftUI body never reads the transcript entries, so
 /// a streamed delta does not invalidate the SwiftUI graph at all. Updates flow
-/// model → coordinator directly: the view model calls `onTranscriptChange`,
-/// and the coordinator applies AppKit-native incremental operations:
+/// store → coordinator directly.
 ///
-/// - appended rows → `insertRows(at:withAnimation:)`
-/// - a row whose content changed in place (the streaming row, almost always)
-///   → reconfigure the visible cell + `noteHeightOfRows(withIndexesChanged:)`,
-///   which re-measures only that row — nothing below it re-lays-out
-/// - wholesale changes (session switch / history rebuild) → `reloadData()`
+/// ## History grows down, older history is revealed upward
 ///
-/// No diffable data source: on macOS its `reloadItems` degenerates to
-/// `reloadFromSnapshot → _reloadData`, a full re-tile + full height pass on
-/// every delta — the exact hot path the TUI profiled.
+/// The full history lives in `TranscriptStore` (off the main thread); the
+/// coordinator materializes a window `[windowStart, windowEnd)` of store
+/// indices into the table (`numberOfRows` is the window size,
+/// `row == storeIndex - windowStart`).
+///
+/// - **The tail always grows:** `windowEnd` tracks the store and streams in via
+///   cheap `insertRows` at the bottom. Scrolling down is therefore always fast.
+/// - **Fetched history is kept in memory:** `windowStart` only ever *decreases*.
+///   Rows (and their measured heights) are never dropped, so once revealed, a
+///   row stays in the height cache and scrolling back to it is instant.
+/// - **Older history is fetched in compounding blocks:** when the viewport
+///   nears the top of the fetched region, a spinner appears at the top of the
+///   conversation and a block of history is prepended. Each successive fetch is
+///   larger (compounding), so sustained scrolling eventually pulls the entire
+///   conversation into memory.
+///
+/// Session switch / reload is a store `generation` bump → full reload
+/// positioned at the tail.
 struct TranscriptView: NSViewRepresentable {
     let viewModel: SessionViewModel
 
@@ -43,8 +53,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
     private let heights = HeightCache()
-    private var entries: [TranscriptEntry] = []
-    private var known: [String: TranscriptEntry] = [:]
     weak var viewModel: SessionViewModel?
     private var isApplying = false
     /// Throttle for in-place row refreshes (streaming text AND tool cards):
@@ -56,6 +64,40 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Coalesced async scroll-to-bottom (tile + scroll happen once per run-loop
     /// turn at most, after the table has laid out).
     private var scrollToBottomPending = false
+
+    /// The materialized window over store indices: table row `r` displays
+    /// `store.entry(at: windowStart + r)`. `windowStart` only decreases (older
+    /// history is prepended); `windowEnd` only increases (tail streams in).
+    private var windowStart = 0
+    private var windowEnd = 0
+    private var lastGeneration: UInt64 = 0
+
+    /// Size of the next upward history fetch, in rows. Compounding: doubles
+    /// after every fetch so sustained scrolling eventually pulls everything.
+    private var fetchBlock = 0
+    private let fetchBlockMax = 600
+
+    /// True while a block of older history is being measured/prepended (drives
+    /// the spinner at the top of the conversation).
+    private var isFetchingOlder = false
+
+    /// Whether the user is pinned to the tail and wants to auto-follow. Once
+    /// they scroll up, this turns off so streaming doesn't keep yanking them
+    /// back down; it re-engages only when they return to the bottom.
+    private var isFollowing = true
+    /// Last viewport bottom edge (document y), for detecting scroll direction.
+    private var lastVisibleMaxY: CGFloat = 0
+
+    /// How many rows currently fit in the viewport (or a sane default).
+    private func viewportRows() -> Int {
+        guard let tableView else { return 20 }
+        return max(tableView.rows(in: tableView.visibleRect).length, 1)
+    }
+
+    /// Rows materialized at the tail on load / reload (a few screens).
+    private func initialChunkRows() -> Int {
+        max(40, viewportRows() * 5)
+    }
 
     func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
         self.viewModel = viewModel
@@ -85,12 +127,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.dataSource = self
         tv.delegate = self
 
+        // Fetch older history (and refresh the tail) on scroll.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollViewDidScroll(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
         }
+        let store = viewModel.store
+        lastGeneration = store.currentGeneration
+        windowStart = max(0, store.count - initialChunkRows())
+        windowEnd = store.count
+        fetchBlock = max(initialChunkRows() / 2, 20)
         applyModelChanges() // initial state (usually empty; populate happens after)
 
         return sv
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     func rebind(viewModel: SessionViewModel) {
@@ -99,115 +158,241 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
         }
-        applyModelChanges()
+        resetToTail(viewModel.store)
     }
 
-    // MARK: - NSTableViewDataSource
+    // MARK: - NSTableViewDataSource / Delegate
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        entries.count
+        max(0, windowEnd - windowStart)
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard entries.indices.contains(row) else { return nil }
-        return makeCell(for: entries[row], in: tableView)
+        let storeIndex = windowStart + row
+        guard let entry = viewModel?.store.entry(at: storeIndex) else { return nil }
+        return makeCell(for: entry, in: tableView)
     }
 
-    // MARK: - Model → table (main actor)
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard let store = viewModel?.store else { return 24 }
+        let storeIndex = windowStart + row
+        guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
+        let width = max(tableView.bounds.width, 320)
+        return heights.height(for: entry.id, width: width) {
+            entry.kind.measuredHeight(forWidth: width)
+        }
+    }
 
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        false // read-only transcript
+    }
+
+    // MARK: - Store → table
+
+    /// Called on every store change. Always materializes newly streamed tail
+    /// rows (cheap append; does not disturb a scrolled-up viewport, and rows
+    /// above stay cached). Follows + refreshes the streaming row only when
+    /// pinned to the bottom.
     func applyModelChanges() {
         guard let viewModel, !isApplying else { return }
         isApplying = true
         defer { isApplying = false }
+        let store = viewModel.store
 
-        let newEntries = viewModel.entries
-        guard newEntries != entries else { return }
-
-        // Anchor state captured BEFORE the mutation. A pending coalesced scroll
-        // means the user is pinned even if the viewport hasn't landed yet.
-        var wasAtBottom = scrollView.isNearBottom(threshold: 4) || scrollToBottomPending
-        let previousOffset = scrollView.contentView.bounds.origin
-        let oldIDs = entries.map(\.id)
-        let newIDs = newEntries.map(\.id)
-
-        // Our live flow is: appends + the last row mutating in place. A session
-        // switch replaces everything (different ids), which we treat as a full
-        // reload — rare, so the cost is fine.
-        var common = 0
-        while common < oldIDs.count, common < newIDs.count, oldIDs[common] == newIDs[common] {
-            common += 1
-        }
-        if common != oldIDs.count || newIDs.count < oldIDs.count {
-            applyFullReload(newEntries, wasAtBottom: wasAtBottom, previousOffset: previousOffset)
+        let generation = store.currentGeneration
+        if generation != lastGeneration {
+            resetToTail(store)
             return
         }
 
-        // In-place content changes within the common prefix (the streaming row,
-        // tool-card output). ALL of these are throttled to ~20Hz: each delta is
-        // O(1) work, and the cell re-layout + height re-measure run once per
-        // tick. Off-tick deltas just advance the model.
-        var changedRows = IndexSet()
-        let now = ProcessInfo.processInfo.systemUptime
-        let refreshDue = now - lastRefresh >= refreshInterval
-        for i in 0..<common {
-            let entry = newEntries[i]
-            if known[entry.id]?.kind != entry.kind {
-                known[entry.id] = entry
-                if refreshDue {
-                    changedRows.insert(i)
+        let newCount = store.count
+        var didAppend = false
+
+        // Materialize the newly streamed tail (cheap, O(added)). Inserting at
+        // the end never shifts the rows above, so a scrolled-up viewport is
+        // untouched.
+        if newCount > windowEnd {
+            let oldEnd = windowEnd
+            windowEnd = newCount
+            let tableRange = (oldEnd - windowStart)..<(newCount - windowStart)
+            for i in oldEnd..<newCount {
+                if let entry = store.entry(at: i) {
                     heights.invalidate(entry.id)
-                    updateVisibleCell(at: i, with: entry)
                 }
-            } else {
-                known[entry.id] = entry
             }
-        }
-        if refreshDue { lastRefresh = now }
-
-        // Appended rows (new messages / tool cards) — cheap, apply immediately.
-        var appended = false
-        if newIDs.count > oldIDs.count {
-            let range = oldIDs.count..<newIDs.count
-            for i in range {
-                known[newIDs[i]] = newEntries[i]
-                heights.invalidate(newIDs[i])
-            }
-            tableView.insertRows(at: IndexSet(integersIn: range), withAnimation: [])
-            appended = true
+            tableView.insertRows(at: IndexSet(integersIn: tableRange), withAnimation: [])
+            didAppend = true
         }
 
-        // The user just sent a message: jump to the bottom so it (and the
-        // response) is visible, regardless of where the user had scrolled.
-        let appendedUserMessage = appended && {
-            if case .userMessage = newEntries[newEntries.count - 1].kind { return true }
+        // Re-engage following when the user just sent a message, and jump them
+        // to the bottom even if they were scrolled up (explicit send = they
+        // want to see the response).
+        let appendedUserMessage = didAppend && {
+            if let last = store.entry(at: newCount - 1), case .userMessage = last.kind { return true }
             return false
         }()
-
-        // Height invalidation for the changed row(s) only — nothing below
-        // re-measures or re-lays-out. (HeightCache was seeded from the cell's
-        // own layout in updateVisibleCell, so these re-queries hit the cache.)
-        if !changedRows.isEmpty {
-            tableView.noteHeightOfRows(withIndexesChanged: changedRows)
+        if appendedUserMessage {
+            isFollowing = true
+            followTail()
+            return
         }
 
-        entries = newEntries
+        // Follow (scroll the streaming tail down) only while following is
+        // engaged. It's engaged by default and disengaged the moment the user
+        // scrolls up; re-engaged when they return to the bottom or send.
+        guard isFollowing else { return }
 
-        if (wasAtBottom || appendedUserMessage) && (appended || !changedRows.isEmpty) {
-            scheduleScrollToBottom()
-        } else if !wasAtBottom {
-            restoreOffset(previousOffset)
+        // Throttled in-place refresh of the streaming row. We seed its cached
+        // height from the cell's own layout rather than invalidating it first
+        // (invalidation can make the row flicker between the cell-derived and
+        // the re-measured height on successive ticks), so the row only ever
+        // grows — never oscillates.
+        let now = ProcessInfo.processInfo.systemUptime
+        var didRefresh = false
+        if now - lastRefresh >= refreshInterval {
+            lastRefresh = now
+            let lastRow = windowEnd - windowStart - 1
+            if let lastEntry = store.entry(at: windowEnd - 1) {
+                // Batch the height change and the follow-scroll into one
+                // display pass so AppKit renders only the final state (row
+                // grown + scrolled) — never the intermediate "row taller but
+                // not scrolled yet" frame that reads as a bounce.
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                if !updateVisibleCell(at: lastRow, with: lastEntry) {
+                    heights.invalidate(lastEntry.id)
+                }
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: lastRow))
+                followTail()
+                CATransaction.commit()
+                didRefresh = true
+            }
+        }
+
+        if didAppend && !didRefresh {
+            followTail()
         }
     }
 
-    /// Sticky-or-follow scroll anchoring.
-    ///
-    /// Follow: coalesce into a single async tile+scroll per run-loop turn, so
-    /// `documentView.frame.height` is current (after layout) and the viewport
-    /// lands exactly on the bottom — no under-scroll that silently un-pins the
-    /// user mid-stream, no per-delta tile.
-    ///
-    /// Sticky: restore the exact previous offset; append-only updates never
-    /// shift it, but a session-switch reload might.
+    /// Called on scroll. Refreshes the tail row's height when the user reaches
+    /// the bottom (it may have grown while they were scrolled up), and fetches
+    /// older history when they near the top of the fetched region.
+    @objc private func scrollViewDidScroll(_ note: Notification) {
+        reconcileOnScroll()
+    }
+
+    private func reconcileOnScroll() {
+        guard let viewModel, !isApplying else { return }
+        isApplying = true
+        defer { isApplying = false }
+        let store = viewModel.store
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.length > 0 else { return }
+
+        let firstVisibleStore = windowStart + visible.location
+
+        // Follow toggle, direction-aware. The programmatic follow-scroll (from
+        // followTail) always scrolls DOWN toward the bottom, so it never
+        // disengages. Only an actual scroll UP (visible max-y decreasing while
+        // away from the bottom) breaks out of following; returning to the
+        // bottom re-engages.
+        let maxY = scrollView.documentVisibleRect.maxY
+        let goingUp = maxY < lastVisibleMaxY - 1
+        lastVisibleMaxY = maxY
+        if goingUp && !isNearBottom(threshold: 8) {
+            isFollowing = false
+        } else if isNearBottom(threshold: 4) {
+            isFollowing = true
+        }
+
+        // At the tail: refresh the streaming row's height so content that grew
+        // while the user was scrolled up renders correctly. (No scroll here —
+        // the user is navigating on their own.)
+        if isNearBottom(threshold: 4) {
+            let lastRow = windowEnd - windowStart - 1
+            if lastRow >= 0, let lastEntry = store.entry(at: windowEnd - 1) {
+                if !updateVisibleCell(at: lastRow, with: lastEntry) {
+                    heights.invalidate(lastEntry.id)
+                }
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: lastRow))
+            }
+        }
+
+        checkFetchOlder(store: store, firstVisibleStore: firstVisibleStore, visible: visible)
+    }
+
+    /// Whether the viewport's bottom edge is within `threshold` px of the
+    /// bottom of the document content (i.e. there's little or nothing to scroll
+    /// down to).
+    private func isNearBottom(threshold: CGFloat) -> Bool {
+        guard let documentView = scrollView.documentView else { return true }
+        let visibleMaxY = scrollView.documentVisibleRect.maxY
+        return documentView.frame.height - visibleMaxY <= threshold
+    }
+
+    // MARK: - Fetching older history (compounding, with spinner)
+
+    /// If the viewport is near the top of the fetched region and more history
+    /// exists above, fetch the next (compounding) block. Shows the spinner, lets
+    /// it paint, then prepends the block and re-anchors the viewport.
+    private func checkFetchOlder(store: TranscriptStore, firstVisibleStore: Int, visible: NSRange) {
+        guard windowStart > 0 else { return } // whole conversation already fetched
+        guard !isFetchingOlder else { return }
+        let margin = max(4, visible.length / 3)
+        guard firstVisibleStore - windowStart <= margin else { return }
+
+        // Capture the anchor row and its on-screen offset so the viewport
+        // doesn't jump when the new rows are inserted above it.
+        let anchorStore = firstVisibleStore
+        let anchorOffset = tableView.rect(ofRow: visible.location).origin.y - tableView.visibleRect.origin.y
+
+        let block = fetchBlock
+        let newStart = max(0, windowStart - block)
+        let fetched = windowStart - newStart
+        guard fetched > 0 else { return }
+        fetchBlock = min(fetchBlock * 2, fetchBlockMax)
+
+        isFetchingOlder = true
+        viewModel?.isFetchingOlder = true
+
+        // Yield so the spinner paints, then prepend on the next run-loop turn.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.prependHistory(fetched, anchorStore: anchorStore, anchorOffset: anchorOffset)
+            self.isFetchingOlder = false
+            self.viewModel?.isFetchingOlder = false
+        }
+    }
+
+    /// Prepends `fetched` rows (older history) at the top of the table and
+    /// re-anchors the viewport to the same store row at the same pixel offset.
+    private func prependHistory(_ fetched: Int, anchorStore: Int, anchorOffset: CGFloat) {
+        guard fetched > 0 else { return }
+        windowStart -= fetched
+        tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
+        tableView.tile()
+        let row = anchorStore - windowStart
+        guard row >= 0, row < (windowEnd - windowStart) else { return }
+        let rowY = tableView.rect(ofRow: row).origin.y
+        let targetY = rowY - anchorOffset
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    private func resetToTail(_ store: TranscriptStore) {
+        let count = store.count
+        let chunk = initialChunkRows()
+        windowStart = max(0, count - chunk)
+        windowEnd = count
+        fetchBlock = max(chunk / 2, 20)
+        lastGeneration = store.currentGeneration
+        isFetchingOlder = false
+        isFollowing = true
+        viewModel?.isFetchingOlder = false
+        tableView.reloadData()
+        scheduleScrollToBottom()
+    }
+
     private func scheduleScrollToBottom() {
         guard !scrollToBottomPending else { return }
         scrollToBottomPending = true
@@ -219,61 +404,36 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
-    private func restoreOffset(_ offset: CGPoint) {
-        let docHeight = scrollView.documentView?.frame.height ?? 0
-        let maxY = max(0, docHeight - scrollView.contentView.bounds.height)
-        let y = min(offset.y, maxY)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-    }
-
-    private func applyFullReload(_ newEntries: [TranscriptEntry], wasAtBottom: Bool, previousOffset: CGPoint) {
-        let newIDs = Set(newEntries.map(\.id))
-        for entry in newEntries {
-            if known[entry.id]?.kind != entry.kind {
-                heights.invalidate(entry.id)
-            }
-            known[entry.id] = entry
-        }
-        for stale in known.keys where !newIDs.contains(stale) {
-            known.removeValue(forKey: stale)
-        }
-        entries = newEntries
-        tableView.reloadData()
-        if wasAtBottom {
-            scheduleScrollToBottom()
-        } else {
-            restoreOffset(previousOffset)
-        }
-    }
-
-    private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) {
-        guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return }
+    /// Reconfigures the visible cell for `row` and seeds its cached height from
+    /// the cell's own layout (avoids a duplicate CoreText measure — that was
+    /// the 100%-CPU hot path). Returns false if the cell isn't currently
+    /// visible, in which case the caller should invalidate the height so it
+    /// falls back to a measurement.
+    @discardableResult
+    private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) -> Bool {
+        guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
         configure(cell, with: entry, in: tableView)
         cell.layoutSubtreeIfNeeded()
-        // Reuse the cell's own layout for the row height instead of a separate
-        // CoreText measure: seed the height cache so noteHeightOfRows' internal
-        // re-queries (span cache + tile) hit instead of re-measuring the whole
-        // growing string — that duplicate measure was the 100%-CPU hot path.
         if let textRow = cell as? TextRowView {
             let width = max(tableView.bounds.width, 320)
             heights.store(entry.id, width: width, height: textRow.contentHeight + 2)
+            return true
         }
+        return true // non-text cells: heightOfRow recomputes cheaply via cache miss
     }
 
-    // MARK: - NSTableViewDelegate
-
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        guard entries.indices.contains(row) else { return 24 }
-        let entry = entries[row]
-        let width = max(tableView.bounds.width, 320)
-        return heights.height(for: entry.id, width: width) {
-            entry.kind.measuredHeight(forWidth: width)
-        }
-    }
-
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        false // read-only transcript
+    /// Anchors the bottom of the last (streaming) row to the bottom of the
+    /// viewport, synchronously, using the row's actual laid-out geometry so it
+    /// can't lag behind the height update. This is what keeps the tail text
+    /// steady as it grows.
+    private func followTail() {
+        let lastRow = windowEnd - windowStart - 1
+        guard lastRow >= 0 else { return }
+        tableView.tile()
+        let rowRect = tableView.rect(ofRow: lastRow)
+        let targetY = rowRect.maxY - scrollView.contentView.bounds.height
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     // MARK: - Cells
@@ -313,7 +473,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 // MARK: - Height cache
 
 /// Never remeasure text on every layout pass. Cache height keyed by
-/// content+width, invalidate only on genuine change.
+/// content+width, invalidate only on genuine change. Grows only as history is
+/// revealed and is never evicted — fetched rows stay in memory so scrolling
+/// back down is always fast.
 final class HeightCache {
     private struct Entry {
         var width: CGFloat
@@ -343,15 +505,9 @@ final class HeightCache {
     }
 }
 
-// MARK: - Scroll anchoring
+// MARK: - Scroll helpers
 
 extension NSScrollView {
-    func isNearBottom(threshold: CGFloat) -> Bool {
-        guard let documentView else { return true }
-        let visibleMaxY = documentVisibleRect.maxY
-        return documentView.frame.height - visibleMaxY <= threshold
-    }
-
     func scrollToBottom() {
         guard let documentView else { return }
         let point = NSPoint(

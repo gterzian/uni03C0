@@ -34,8 +34,32 @@ struct SessionView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let viewModel {
-                TranscriptView(viewModel: viewModel)
-                    .background(Color(nsColor: .textBackgroundColor))
+                ZStack {
+                    TranscriptView(viewModel: viewModel)
+                        .background(Color(nsColor: .textBackgroundColor))
+                    if viewModel.isReloading {
+                        // In-app spinner while the store rebuilds the whole
+                        // history off the main thread (no system beachball).
+                        ProgressView("Reloading session…")
+                            .controlSize(.small)
+                            .padding(12)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    if viewModel.isFetchingOlder {
+                        // Small spinner pinned to the top of the conversation
+                        // while the coordinator fetches a block of older
+                        // history (scrolling up).
+                        VStack {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(6)
+                                .background(.regularMaterial, in: Capsule())
+                            Spacer()
+                        }
+                        .padding(.top, 8)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                }
 
                 Divider()
 

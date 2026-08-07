@@ -31,6 +31,7 @@
 		AA3C4B22EBC1A122075BC970 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BCA090986F82F163611C22A /* MainWindowView.swift */; };
 		BE5683D33E93DF6A11C9B33E /* PromptInputView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 090FF221FE9438A502C38BE4 /* PromptInputView.swift */; };
 		BFC127D3DE857525BD44E1A5 /* AppStorage.swift in Sources */ = {isa = PBXBuildFile; fileRef = D288B21782F263FE925E16C4 /* AppStorage.swift */; };
+		C2B47B662440EEFBFB2594FD /* TranscriptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = D292FF86D8C302DE3E700C9F /* TranscriptStore.swift */; };
 		E1C2625E791E1325A38BDF49 /* PiCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = EA0F422EDE49252A55D6D9E1 /* PiCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		F85EFFA6617980254550EB48 /* RPCFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D8AB3567E3D8731BFE30FEF /* RPCFrame.swift */; };
 		F9ADCB37764D378A28F28C2B /* PathCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CDDC2D7520CB730041619D6 /* PathCompletion.swift */; };
@@ -94,6 +95,7 @@
 		B490157B31C89D1AC674EF39 /* SessionViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionViewModel.swift; sourceTree = "<group>"; };
 		C6784EF044D3681C65242E94 /* PiCLI */ = {isa = PBXFileReference; includeInIndex = 0; path = PiCLI; sourceTree = BUILT_PRODUCTS_DIR; };
 		D288B21782F263FE925E16C4 /* AppStorage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppStorage.swift; sourceTree = "<group>"; };
+		D292FF86D8C302DE3E700C9F /* TranscriptStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptStore.swift; sourceTree = "<group>"; };
 		EA0F422EDE49252A55D6D9E1 /* PiCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = PiCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		FD75E6439EC4F4DE8B075F48 /* PiMacApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PiMacApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -162,6 +164,7 @@
 				4DF155F582D402D7D81822A0 /* SessionListing.swift */,
 				B490157B31C89D1AC674EF39 /* SessionViewModel.swift */,
 				A27DCDDFEF6C280EEA5FA490 /* TranscriptEntry.swift */,
+				D292FF86D8C302DE3E700C9F /* TranscriptStore.swift */,
 			);
 			path = Session;
 			sourceTree = "<group>";
@@ -392,6 +395,7 @@
 				02F798940E5E18085852D903 /* SessionListing.swift in Sources */,
 				A085C355882E54C8AD950C7D /* SessionViewModel.swift in Sources */,
 				5EC57FECF760DA0212508189 /* TranscriptEntry.swift in Sources */,
+				C2B47B662440EEFBFB2594FD /* TranscriptStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
