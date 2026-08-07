@@ -8,7 +8,12 @@ import Foundation
 public enum SessionListing {
     public static func sessionsDirectory(for cwd: URL) -> URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let encoded = cwd.path.replacingOccurrences(of: "/", with: "-")
+        var path = cwd.path
+        // Strip the leading "/" so it doesn't become an extra "-" in the
+        // encoded name (real dirs are --Users-Gregory-Projects-x--, not
+        // ---Users-...--).
+        if path.hasPrefix("/") { path.removeFirst() }
+        let encoded = path.replacingOccurrences(of: "/", with: "-")
         return home.appendingPathComponent(".pi/agent/sessions/--\(encoded)--", isDirectory: true)
     }
 

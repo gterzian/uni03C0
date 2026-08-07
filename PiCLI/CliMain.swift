@@ -21,7 +21,28 @@ struct PiCLITest {
             await runResumeCheck(path: args[resumeIndex + 1])
             exit(0)
         }
+        if let sessionsIndex = args.firstIndex(of: "--sessions"), args.indices.contains(sessionsIndex + 1) {
+            runSessionsCheck(cwd: URL(fileURLWithPath: args[sessionsIndex + 1]))
+            exit(0)
+        }
         await runSmokeTest()
+    }
+
+    /// Verifies the session listing (Resume menu) for a project directory.
+    static func runSessionsCheck(cwd: URL) {
+        let dir = SessionListing.sessionsDirectory(for: cwd)
+        print("sessions dir: \(dir.path)")
+        print("exists: \(FileManager.default.fileExists(atPath: dir.path))")
+        let list = SessionListing.recentSessions(for: cwd, limit: nil)
+        for session in list.prefix(5) {
+            print("  \(session.timestamp) | \(session.title) | \(session.path.lastPathComponent)")
+        }
+        print("total: \(list.count)")
+        if list.isEmpty {
+            print("SESSIONS CHECK FAILED: empty listing")
+            exit(1)
+        }
+        print("SESSIONS CHECK PASSED")
     }
 
     /// Verifies the resume path against a real session file: switch_session to
