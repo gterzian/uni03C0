@@ -1,5 +1,7 @@
 # uni03C0 — native macOS client for the pi coding agent
 
+> π (low p) = π (pi, uni03C0)
+
 A lightweight macOS client for the [pi coding agent](https://github.com/earendil-works/pi).
 It spawns `pi --mode rpc` as a subprocess and renders the conversation natively
 instead of running the terminal TUI. The point: a smooth, low-CPU way to work
