@@ -33,7 +33,8 @@ with pi.
 - **PiMacApp** (app): SwiftUI shell; the AppKit transcript
   (`NSViewRepresentable` + `NSTableView` + a `Coordinator` that renders a
   windowed slice of the store); AppKit prompt bar; toolbar menus.
-- **PiCLI** (tool): headless smoke test of the protocol layer against a live pi.
+- **PiTests** (unit-test bundle): unit tests for framing, request encoding, and
+  transcript-store folding, plus live-pi integration tests.
 
 See `AGENTS.md` for the full architecture write-up.
 
@@ -63,11 +64,11 @@ xcodebuild -project PiNative.xcodeproj -scheme PiMacApp -configuration Debug bui
 open "$(find ~/Library/Developer/Xcode/DerivedData/PiNative-*/Build/Products/Debug -maxdepth 1 -name PiMacApp.app)"
 ```
 
-Smoke test (spawns pi, round-trips `get_state`, runs one real prompt):
+Tests (unit + integration; integration spawns a real pi and skips if it's not
+installed):
 
 ```bash
-xcodebuild -project PiNative.xcodeproj -scheme PiCLI -configuration Debug build
-"$(find ~/Library/Developer/Xcode/DerivedData/PiNative-*/Build/Products/Debug -name PiCLI)"
+xcodebuild -project PiNative.xcodeproj -scheme PiTests test
 ```
 
 ## Usage

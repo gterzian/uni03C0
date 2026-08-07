@@ -53,17 +53,39 @@ targets:
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         INFOPLIST_KEY_CFBundleDisplayName: "Pi"
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
-  PiCLI:
-    type: tool
+  PiTests:
+    type: bundle.unit-test
     platform: macOS
     sources:
-      - PiCLI
+      - PiTests
     dependencies:
       - target: PiCore
       - package: Subprocess
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiCLI
+        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.pimac.PiTests
+        GENERATE_INFOPLIST_FILE: YES
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
-        LD_RUNPATH_SEARCH_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
+
+schemes:
+  PiMacApp:
+    build:
+      targets:
+        PiMacApp: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PiTests
+  PiTests:
+    build:
+      targets:
+        PiCore: all
+        PiTests: [test]
+    test:
+      config: Debug
+      targets:
+        - PiTests

@@ -35,7 +35,9 @@ Three targets (see `project.yml`):
 - **PiCore** (framework, default *nonisolated*): the protocol + process layer
   and the data side of the transcript. No AppKit.
 - **PiMacApp** (app, default *MainActor*): the SwiftUI shell + AppKit views.
-- **PiCLI** (tool): headless smoke test of the protocol layer against a live pi.
+- **PiTests** (unit-test bundle, XCTest): unit tests for framing/request
+  encoding/store folding, plus live-pi integration tests that skip when pi
+  isn't installed. Run via `xcodebuild -scheme PiTests test`.
 
 Concurrency defaults are set per target in `project.yml`:
 `PiCore = nonisolated`, `PiMacApp = MainActor`, both Swift 6 strict concurrency.
