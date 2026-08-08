@@ -52,6 +52,7 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             "/Library/Developer",          // Xcode shared data
             "/Library/Developer/CommandLineTools",
             "/Applications/Xcode.app",     // Xcode: SDKs, toolchains, swiftc
+            "/Applications/TLA+ Toolbox.app", // TLA+ formal verification (spec checks)
             "/opt/local",                  // MacPorts
             "/usr/local",                  // Homebrew (Intel) / local installs
             "~/Library/Developer",          // Xcode DerivedData, module caches
@@ -102,7 +103,22 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
         let paths = defaults.stringArray(forKey: pathsKey) ?? []
         let hosts = defaults.stringArray(forKey: hostsKey) ?? []
         if paths.isEmpty && hosts.isEmpty { return Self.defaults }
-        return SandboxSettings(readOnlyPaths: paths, allowedHosts: hosts)
+        var settings = SandboxSettings(readOnlyPaths: paths, allowedHosts: hosts)
+        // One-shot migration: saved lists written by an older app version may
+        // predate default entries added since (e.g. ~/Library/Developer for
+        // Xcode builds — without it xcodebuild cannot write DerivedData inside
+        // the sandbox). Merge in anything the current defaults carry that the
+        // saved list lacks, and persist so the merge applies once, not on
+        // every launch. The user's own edits still win afterwards: their next
+        // save replaces the list wholesale.
+        let missingPaths = Self.defaults.readOnlyPaths.filter { !settings.readOnlyPaths.contains($0) }
+        let missingHosts = Self.defaults.allowedHosts.filter { !settings.allowedHosts.contains($0) }
+        if !missingPaths.isEmpty || !missingHosts.isEmpty {
+            settings.readOnlyPaths.append(contentsOf: missingPaths)
+            settings.allowedHosts.append(contentsOf: missingHosts)
+            settings.save()
+        }
+        return settings
     }
 
     public func save() {

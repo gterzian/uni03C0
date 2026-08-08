@@ -10,7 +10,6 @@
 		0B6AA0EE8F41C01CC880332C /* RequestEncodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A33353D55A352F2559EFDBA /* RequestEncodingTests.swift */; };
 		0F399E7283B2504AFF0D3228 /* Core.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = BC124C9BC1141DC93680F43A /* Core.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		10C8C30306D73FE4BB82DACC /* RPCRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00602F4A6DDFABFAB14C7261 /* RPCRequest.swift */; };
-		118D6DB3F8E7DAAA0532CE3F /* QuickPromptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E33B212A0A221981AF7AA2CD /* QuickPromptView.swift */; };
 		13D55E36D1D2D02366AA0C19 /* Subprocess in Frameworks */ = {isa = PBXBuildFile; productRef = 81A508483E6FBAA911EE548B /* Subprocess */; };
 		15180863C2008ED568112D78 /* SessionViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0877F8E65AD085F56C0A45B0 /* SessionViewModel.swift */; };
 		272939C3CA2905A8E4ABB3A4 /* TranscriptEntry+Measurement.swift in Sources */ = {isa = PBXBuildFile; fileRef = C90C6750B4E23BD7F2B937A4 /* TranscriptEntry+Measurement.swift */; };
@@ -145,7 +144,6 @@
 		D7682B2BB89A0CBACC195F9D /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		D77184B66EEDA638FCF67B7C /* RPCEndpointSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCEndpointSettings.swift; sourceTree = "<group>"; };
 		DD2E0E1238AD9B7245123060 /* TranscriptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptView.swift; sourceTree = "<group>"; };
-		E33B212A0A221981AF7AA2CD /* QuickPromptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickPromptView.swift; sourceTree = "<group>"; };
 		E512CEE54BE52B85E61D96FD /* SandboxSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxSettings.swift; sourceTree = "<group>"; };
 		E5E874A878E044EBBA8E03F5 /* SandboxSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxSettingsModel.swift; sourceTree = "<group>"; };
 		EB1CB5FCE7471ECBB765D90F /* FramingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FramingTests.swift; sourceTree = "<group>"; };
@@ -225,7 +223,6 @@
 				C70DEDE4ACCE12585494E5CC /* MainWindowView.swift */,
 				81F56B6989F31097F8D54DDB /* ProjectPickerView.swift */,
 				3F3AF5E28FB40BF5F89311D6 /* PromptInputView.swift */,
-				E33B212A0A221981AF7AA2CD /* QuickPromptView.swift */,
 				53E6C820CF5034AE8FF7D6AE /* SandboxSettingsView.swift */,
 				A2C6FBFD7626AE3CB8C9071B /* SessionContent.swift */,
 				BCAF147B9B61A6FD437FC39C /* SessionHistorySheet.swift */,
@@ -555,7 +552,6 @@
 				EDE3362C53404D1D0AAD8EB7 /* MainWindowView.swift in Sources */,
 				5BACCC46FC1BAAEF0BA94ED7 /* ProjectPickerView.swift in Sources */,
 				53590DA3ADE79E31CD27AF92 /* PromptInputView.swift in Sources */,
-				118D6DB3F8E7DAAA0532CE3F /* QuickPromptView.swift in Sources */,
 				512D879AF9F685F11892732F /* SandboxSettingsModel.swift in Sources */,
 				3619ABBCBC26300D95338CDF /* SandboxSettingsView.swift in Sources */,
 				CDDF147786676B234C7068A5 /* SessionContent.swift in Sources */,
