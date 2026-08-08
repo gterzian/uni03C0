@@ -3,8 +3,8 @@ import SwiftUI
 
 /// The live content of one session: transcript (AppKit) + prompt bar (AppKit-
 /// backed for Tab completion) + queued-steering banner. No lifecycle of its
-/// own — the owning view (`SessionView` or `SessionTabsView`) starts and stops
-/// the session and owns the toolbar.
+/// own — the owning view (`SessionTabsView`) starts and stops the session and
+/// owns the toolbar.
 struct SessionContent: View {
     @Bindable var tab: SessionTab
 

@@ -41,7 +41,7 @@ public enum SandboxPolicy {
         let ancestorTargets = ([projectPath, "\(home)/.pi"] + devPaths + [
             "\(home)/.gitconfig", "\(home)/.gitattributes", "\(home)/.gitignore_global", "\(home)/.git-credentials", "\(home)/.config/git", "\(home)/.ssh",
             "/usr/local", "/opt/homebrew", "/usr/bin", "/bin", "/usr/lib",
-            "/System/Library", "/Library/Frameworks", "/dev",
+            "/System/Library", "/Library/Frameworks", "/Library/Java", "/dev",
             "/private/tmp", "/private/var/tmp",
             "/private/var", "/private/etc", "/usr/share", "/usr/libexec",
             "/Library/Apple", "/Library/Preferences", "\(home)/Library/Preferences",
@@ -113,9 +113,9 @@ public enum SandboxPolicy {
         (allow file-map-executable (subpath "/usr/libexec") (subpath "/usr/share"))
 
         ;; System read (+ executable mapping for dyld / runtimes)
-        (allow file-read* (subpath "/usr/local") (subpath "/opt/homebrew") (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/lib") (subpath "/System/Library") (subpath "/Library/Frameworks") (subpath "/dev"))
+        (allow file-read* (subpath "/usr/local") (subpath "/opt/homebrew") (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/lib") (subpath "/System/Library") (subpath "/Library/Frameworks") (subpath "/Library/Java") (subpath "/dev"))
         (allow file-write* (literal "/dev/null"))
-        (allow file-map-executable (subpath "/usr/local") (subpath "/opt/homebrew") (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/lib") (subpath "/System/Library") (subpath "/Library/Frameworks") (subpath "/dev"))
+        (allow file-map-executable (subpath "/usr/local") (subpath "/opt/homebrew") (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/lib") (subpath "/System/Library") (subpath "/Library/Frameworks") (subpath "/Library/Java") (subpath "/dev"))
 
         ;; Directory-entry reads for path components above the allowed
         ;; subtrees (node's realpathSync lstats each ancestor).
@@ -151,20 +151,59 @@ public enum SandboxPolicy {
         (allow process-fork)
         (allow process-exec)
         (allow process-info*)
-        (allow signal (target self) (target others))
+        ;; Signal targets: self, same-sandbox processes (the session's own
+        ;; children — verified: `(target others)` alone denies kill on them
+        ;; with EPERM), and other processes (e.g. pkill'ing leftovers from
+        ;; earlier sessions).
+        (allow signal (target self) (target others) (target same-sandbox))
 
         ;; IPC / misc
         (allow sysctl-read)
         (allow file-ioctl)
-        (allow mach-lookup
-          (global-name "com.apple.system.logger")
-          (global-name "com.apple.system.opendirectoryd.libinfo")
-          (global-name "com.apple.mDNSResponder"))
+
+        ;; POSIX semaphores + shared memory — allowed in general. Python's
+        ;; multiprocessing module uses named semaphores (sem_open) and shared
+        ;; memory (shm_open); without these, multiprocessing.Lock() and
+        ;; SharedMemory fail with "Operation not permitted". Like Mach IPC,
+        ;; tools the agent runs use arbitrary names, so no whitelist.
+        (allow ipc-posix-sem)
+        (allow ipc-posix-shm)
+
+        ;; Mach IPC — allowed in general. The agent builds and runs arbitrary
+        ;; tools whose IPC uses dynamic Mach service names: ipc-channel
+        ;; bootstrap names are random per connection
+        ;; ("org.rust-lang.ipc-channel.<rand>"), XPC services are
+        ;; launchd-registered, etc. — whitelisting individual names is
+        ;; whack-a-mole (denying register/lookup surfaces as
+        ;; BOOTSTRAP_NOT_PRIVILEGED, mach error 0x44c). Registering/looking
+        ;; up Mach services cannot loosen the seatbelt profile, and
+        ;; privileged services (tccd, securityd, …) still check the caller's
+        ;; entitlements, which the agent process does not have.
+        (allow mach-lookup)
+        (allow mach-register)
+
+        ;; GPU / Metal — wgpu and other graphics stacks enumerate adapters and
+        ;; create devices through IOKit GPU services; without these, adapter
+        ;; enumeration finds nothing ("metal found no adapters"). Mirrors
+        ;; Apple's GPU daemon profile (com.apple.gputoolsserviced.sb): open
+        ;; the GPU registry services (AGX on Apple Silicon, Intel/AMD on
+        ;; Intel) and their user clients, plus IOSurface for compositing.
+        (allow iokit-open-service (iokit-registry-entry-class "IOSurfaceRoot"))
+        (allow iokit-open-user-client (iokit-user-client-class "IOSurfaceRootUserClient"))
+        (allow iokit-open-service (iokit-registry-entry-class-prefix "AGX" "AGPM" "IOGPU" "AMDRadeon" "IntelAccelerator"))
+        (allow iokit-open-user-client (iokit-user-client-class-regex "*AGX*" "*IOGPU*"))
+        (allow iokit-open-user-client (iokit-user-client-class "IGAccelDevice" "IGAccelSharedUserClient" "AGPMClient" "IGAccelCommandQueue"))
+        ;; Adapter properties (MetalPluginName, registry IDs, …) — read-only
+        ;; metadata, needed while enumerating adapters.
+        (allow iokit-get-properties)
 
         ;; Network — loopback only. The app's whitelist proxy (WhitelistProxy)
         ;; on 127.0.0.1 is the sole internet egress; anything that ignores the
-        ;; proxy env simply cannot connect (fail-closed).
+        ;; proxy env simply cannot connect (fail-closed). Inbound is loopback
+        ;; too: local test servers (WPT runners, WebDriver, TLA+ tracing)
+        ;; bind and accept on 127.0.0.1 inside the sandbox.
         (allow network-outbound (remote ip "localhost:*"))
+        (allow network-inbound (local ip "localhost:*"))
         """
     }
 

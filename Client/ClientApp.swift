@@ -28,11 +28,6 @@ struct ClientApp: App {
             AppCommands()
         }
 
-        MenuBarExtra("uni03C0", systemImage: "terminal.fill") {
-            QuickPromptView()
-        }
-        .menuBarExtraStyle(.window)
-
         Settings {
             SandboxSettingsView()
         }

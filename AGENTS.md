@@ -117,11 +117,11 @@ from two user-editable settings (first-run picker + Settings page):
   work (GitHub, crates.io, npm, PyPI, the Go proxy, rustup/node downloads).
 
 Settings are snapshotted when an agent process spawns: per session — the
-initial window session, each additional **tab** (all tabs share the same
-sandbox settings; each spawns its own process with a fresh snapshot), or the
-menu-bar quick prompt. A running agent keeps its sandbox until its session
-ends; new sessions pick up the current settings. Resume/Reload reuse the
-running process and never re-apply settings.
+initial window session and each additional **tab** (all tabs share the same
+sandbox settings; each spawns its own process with a fresh snapshot). A
+running agent keeps its sandbox until its session ends; new sessions pick up
+the current settings. Resume/Reload reuse the running process and never
+re-apply settings.
 
 ### Mechanism — Strategy A via a launcher
 
@@ -135,27 +135,121 @@ fails the launcher exits non-zero with the error on stderr.
 
 ### The policy
 
-Built by `SandboxPolicy.source(...)` in Core: the **projects root** (every
-project inside it is read+write — the workspace) + `~/.pi` + dev dirs
-read/write, temp, system read, processes, IPC — plus the macOS dev-tooling
-paths (xcode-select's `/var` symlink, `$TMPDIR` in `/var/folders`,
-`/usr/share`|`/usr/libexec`, `/etc`, and Preferences for the Xcode license
-check) and two empirically required pieces: Apple's **dyld-support rules**
-(cryptex graft points + special syscalls; without them dyld aborts at
-startup) and **`path-ancestors` rules** for every allowed subtree (node's
-`realpathSync` lstats each component).
+Built by `SandboxPolicy.source(...)` in Core. The **user-configurable** part
+comes from `SandboxSettings` (the Settings page): the dev directories and the
+allowed hosts. Everything else is a **fixed scaffold**, always present:
 
-Network is **loopback-only**: the Seatbelt profile language on macOS 26
-accepts only `*` and `localhost` as network hosts (no IPs, no hostnames), so
-the domain whitelist is enforced by `WhitelistProxy` — a loopback HTTP proxy
-in the app (CONNECT + absolute-URI) that is the agent's sole egress. The
+- **Projects root (read + write)** — the top-level working folder; every
+  project inside it is the agent's workspace.
+- **`~/.pi` (read + write)** — pi's sessions, config, auth.
+- **Dev directories (read + write)** — the user's list: toolchain homes,
+  caches, frameworks, Xcode, TLA+ Toolbox, …
+- **Temp (read + write)** — `/tmp`, `/private/tmp`, `/private/var/tmp` (both
+  the literal and the symlink spelling — seatbelt does not resolve the `/tmp`
+  symlink, so tools writing to `/tmp` literally need that entry too).
+- **System (read-only + executable mapping)** — `/usr/local`, `/opt/homebrew`,
+  `/usr/bin`, `/bin`, `/usr/lib`, `/System/Library`, `/Library/Frameworks`,
+  `/Library/Java` (JVM runtimes — the TLA+ verification runs TLC via system
+  java), `/dev`.
+- **macOS dev-tooling (read)** — the `/var` symlink root (xcode-select),
+  `/etc` configs, `/usr/share`, `/usr/libexec`, `/Library/Apple`, and
+  Preferences (the Xcode license check reads `com.apple.dt.Xcode.plist`
+  directly, not via cfprefsd).
+- **Git configuration (read-only)** — `~/.gitconfig`, `~/.gitattributes`,
+  `~/.gitignore_global`, `~/.git-credentials`, `~/.config/git`, `~/.ssh`.
+  Without these every git command fails ("unable to access '~/.gitconfig':
+  Operation not permitted") — and SwiftPM package resolution needs them too.
+- **Mach syscalls (allowed)** — the sandbox module's syscalls are permitted so
+  tools like SwiftPM can apply their *own* child sandboxes (`sandbox-exec`);
+  they can never loosen the outer profile. (Apple's own restrictive profiles
+  allow all mac syscalls.)
+- **Mach IPC (allowed in general)** — `mach-lookup` + `mach-register` are not
+  name-whitelisted: tools the agent runs use dynamic service names
+  (ipc-channel bootstrap names are random per connection,
+  `org.rust-lang.ipc-channel.<rand>`; XPC services are launchd-registered),
+  so a name whitelist is impossible. Privileged services (tccd, securityd, …)
+  still check the caller's entitlements, which the agent process does not
+  have.
+- **POSIX IPC (allowed in general)** — `ipc-posix-sem` + `ipc-posix-shm`:
+  Python's multiprocessing uses named semaphores and shared memory, so
+  `multiprocessing.Lock()`/`SharedMemory` fail with "Operation not
+  permitted" without them.
+- **GPU / Metal (IOKit)** — wgpu and other graphics stacks enumerate adapters
+  and create devices through IOKit GPU services (AGX on Apple Silicon, Intel/
+  AMD on Intel) plus IOSurface; without `iokit-open-*` rules adapter
+  enumeration finds nothing ("metal found no adapters"). Mirrors Apple's
+  `com.apple.gputoolsserviced.sb`.
+- **Processes** — fork/exec, process info; signal targets are self,
+  same-sandbox processes (the session's own children), and other processes,
+  so `pkill`/kill work both on the session's own processes and on leftovers
+  from earlier sessions. (Verified: `(target others)` alone denies kill on
+  the session's own children.)
+- **dyld-support rules** — Apple's cryptex graft points + special
+  syscalls/fcntls, taken verbatim from
+  `/System/Library/Sandbox/Profiles/dyld-support.sb`; without them dyld
+  aborts at startup.
+- **`path-ancestors` rules** — for every allowed subtree, because node's
+  `realpathSync` lstats each path component and a denied lstat of an ancestor
+  aborts startup with EPERM.
+
+Network is **loopback-only, both directions**: the Seatbelt profile language
+on macOS 26 accepts only `*` and `localhost` as network hosts (no IPs, no
+hostnames), so the domain whitelist is enforced by `WhitelistProxy` — a
+loopback HTTP proxy in the app (CONNECT + absolute-URI) that is the agent's
+sole internet egress. Outbound on `localhost` is allowed so the proxy is
+reachable; inbound on `localhost` is allowed so local test servers (WPT
+runners, WebDriver, TLA+ tracing) can bind ports inside the sandbox. The
 agent's environment carries `HTTP(S)_PROXY`/`ALL_PROXY`, `NO_PROXY`,
 `NODE_OPTIONS=--use-env-proxy` (node's undici only honors proxy env with this
 flag) and `GIT_CONFIG_COUNT/KEY/VALUE` (git ignores proxy env). Anything that
 ignores the proxy env simply fails to connect — fail-closed, no bypass.
 
-Empirical notes are appended to `../formal-web/scratchpad/sandbox-design.md`
-(§10).
+Saved settings lists from an older app version automatically gain any new
+default entries once (one-shot migration in `SandboxSettings.load()`); after
+that, user edits win wholesale.
+
+### Empirical notes (verified on macOS 26, 2026-08)
+
+Everything above was confirmed by real failures during this session's work
+(building the app, running xcodebuild/SPM, and running the formal-web
+end-of-task verification — WPT, TLA+ traces — inside the sandbox).
+
+- **Diagnosing a denial**: the sandbox logs denials only to the unified log,
+  and `log show`/`log stream`, `dtruss`, and `lldb` attach are all blocked
+  inside the sandbox (no root, no debugserver attach). What works: direct
+  probes (`ls`, `stat`, `kill -0`, `mdfind`, `mdutil`, `/usr/sbin/ioreg`,
+  `otool -L`/`nm -u`/`strings` on the tool's binaries). `DYLD_INSERT_LIBRARIES`
+  interposition is refused on hardened Apple system binaries.
+- **Not every failure is the sandbox — check the machine first.**
+  `java_home`/`/usr/bin/java` reporting "Unable to locate a Java Runtime"
+  looked sandbox-caused but was not: JVM discovery goes through the Spotlight
+  catalog (`JavaLaunching.framework`), and this machine has Spotlight
+  indexing disabled (`mdutil -s /` → "Indexing and searching disabled"), so
+  discovery fails unsandboxed too. `JAVA_HOME` set to the JDK's `Contents/Home`
+  makes `/usr/bin/java` work inside the sandbox (verified).
+- **Signal targets are context-scoped.** `(allow signal (target others))`
+  covers processes outside the sandbox context but NOT the session's own
+  children — kill on a child fails with EPERM until `(target same-sandbox)`
+  is added. Verified: `kill -0` on an unsandboxed process succeeds, on the
+  agent's own child it is denied.
+- **SPM's package resolution runs `sandbox-exec`** (its own nested sandbox)
+  and fails with "sandbox_apply: Operation not permitted" unless the outer
+  profile allows `system-mac-syscall`. This also surfaced as the reason
+  xcodebuild could not resolve Swift packages inside the sandbox.
+- **`xcodebuild` package resolution also needs the git-config reads** — SPM
+  shells out to git to clone dependencies, so a denied `~/.gitconfig` fails
+  the whole build, not just `git status`.
+- **Python `multiprocessing` needs POSIX IPC** (`ipc-posix-sem` for
+  `sem_open`, `ipc-posix-shm` for `shm_open`) — without them `Lock()` and
+  `SharedMemory` raise `PermissionError: Operation not permitted`.
+- **Local test servers bind loopback ports inside the sandbox** — the WPT
+  runner and the TLA+ tracing embedder bind 127.0.0.1; `network-inbound` on
+  `localhost` was missing and surfaced as "failed to allocate local port:
+  Operation not permitted".
+- **Policy edits take effect only for new sessions after an app rebuild +
+  restart** (Resume/Reload reuse the running process — see above). Iterating
+  on the policy is one probe → edit → rebuild/restart per round trip; the
+  probes in the first bullet make each round trip decisive.
 
 ## Modules
 
@@ -236,8 +330,6 @@ concurrency.
   disabled until both a model and a thinking level have been chosen.
 - `SessionTab` — one tab's state: owns its `SessionViewModel` plus the
   per-session UI bits (recent sessions, history sheet, prompt draft).
-  `SessionView` (the menu-bar quick prompt) is the single-session form of
-  the same content.
 - `SessionContent` / `SessionToolbar` — the shared session UI: transcript +
   prompt bar + queued-steering banner, and the toolbar items, both bound to
   whichever session owns them.

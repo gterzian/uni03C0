@@ -52,6 +52,7 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             "/Library/Developer",          // Xcode shared data
             "/Library/Developer/CommandLineTools",
             "/Applications/Xcode.app",     // Xcode: SDKs, toolchains, swiftc
+            "/Applications/TLA+ Toolbox.app", // TLA+ formal verification (spec checks)
             "/opt/local",                  // MacPorts
             "/usr/local",                  // Homebrew (Intel) / local installs
             "~/Library/Developer",          // Xcode DerivedData, module caches

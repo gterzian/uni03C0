@@ -15,6 +15,8 @@ final class SandboxSettingsTests: XCTestCase {
         XCTAssertTrue(defaults.readOnlyPaths.contains("/Library/Frameworks"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/System/Library/Frameworks"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/Applications/Xcode.app"))
+        // Formal verification tooling (spec traces run from the agent).
+        XCTAssertTrue(defaults.readOnlyPaths.contains("/Applications/TLA+ Toolbox.app"))
         // Build output/caches and Homebrew (Intel) — writable dev dirs
         XCTAssertTrue(defaults.readOnlyPaths.contains("~/Library/Developer"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/usr/local"))
@@ -155,6 +157,9 @@ final class SandboxPolicyTests: XCTestCase {
         let settings = SandboxSettings(readOnlyPaths: [], allowedHosts: ["whatwg.org"])
         let source = source(settings: settings)
         XCTAssertTrue(source.contains("(allow network-outbound (remote ip \"localhost:*\"))"))
+        // Inbound is loopback too — local test servers (WPT, WebDriver, TLA+)
+        // bind/accept on 127.0.0.1 inside the sandbox.
+        XCTAssertTrue(source.contains("(allow network-inbound (local ip \"localhost:*\"))"))
         XCTAssertFalse(source.contains("whatwg.org"))
     }
 
@@ -170,6 +175,53 @@ final class SandboxPolicyTests: XCTestCase {
         // resolution aborts with "sandbox_apply: Operation not permitted".
         let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
         XCTAssertTrue(source.contains("(allow system-mac-syscall)"))
+    }
+
+    func testPolicyAllowsMachIpc() {
+        // The agent runs arbitrary tools whose IPC uses dynamic Mach service
+        // names (ipc-channel bootstrap names are random per connection), so
+        // mach lookup/register are allowed in general, not name-whitelisted.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(allow mach-lookup)"))
+        XCTAssertTrue(source.contains("(allow mach-register)"))
+        XCTAssertFalse(source.contains("global-name"))
+    }
+
+    func testPolicyAllowsGpuMetal() {
+        // wgpu/Metal enumerate adapters and create devices via IOKit GPU
+        // services (AGX on Apple Silicon); without iokit-open rules adapter
+        // enumeration finds nothing ("metal found no adapters").
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(iokit-registry-entry-class-prefix \"AGX\" \"AGPM\" \"IOGPU\" \"AMDRadeon\" \"IntelAccelerator\")"))
+        XCTAssertTrue(source.contains("iokit-user-client-class-regex"))
+        XCTAssertTrue(source.contains("(allow iokit-get-properties)"))
+        XCTAssertTrue(source.contains("(iokit-registry-entry-class \"IOSurfaceRoot\")"))
+    }
+
+    func testPolicyAllowsPosixIpc() {
+        // Python multiprocessing uses POSIX named semaphores + shared memory;
+        // without these, multiprocessing.Lock()/SharedMemory raise
+        // PermissionError "Operation not permitted".
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(allow ipc-posix-sem)"))
+        XCTAssertTrue(source.contains("(allow ipc-posix-shm)"))
+    }
+
+    func testPolicyAllowsSignaling() {
+        // `(target others)` alone does NOT cover the session's own children
+        // (same sandbox context) — kill on them is denied with EPERM. Both
+        // same-sandbox and others are needed for kill/pkill in scripts.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(allow signal (target self) (target others) (target same-sandbox))"))
+    }
+
+    func testPolicyAllowsJavaRuntime() {
+        // The TLA+ verification runs TLC via system java (Temurin under
+        // /Library/Java/JavaVirtualMachines); without /Library/Java read +
+        // exec mapping the java stub reports "Unable to locate a Java Runtime".
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(subpath \"/Library/Java\")"))
+        XCTAssertTrue(source.contains("(path-ancestors \"/Library/Java\")"))
     }
 
     func testCanonicalizeExpandsTilde() {

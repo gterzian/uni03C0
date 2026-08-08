@@ -66,8 +66,18 @@ Part of the policy scaffold, always present:
 - **Nested sandboxing** — the sandbox module's mac syscalls are permitted so
   tools like SwiftPM can apply their own child sandboxes; they can never
   loosen the outer profile.
-- **Network** — loopback only; the domain whitelist is enforced by the app's
-  proxy (below), and anything that ignores the proxy simply cannot connect.
+- **Mach + POSIX IPC** — allowed in general: tools the agent runs use dynamic
+  Mach service names (ipc-channel bootstrap names are random per connection,
+  XPC services are launchd-registered) and Python multiprocessing uses named
+  semaphores/shared memory, so nothing is name-whitelisted. Privileged
+  services still check the caller's entitlements.
+- **GPU / Metal** — IOKit access to the GPU services (AGX, Intel/AMD) and
+  IOSurface, so graphics stacks (wgpu) can enumerate adapters and create
+  devices; without it, adapter enumeration finds nothing.
+- **Network** — loopback only (outbound and inbound): local test servers
+  (WPT runners, WebDriver, TLA+ tracing) bind on 127.0.0.1, and the domain
+  whitelist is enforced by the app's proxy (below) — anything that ignores
+  the proxy simply cannot connect.
 
 ### When changes take effect
 

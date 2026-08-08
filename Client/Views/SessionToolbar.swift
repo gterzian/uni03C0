@@ -1,10 +1,9 @@
 import Core
 import SwiftUI
 
-/// The window-toolbar items for one live session, shared by the single-session
-/// view (`SessionView`) and the tabbed main window (`SessionTabsView`): Stop,
-/// Reload, the model + thinking-level pickers, and the Resume menu — all bound
-/// to the session in `tab`.
+/// The window-toolbar items for one live session, shared by the tabbed main
+/// window (`SessionTabsView`): Stop, Reload, the model + thinking-level
+/// pickers, and the Resume menu — all bound to the session in `tab`.
 enum SessionToolbar {
     @ToolbarContentBuilder
     static func content(tab: SessionTab) -> some ToolbarContent {
