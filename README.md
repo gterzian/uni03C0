@@ -29,8 +29,11 @@ agent),
 3. the allowed internet domains. 
 
 After that, pick a project and start prompting. The app is
-single-window: it opens on your last project (or the setup screen), and the
-Projects menu switches projects by replacing the window.
+single-window, but **tabbed**: your project opens as the first tab, a "+"
+adds more sessions (one tab per folder, each a separate agent process with
+the same sandbox settings), and tabs show at a glance whether their session
+is idle or working. The Projects menu switches the window to another
+project.
 
 ## Sandbox 
 
@@ -45,6 +48,9 @@ touch is defined in Settings (app menu → Settings…):
 - **Internet** — only the whitelisted domains (subdomains included); the model
   provider and the usual code sources (GitHub, crates.io, npm, PyPI, …) are
   prefilled.
+- **Agent RPC endpoint** — the pi executable the client spawns as
+  `pi --mode rpc` (default: pi on PATH); point it at a different binary from
+  Settings.
 
 Two mechanism notes that shape the design:
 

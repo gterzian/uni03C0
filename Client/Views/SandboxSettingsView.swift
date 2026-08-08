@@ -1,19 +1,24 @@
+import Core
 import SwiftUI
 
-/// The sandbox settings page (app menu → Settings…, ⌘,): the definition of
-/// the sandbox — the top-level projects folder (read+write for everything in
-/// it), the development directories, and the allowed internet domains. Same
-/// fields as the first-run setup; applied at app startup.
+/// The settings page (app menu → Settings…, ⌘,): the definition of the
+/// sandbox — the top-level projects folder (read+write for everything in
+/// it), the development directories, and the allowed internet domains — plus
+/// the agent RPC endpoint (the pi executable spawned as `pi --mode rpc`).
+/// Same fields as the first-run setup; snapshotted per session at spawn.
 struct SandboxSettingsView: View {
     @State private var model = SandboxSettingsModel.shared
     @State private var appState = AppState.shared
     @State private var saved = false
+    /// The agent RPC endpoint: the local pi executable spawned as
+    /// `pi --mode rpc`. Prefilled with the default (pi resolved from PATH).
+    @State private var rpcEndpointText = RPCEndpointSettings.load().executablePath
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Sandbox")
+            Text("Settings")
                 .font(.title2.weight(.semibold))
-            Text("The agent runs in a Seatbelt sandbox: everything it can touch is defined here, and everything else is off-limits. These settings are applied at app startup — a running agent keeps the sandbox it started with until the app is restarted.")
+            Text("The agent runs in a Seatbelt sandbox: everything it can touch is defined below, and everything else is off-limits. Settings are snapshotted when a session starts — a running agent keeps what it started with until the session ends; new sessions (including new tabs) pick up the current values.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -33,7 +38,7 @@ struct SandboxSettingsView: View {
                         appState.chooseProjectsRoot()
                     }
                 }
-                Text("The top-level folder the agent works on — everything inside it is read + write. The agent also gets ~/.pi. Changing it takes effect on the next app start.")
+                Text("The top-level folder the agent works on — everything inside it is read + write. The agent also gets ~/.pi. Changing it takes effect on the next session.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -55,15 +60,38 @@ struct SandboxSettingsView: View {
                 footnote: "One domain per line; subdomains are included. The agent can reach no other internet host. The model provider's domain (e.g. api.deepseek.com) must be listed for the agent to reach its model."
             )
 
+            // The agent RPC endpoint: where the client finds `pi --mode rpc`.
+            // Local process only — the client speaks the RPC protocol over the
+            // executable's stdin/stdout.
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Agent RPC endpoint", systemImage: "terminal")
+                    .font(.headline)
+                HStack(spacing: 8) {
+                    TextField("pi executable path", text: $rpcEndpointText)
+                        .font(.system(.body, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                    Button("Reset to Default") {
+                        rpcEndpointText = RPCEndpointSettings.defaults.executablePath
+                    }
+                }
+                Text("The path to the pi executable the client drives in RPC mode (`pi --mode rpc`), spawned as a local process. Default: the pi binary found on PATH. New sessions start from this path.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack(spacing: 10) {
                 if saved {
-                    Label("Saved — applies at next app startup", systemImage: "checkmark.circle.fill")
+                    Label("Saved — new sessions use these settings", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                         .font(.callout)
                 }
                 Spacer()
                 Button("Save") {
                     model.save()
+                    RPCEndpointSettings(
+                        executablePath: rpcEndpointText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ).save()
                     saved = true
                 }
                 .keyboardShortcut(.defaultAction)

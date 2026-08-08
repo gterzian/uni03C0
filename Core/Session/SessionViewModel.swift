@@ -69,7 +69,7 @@ public final class SessionViewModel {
     private static let contextPollInterval: Duration = .seconds(2)
     private var contextPollTask: Task<Void, Never>?
 
-    public init(cwd: URL, executable: String = PiExecutable.resolve(), projectsRoot: URL? = nil) {
+    public init(cwd: URL, executable: String? = nil, projectsRoot: URL? = nil) {
         self.cwd = cwd
         // Debug escape hatch: PI_NOSANDBOX=1 runs the agent without a Seatbelt
         // profile (used to isolate sandbox-caused failures).
@@ -80,8 +80,12 @@ public final class SessionViewModel {
         // one-way and the proxy whitelist is fixed for the session's life, so
         // edits take effect on the next session (the settings page says so).
         self.proxy = WhitelistProxy(whitelist: .init(hosts: settings?.allowedHosts ?? []))
+        // The RPC endpoint: the local pi executable spawned as `pi --mode rpc`.
+        // Read from the settings (default: pi resolved from PATH), overridable
+        // programmatically for tests.
+        let exec = executable ?? RPCEndpointSettings.load().executablePath
         self.controller = ProcessController(
-            executablePath: executable,
+            executablePath: exec,
             arguments: ["--mode", "rpc"],
             workingDirectory: cwd.path,
             sandbox: settings,

@@ -116,10 +116,12 @@ from two user-editable settings (first-run picker + Settings page):
   `w3c.org`, `w3c.github.io`) and the code sources a coding agent needs to
   work (GitHub, crates.io, npm, PyPI, the Go proxy, rustup/node downloads).
 
-Settings are snapshotted when an agent process spawns: **at app startup**
-(the app is single-window) or when the menu-bar quick prompt starts one. A
-running agent keeps its sandbox until the app restarts. Resume/Reload reuse
-the running process and never re-apply settings.
+Settings are snapshotted when an agent process spawns: per session — the
+initial window session, each additional **tab** (all tabs share the same
+sandbox settings; each spawns its own process with a fresh snapshot), or the
+menu-bar quick prompt. A running agent keeps its sandbox until its session
+ends; new sessions pick up the current settings. Resume/Reload reuse the
+running process and never re-apply settings.
 
 ### Mechanism — Strategy A via a launcher
 
@@ -205,6 +207,9 @@ concurrency.
 - `SandboxSettings` — the persisted settings (dev directories, allowed
   hosts); defaults cover macOS development (cargo, rustup, nvm, Xcode, …)
   plus the model provider.
+- `RPCEndpointSettings` — the persisted agent RPC endpoint: the local pi
+  executable spawned as `pi --mode rpc`. Defaults to `PiExecutable.resolve()`
+  (pi on PATH); the Settings page lets the user point at a different binary.
 - `SandboxPolicy` — builds the Seatbelt policy text (project + dev paths +
   dyld-support + path-ancestors + loopback-only network).
 - `WhitelistProxy` — the loopback HTTP proxy (CONNECT + absolute-URI) that
@@ -212,18 +217,30 @@ concurrency.
 
 ### Client
 
-- `MainWindowView` / `SessionView` — the app's **single** window (one
-  pi process per app; no New Window — switching projects replaces the
-  window). On startup it opens the **last selected project folder**
-  (`AppState.shared.lastProject`, persisted to UserDefaults), or the picker
-  if no projects folder has ever been chosen (first run also shows the
-  sandbox setup fields). The toolbar (top right) carries the session
-  controls: Stop, Reload, the
-  **model** + **thinking level** pickers (current choice shown beside the
-  icon, a "choose model/thinking level" prompt until one is set), and Resume.
-  The live status readout (context %, model, thinking level) sits in the
-  prompt bar, not the toolbar. Sending a prompt is disabled until both a
-  model and a thinking level have been chosen.
+- `MainWindowView` / `SessionTabsView` — the app's **single window**, now
+  tabbed: one live session per tab, all sharing the same sandbox settings
+  (each session snapshots them at spawn). The window opens on the **last
+  selected project folder** (`AppState.shared.lastProject`, persisted to
+  UserDefaults) as the first tab, or the picker if no projects folder has
+  ever been chosen (first run also shows the sandbox setup fields). The
+  tab bar shows every session's folder name plus its live status — the same
+  spinner/stop icons as the toolbar's Stop button — so background tabs show
+  whether they're idle or working; a **"+"** button starts a new session in
+  a folder of the user's choice (NSOpenPanel). Only the active tab renders
+  its transcript; background tabs keep folding their event stream off-main.
+  The toolbar (top right) carries the active session's controls: Stop,
+  Reload, the **model** + **thinking level** pickers (current choice shown
+  beside the icon, a "choose model/thinking level" prompt until one is
+  set), and Resume. The live status readout (context %, model, thinking
+  level) sits in the prompt bar, not the toolbar. Sending a prompt is
+  disabled until both a model and a thinking level have been chosen.
+- `SessionTab` — one tab's state: owns its `SessionViewModel` plus the
+  per-session UI bits (recent sessions, history sheet, prompt draft).
+  `SessionView` (the menu-bar quick prompt) is the single-session form of
+  the same content.
+- `SessionContent` / `SessionToolbar` — the shared session UI: transcript +
+  prompt bar + queued-steering banner, and the toolbar items, both bound to
+  whichever session owns them.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
 - `SessionStatusBar` — removed. The model + thinking-level pickers live in
@@ -258,7 +275,8 @@ concurrency.
 - `SandboxSettingsModel` / `SandboxSettingsView` — the editable sandbox
   settings: the Settings page (app menu → Settings…, and a Projects-menu
   entry) and the first-run picker fields. Saved to the same
-  `SandboxSettings`; applied at app startup.
+  `SandboxSettings`; applied per session at spawn. The Settings page also
+  edits the agent RPC endpoint (`RPCEndpointSettings`).
 
 ## The transcript design (the load-bearing part)
 

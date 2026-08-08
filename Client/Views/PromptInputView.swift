@@ -36,6 +36,12 @@ struct PromptInputView: NSViewRepresentable {
     func updateNSView(_ nsView: PromptContainerView, context: Context) {
         context.coordinator.cwd = cwd
         context.coordinator.isEnabled = isEnabled
+        // Refresh the action closures: the representable is reused across tab
+        // switches (same structural identity), so the coordinator must target
+        // the currently active session, not the one it was created for.
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onAbort = onAbort
+        context.coordinator.onDraftChange = onDraftChange
         nsView.textView.isEditable = isEnabled
         nsView.textView.textColor = isEnabled ? .labelColor : .tertiaryLabelColor
         nsView.statusLabel.stringValue = statusText
@@ -60,6 +66,7 @@ final class PromptContainerView: NSView {
     /// prompt bar: context %, model, thinking level. Purely decorative — it
     /// never intercepts clicks or keys.
     let statusLabel = NSTextField(labelWithString: "")
+    private let scrollView = NSScrollView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -72,11 +79,16 @@ final class PromptContainerView: NSView {
     }
 
     private func setup() {
-        let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = false
         scrollView.drawsBackground = false
-        scrollView.borderType = .bezelBorder
+        // The input is rounded to match the window's own corner radius — the
+        // old bezel border left square corners that clashed with the window's
+        // rounded bottom edge. The background + border colors are dynamic
+        // (light/dark), so they're applied via `applyInputAppearance` and
+        // refreshed when the appearance changes.
+        scrollView.borderType = .noBorder
+        scrollView.wantsLayer = true
         // Reserve the bottom strip for the status readout so typed text never
         // scrolls under it.
         scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 16, right: 0)
@@ -112,6 +124,29 @@ final class PromptContainerView: NSView {
             statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
         ])
+        applyInputAppearance()
+    }
+
+    /// The window's corner radius, matched by the prompt input so the two
+    /// read as one surface instead of a square field poking into a rounded
+    /// window.
+    private static let cornerRadius: CGFloat = 10
+
+    /// Rounds the input and paints its background/border. Layer colors don't
+    /// follow the effective appearance automatically, so this re-runs on
+    /// light/dark changes.
+    private func applyInputAppearance() {
+        guard let layer = scrollView.layer else { return }
+        layer.cornerRadius = Self.cornerRadius
+        layer.borderWidth = 1
+        layer.borderColor = NSColor.separatorColor.cgColor
+        layer.backgroundColor = NSColor.textBackgroundColor.cgColor
+        layer.masksToBounds = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyInputAppearance()
     }
 }
 
@@ -133,9 +168,9 @@ final class PromptTextView: NSTextView {
 final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var cwd: URL
     var isEnabled = true
-    private let onSubmit: (String) -> Void
-    private let onAbort: () -> Void
-    private let onDraftChange: (String) -> Void
+    var onSubmit: (String) -> Void
+    var onAbort: () -> Void
+    var onDraftChange: (String) -> Void
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
