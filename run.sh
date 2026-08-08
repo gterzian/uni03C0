@@ -13,8 +13,10 @@ if [ -z "$APP" ]; then
 fi
 
 # Quit any running instance FIRST — `open` on an already-running app just
-# activates the OLD binary, which looks like "nothing was fixed".
-osascript -e 'quit app id "com.gterzian.client"' >/dev/null 2>&1 || true
+# activates the old process, which looks like "nothing was fixed". killall is
+# used because `osascript -e 'quit app'` can be silently denied by TCC
+# automation permission, leaving the stale instance alive.
+killall uni03C0 2>/dev/null || true
 sleep 0.5
 echo "Launching $APP"
 open "$APP"

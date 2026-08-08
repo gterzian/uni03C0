@@ -36,6 +36,16 @@ targets:
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
+  SandboxLauncher:
+    type: tool
+    platform: macOS
+    sources:
+      - SandboxLauncher
+    settings:
+      base:
+        PRODUCT_NAME: sandbox-launcher
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
   Client:
     type: application
     platform: macOS
@@ -44,8 +54,14 @@ targets:
     dependencies:
       - target: Core
         embed: true
+      - target: SandboxLauncher
       - package: Subprocess
         product: Subprocess
+    postCompileScripts:
+      - name: Copy sandbox launcher into the app bundle
+        script: |
+          mkdir -p "${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}"
+          cp "${BUILT_PRODUCTS_DIR}/sandbox-launcher" "${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client

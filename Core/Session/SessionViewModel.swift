@@ -46,6 +46,9 @@ public final class SessionViewModel {
 
     public let cwd: URL
     public let controller: ProcessController
+    /// Loopback whitelist proxy — the agent's only internet egress. Started
+    /// with the session, stopped with it.
+    public let proxy: WhitelistProxy
 
     /// AppKit-side hook: the transcript coordinator sets this and is called on
     /// the main actor whenever the store has mutated. The SwiftUI body
@@ -56,12 +59,24 @@ public final class SessionViewModel {
 
     private var eventTask: Task<Void, Never>?
 
-    public init(cwd: URL, executable: String = PiExecutable.resolve()) {
+    public init(cwd: URL, executable: String = PiExecutable.resolve(), projectsRoot: URL? = nil) {
         self.cwd = cwd
+        // Debug escape hatch: PI_NOSANDBOX=1 runs the agent without a Seatbelt
+        // profile (used to isolate sandbox-caused failures).
+        let settings = ProcessInfo.processInfo.environment["PI_NOSANDBOX"] == nil
+            ? SandboxSettings.load()
+            : nil
+        // Snapshot the sandbox settings at spawn: the seatbelt profile is
+        // one-way and the proxy whitelist is fixed for the session's life, so
+        // edits take effect on the next session (the settings page says so).
+        self.proxy = WhitelistProxy(whitelist: .init(hosts: settings?.allowedHosts ?? []))
         self.controller = ProcessController(
             executablePath: executable,
             arguments: ["--mode", "rpc"],
-            workingDirectory: cwd.path
+            workingDirectory: cwd.path,
+            sandbox: settings,
+            proxy: self.proxy,
+            projectsRoot: projectsRoot?.path
         )
     }
 
@@ -69,6 +84,8 @@ public final class SessionViewModel {
 
     public func start() async {
         guard eventTask == nil else { return }
+        // Bring up the loopback egress first so the spawn picks up the port.
+        try? await proxy.start()
         await controller.start()
         eventTask = Task { [weak self] in
             await self?.consumeEvents()
@@ -88,6 +105,7 @@ public final class SessionViewModel {
         eventTask?.cancel()
         eventTask = nil
         await controller.terminate()
+        await proxy.stop()
     }
 
     private func consumeEvents() async {
