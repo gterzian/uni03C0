@@ -15,6 +15,44 @@ operation) is needed, say so and let the human run it.
 
 ---
 
+## You are running inside a sandbox
+
+This app runs you (the agent) inside a **Seatbelt sandbox** (default-deny).
+Everything you can touch is defined by the user in the app's **Settings**
+(app menu → Settings…):
+
+- **Working folder — read + write.** Every project inside the top-level
+  folder the user chose. This is your workspace.
+- **Additional read/write paths — read + write.** Toolchain homes, caches,
+  frameworks, Xcode — whatever the user listed there.
+- **`~/.pi` — read + write** (your session data).
+- **System directories — read-only** (e.g. `/usr`, `/opt/homebrew`,
+  `/System/Library`).
+- **Internet — only the domains in "Allowed internet domains"** (subdomains
+  included), via a loopback whitelist proxy. Your environment carries
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, `NODE_OPTIONS=--use-env-proxy` and
+  git proxy config; any tool that ignores proxy env simply cannot connect.
+
+Everything else is blocked — silently (`EPERM`) or as a connection failure.
+**When you hit a permission problem, say so explicitly and tell the user what
+to change**, rather than guessing or working around it:
+
+- A file or directory you need is denied → ask the user to add it to
+  **"Additional read/write paths"** in Settings, or to move the work inside
+  the working folder.
+- A host you need to reach fails to connect → ask the user to add its domain
+  to **"Allowed internet domains"** in Settings.
+- A tool that should use the network fails → check whether it honors the
+  proxy environment; if it doesn't, tell the user how it must be configured
+  (or that the domain needs whitelisting).
+
+Settings are applied when a new agent process starts; after changing them the
+user restarts the app (Resume/Reload reuse the running process and do **not**
+re-apply the sandbox). See the Sandbox section under Project design for the
+mechanism.
+
+---
+
 # Project design
 
 ## What this is
@@ -62,12 +100,66 @@ choices for a running session.
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
 
+## Sandbox
+
+Every pi subprocess runs inside a **Seatbelt sandbox** (default-deny), built
+from two user-editable settings (first-run picker + Settings page):
+
+- **Development directories (read + write)** — toolchain homes, caches,
+  frameworks, Xcode. The project folder itself and `~/.pi` are always allowed
+  (read+write); system dirs and the dyld cryptexes are fixed scaffold.
+- **Allowed internet domains** — the only hosts the agent may reach on the
+  internet (subdomains included). Defaults cover the model provider
+  (`deepseek.com`), the web-spec sites (`whatwg.org`, `w3c.org`, `w3c.github.io`)
+  and the code sources a coding agent needs to work (GitHub, crates.io, npm,
+  PyPI, the Go proxy, rustup/node downloads).
+
+Settings are snapshotted when an agent process spawns: **at app startup**
+(the app is single-window) or when the menu-bar quick prompt starts one. A
+running agent keeps its sandbox until the app restarts. Resume/Reload reuse
+the running process and never re-apply settings.
+
+### Mechanism — Strategy A via a launcher
+
+The app does **not** apply the sandbox to the child from outside:
+`sandbox_apply(profile, pid)` silently sandboxes the *caller* when
+`task_for_pid` fails (verified — it sandboxed the app itself). Instead, a
+tiny C executable (`SandboxLauncher`, in the app bundle) calls `sandbox_init`
+on **itself** and then `execv`s the agent; the sandbox survives exec and is
+inherited by everything the agent spawns. Fail-closed: if `sandbox_init`
+fails the launcher exits non-zero with the error on stderr.
+
+### The policy
+
+Built by `SandboxPolicy.source(...)` in Core: the **projects root** (every
+project inside it is read+write — the workspace) + `~/.pi` + dev dirs
+read/write, temp, system read, processes, IPC — plus two empirically required
+pieces: Apple's **dyld-support rules** (cryptex graft points + special
+syscalls; without them dyld aborts at startup) and **`path-ancestors` rules**
+for every allowed subtree (node's `realpathSync` lstats each component).
+
+Network is **loopback-only**: the Seatbelt profile language on macOS 26
+accepts only `*` and `localhost` as network hosts (no IPs, no hostnames), so
+the domain whitelist is enforced by `WhitelistProxy` — a loopback HTTP proxy
+in the app (CONNECT + absolute-URI) that is the agent's sole egress. The
+agent's environment carries `HTTP(S)_PROXY`/`ALL_PROXY`, `NO_PROXY`,
+`NODE_OPTIONS=--use-env-proxy` (node's undici only honors proxy env with this
+flag) and `GIT_CONFIG_COUNT/KEY/VALUE` (git ignores proxy env). Anything that
+ignores the proxy env simply fails to connect — fail-closed, no bypass.
+
+Empirical notes are appended to `../formal-web/scratchpad/sandbox-design.md`
+(§10).
+
 ## Modules
 
 Three targets (see `project.yml`):
 
 - **Core** (framework, default *nonisolated*): the protocol + process
   layer and the data side of the transcript. No AppKit.
+- **SandboxLauncher** (tiny C executable, embedded in the app bundle):
+  applies the Seatbelt policy to itself (`sandbox_init`) and `execv`s the
+  agent — the only reliable way to sandbox the child (see the Sandbox
+  section).
 - **Client** (app, default *MainActor*): the SwiftUI shell + AppKit views.
   Display name "uni03C0".
 - **ClientTests** (unit-test bundle, XCTest): deterministic unit tests for
@@ -84,7 +176,8 @@ concurrency.
 
 - `ProcessController` — an actor wrapping
   [`swift-subprocess`](https://github.com/swiftlang/swift-subprocess). Spawns
-  `pi --mode rpc`, encodes outbound RPC commands, demuxes inbound frames by id
+  `pi --mode rpc` (through the sandbox launcher when sandboxing is on),
+  encodes outbound RPC commands, demuxes inbound frames by id
   (`response` frames resolve awaited sends; everything else is yielded on an
   `AsyncThrowingStream`).
 - `JSONLFramer` — manual LF-only framing. The stdlib treats U+2028/U+2029 as
@@ -104,13 +197,23 @@ concurrency.
   assistant message with thinking, tool call card).
 - `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
 - `PathCompletion` — filesystem path tab-completion for the prompt bar.
+- `SandboxSettings` — the persisted settings (dev directories, allowed
+  hosts); defaults cover macOS development (cargo, rustup, nvm, Xcode, …)
+  plus the model provider.
+- `SandboxPolicy` — builds the Seatbelt policy text (project + dev paths +
+  dyld-support + path-ancestors + loopback-only network).
+- `WhitelistProxy` — the loopback HTTP proxy (CONNECT + absolute-URI) that
+  enforces the host whitelist; the agent's sole internet egress.
 
 ### Client
 
-- `MainWindowView` / `SessionView` — the per-project window. On startup it
-  opens the **last selected project folder** (`AppState.shared.lastProject`,
-  persisted to UserDefaults), or the picker if none has been chosen. The
-  toolbar (top right) carries the session controls: Stop, Reload, the
+- `MainWindowView` / `SessionView` — the app's **single** window (one
+  pi process per app; no New Window — switching projects replaces the
+  window). On startup it opens the **last selected project folder**
+  (`AppState.shared.lastProject`, persisted to UserDefaults), or the picker
+  if no projects folder has ever been chosen (first run also shows the
+  sandbox setup fields). The toolbar (top right) carries the session
+  controls: Stop, Reload, the
   **model** + **thinking level** pickers (current choice shown beside the
   icon, a "choose model/thinking level" prompt until one is set), and Resume.
   The **context-window usage %** sits at the leading edge of the toolbar.
@@ -139,6 +242,12 @@ concurrency.
 - `SessionHistorySheet` — unbounded session list.
 - `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
   and subprocess cleanup on termination (every live child gets EOF on quit).
+  `AppDelegate` also enforces the single-window rule (closes duplicate main
+  windows).
+- `SandboxSettingsModel` / `SandboxSettingsView` — the editable sandbox
+  settings: the Settings page (app menu → Settings…, and a Projects-menu
+  entry) and the first-run picker fields. Saved to the same
+  `SandboxSettings`; applied at app startup.
 
 ## The transcript design (the load-bearing part)
 

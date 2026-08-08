@@ -207,7 +207,14 @@ final class TextRowView: NSView {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.05) { [weak self] in
                 guard let self, self.fadeGeneration == generation, let storage = self.textView.textStorage else { return }
                 for (r, c) in runs {
-                    storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(alpha), range: r)
+                    // The text may have been replaced/truncated since this fade
+                    // was scheduled; clip the range to the current length so a
+                    // stale range can't exceed the string (which raises an
+                    // NSRangeException on addAttribute).
+                    let current = NSRange(location: 0, length: storage.length)
+                    let clipped = NSIntersectionRange(r, current)
+                    guard clipped.length > 0 else { continue }
+                    storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(alpha), range: clipped)
                 }
             }
         }

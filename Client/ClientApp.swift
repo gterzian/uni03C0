@@ -18,10 +18,10 @@ struct ClientApp: App {
         WindowGroup("uni03C0", id: SceneIDs.mainWindow, for: ProjectRef.self) { $project in
             MainWindowView(project: $project)
         } defaultValue: {
-            // Start in the last project that was selected before shutdown, so
-            // the app resumes where the user left off. Falls back to the
-            // picker when no project has ever been chosen.
-            ProjectRef(cwd: AppState.shared.lastProject)
+            // First run (no projects folder chosen yet): open on the picker,
+            // which includes the sandbox setup fields. Otherwise resume where
+            // the user left off.
+            ProjectRef(cwd: AppState.shared.projectsRoot == nil ? nil : AppState.shared.lastProject)
         }
         .defaultSize(width: 920, height: 720)
         .commands {
@@ -32,6 +32,10 @@ struct ClientApp: App {
             QuickPromptView()
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SandboxSettingsView()
+        }
     }
 }
 

@@ -26,35 +26,41 @@ enum AppStorage {
 /// per-window toolbar menus bound to that window's session).
 struct AppCommands: Commands {
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
     @State private var appState = AppState.shared
 
     var body: some Commands {
-        CommandGroup(replacing: .newItem) {
-            Button("New Window") {
-                openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: nil))
-            }
-            .keyboardShortcut("n", modifiers: .command)
-        }
+        // Single-window app: no File > New / Cmd-N. The app opens its one
+        // window at startup; switching projects replaces that window.
+        CommandGroup(replacing: .newItem) {}
 
         CommandMenu("View") {
             FontSizeCommands()
         }
 
         CommandMenu("Projects") {
-            Button("New Window") {
-                openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: nil))
-            }
-            Divider()
             ForEach(appState.projects, id: \.self) { project in
                 Button(project.lastPathComponent) {
-                    appState.lastProject = project
-                    openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: project))
+                    switchToProject(project)
                 }
             }
             Divider()
+            Button("Sandbox Settings…") {
+                openSettings()
+            }
             Button("Choose Projects Folder…") {
                 appState.chooseProjectsRoot()
             }
         }
+    }
+
+    /// Switches the single window to another project: closes the current main
+    /// window and opens a fresh one. Never creates a second window.
+    private func switchToProject(_ project: URL) {
+        appState.lastProject = project
+        for window in NSApp.windows where window.identifier?.rawValue == SceneIDs.mainWindow {
+            window.close()
+        }
+        openWindow(id: SceneIDs.mainWindow, value: ProjectRef(cwd: project))
     }
 }

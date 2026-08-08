@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import System
 import Subprocess
@@ -27,6 +28,17 @@ public actor ProcessController {
     private let executablePath: String
     private let arguments: [String]
     private let workingDirectory: String?
+    /// The top-level projects folder: every project inside it is read+write
+    /// for the agent (the workspace). Falls back to `workingDirectory`.
+    private let projectsRoot: String?
+    /// Non-nil when the child must run inside a Seatbelt sandbox. The policy
+    /// is passed to the sandbox-launcher, which applies it to itself and execs
+    /// the agent (the app cannot sandbox the child from outside — see
+    /// SandboxPolicy).
+    private let sandbox: SandboxSettings?
+    /// Loopback whitelist proxy — the agent's only internet egress. Its port
+    /// is injected into the child's environment (HTTP_PROXY & friends).
+    private let proxy: WhitelistProxy?
 
     private var writer: StandardInputWriter?
     private var writerWaiters: [CheckedContinuation<StandardInputWriter, Error>] = []
@@ -43,11 +55,17 @@ public actor ProcessController {
         executablePath: String = PiExecutable.resolve(),
         arguments: [String] = ["--mode", "rpc"],
         workingDirectory: String? = nil,
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        sandbox: SandboxSettings? = nil,
+        proxy: WhitelistProxy? = nil,
+        projectsRoot: String? = nil
     ) {
         self.executablePath = executablePath
         self.arguments = arguments
         self.workingDirectory = workingDirectory
+        self.sandbox = sandbox
+        self.proxy = proxy
+        self.projectsRoot = projectsRoot
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: RPCFrame.self)
         self.events = stream
         self.eventsContinuation = continuation
@@ -158,10 +176,53 @@ public actor ProcessController {
     private func runProcess() async {
         let execPath = FilePath(executablePath)
         let workDir: FilePath? = workingDirectory.map { FilePath($0) }
+
+        // Sandbox via the launcher (Strategy A): the launcher applies the
+        // policy to itself with sandbox_init, then execs the agent. The app
+        // cannot apply the sandbox to the child from outside (sandbox_apply
+        // falls back to sandboxing the caller when task_for_pid fails), so
+        // this is the only reliable mechanism.
+        let policy: String?
+        let launchPath: FilePath
+        var launchArguments = arguments
+        if let sandbox {
+            // The writable workspace is the top-level projects folder (every
+            // project in it is read+write), not just the picked project.
+            policy = SandboxPolicy.source(
+                project: projectsRoot ?? workingDirectory ?? "",
+                settings: sandbox
+            )
+            guard let launcher = Self.launcherPath() else {
+                await handleFatal(ProcessError.launchFailed("sandbox launcher executable not found"))
+                return
+            }
+            launchPath = FilePath(launcher)
+            launchArguments = [executablePath] + arguments
+        } else {
+            policy = nil
+            launchPath = execPath
+        }
+
+        // Inherit the app environment, overlaid with the whitelist proxy so
+        // the agent's HTTP clients route through the loopback egress, and the
+        // policy for the launcher.
+        var environment = Environment.inherit
+        if let proxy, let port = try? await proxy.portValue() {
+            var updates: [Environment.Key: String?] = [:]
+            for (key, value) in proxy.environmentVariables(port: port) {
+                updates[Environment.Key(stringLiteral: key)] = value
+            }
+            environment = environment.updating(updates)
+        }
+        if let policy {
+            environment = environment.updating(["PI_SANDBOX_POLICY": policy])
+        }
+
         do {
             _ = try await Subprocess.run(
-                .path(execPath),
-                arguments: Arguments(arguments),
+                .path(launchPath),
+                arguments: Arguments(launchArguments),
+                environment: environment,
                 workingDirectory: workDir,
                 input: .inputWriter,
                 output: .sequence,
@@ -172,6 +233,15 @@ public actor ProcessController {
         } catch {
             await handleFatal(error)
         }
+    }
+
+    /// The sandbox launcher executable inside the app bundle
+    /// (Contents/MacOS/sandbox-launcher), if present.
+    private static func launcherPath() -> String? {
+        guard let executable = Bundle.main.executablePath else { return nil }
+        let dir = (executable as NSString).deletingLastPathComponent
+        let candidate = dir + "/sandbox-launcher"
+        return FileManager.default.isExecutableFile(atPath: candidate) ? candidate : nil
     }
 
     private func serve(_ execution: Execution<CustomWriteInput, SequenceOutput, SequenceOutput>) async {
