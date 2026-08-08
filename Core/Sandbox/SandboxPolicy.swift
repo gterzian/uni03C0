@@ -39,6 +39,7 @@ public enum SandboxPolicy {
         // when resolving `/opt/homebrew/…`), and a denied lstat of an
         // ancestor kills startup with EPERM.
         let ancestorTargets = ([projectPath, "\(home)/.pi"] + devPaths + [
+            "\(home)/.gitconfig", "\(home)/.gitattributes", "\(home)/.gitignore_global", "\(home)/.git-credentials", "\(home)/.config/git", "\(home)/.ssh",
             "/usr/local", "/opt/homebrew", "/usr/bin", "/bin", "/usr/lib",
             "/System/Library", "/Library/Frameworks", "/dev",
             "/private/tmp", "/private/var/tmp",
@@ -58,6 +59,18 @@ public enum SandboxPolicy {
         ;; pi's own data directory — read + write (sessions, config)
         (allow file-read* (subpath "\(home)/.pi"))
         (allow file-write* (subpath "\(home)/.pi"))
+
+        ;; User git configuration — read only. The agent runs read-only git
+        ;; (status/log/diff/show/…) per project rules, and those commands
+        ;; read the user's git config and credentials. Without these, every
+        ;; git command fails with "unable to access '~/.gitconfig': Operation
+        ;; not permitted" under default-deny.
+        ;; - ~/.gitconfig + ~/.config/git: user config, with the XDG fallback
+        ;;   (config, ignore, attributes, credentials)
+        ;; - ~/.git-credentials: credential-helper store
+        ;; - ~/.gitignore_global / ~/.gitattributes: common global files
+        ;; - ~/.ssh: keys + known_hosts for ssh remotes
+        (allow file-read* (literal "\(home)/.gitconfig") (literal "\(home)/.gitattributes") (literal "\(home)/.gitignore_global") (literal "\(home)/.git-credentials") (subpath "\(home)/.config/git") (subpath "\(home)/.ssh"))
 
         ;; User-configured development directories — read + write
         (allow file-read* \(devReadWrite))
@@ -123,6 +136,16 @@ public enum SandboxPolicy {
         (allow syscall-unix (syscall-number SYS_open) (syscall-number SYS_openat))
         (allow syscall-unix (syscall-number SYS_fstatat SYS_fstatat64))
         (allow syscall-unix (syscall-number SYS_dup))
+
+        ;; Nested sandboxing — SPM package resolution (xcodebuild resolving
+        ;; Swift packages) runs `sandbox-exec` to isolate its git fetch/clone,
+        ;; and the outer profile must permit the sandbox module's mac syscalls
+        ;; or resolution aborts with "sandbox-exec: sandbox_apply: Operation
+        ;; not permitted". Apple's own restrictive profiles (lockdownmoded.sb,
+        ;; safety-inference-extension-macos.sb) allow all mac syscalls; they
+        ;; only query/apply policy and cannot loosen an already-applied seatbelt
+        ;; profile, so granting them broadly is safe.
+        (allow system-mac-syscall)
 
         ;; Processes — spawn build tools; signal self and siblings
         (allow process-fork)

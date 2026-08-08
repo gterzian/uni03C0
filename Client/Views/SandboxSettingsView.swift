@@ -23,6 +23,19 @@ struct SandboxSettingsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            // Explainer: what's configurable here vs. the fixed policy scaffold.
+            VStack(alignment: .leading, spacing: 6) {
+                Label("What's configurable, what's not", systemImage: "info.circle")
+                    .font(.headline)
+                Text("The fields below are the agent's world — anything not listed is denied (files, network, syscalls). Always allowed with no configuration needed: ~/.pi (read + write), system directories (read-only), temp folders, your git configuration (read-only, so git and SwiftPM package resolution work), and loopback networking. Internet egress happens only through the whitelisted domains below — a domain that isn't listed cannot be reached, no matter what the agent tries.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+
             // The workspace: the top-level working folder, fully read+write.
             VStack(alignment: .leading, spacing: 4) {
                 Label("Working folder (read + write)", systemImage: "folder")

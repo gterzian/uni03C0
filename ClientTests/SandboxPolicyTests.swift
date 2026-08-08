@@ -91,6 +91,26 @@ final class SandboxPolicyTests: XCTestCase {
         XCTAssertTrue(source.contains("(allow file-write* (subpath \"/Users/tester/.pi\"))"))
     }
 
+    func testPolicyAllowsGitConfigReadOnly() {
+        // Read-only git (status/log/diff) needs the user's git config,
+        // credentials, and SSH material — but never writes to them.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(literal \"/Users/tester/.gitconfig\")"))
+        XCTAssertTrue(source.contains("(literal \"/Users/tester/.gitattributes\")"))
+        XCTAssertTrue(source.contains("(literal \"/Users/tester/.gitignore_global\")"))
+        XCTAssertTrue(source.contains("(literal \"/Users/tester/.git-credentials\")"))
+        XCTAssertTrue(source.contains("(subpath \"/Users/tester/.config/git\")"))
+        XCTAssertTrue(source.contains("(subpath \"/Users/tester/.ssh\")"))
+        // No write access to git config: the agent never runs git config
+        // writes or mutates credentials.
+        XCTAssertFalse(source.contains("file-write* (literal \"/Users/tester/.gitconfig\""))
+        XCTAssertFalse(source.contains("file-write* (subpath \"/Users/tester/.ssh\""))
+        // Ancestors for the new roots (node lstats every component).
+        XCTAssertTrue(source.contains("(path-ancestors \"/Users/tester/.gitconfig\")"))
+        XCTAssertTrue(source.contains("(path-ancestors \"/Users/tester/.config/git\")"))
+        XCTAssertTrue(source.contains("(path-ancestors \"/Users/tester/.ssh\")"))
+    }
+
     func testPolicyIncludesUserDevPathsExpanded() {
         let settings = SandboxSettings(readOnlyPaths: ["~/.cargo", "/Library/Frameworks"], allowedHosts: [])
         let source = source(settings: settings)
@@ -142,6 +162,14 @@ final class SandboxPolicyTests: XCTestCase {
         let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
         XCTAssertTrue(source.contains("/System/Cryptexes/OS"))
         XCTAssertTrue(source.contains("SYS_map_with_linking_np"))
+    }
+
+    func testPolicyAllowsNestedSandboxing() {
+        // SPM package resolution runs sandbox-exec; the outer profile must
+        // permit the sandbox module's mac syscalls or xcodebuild's package
+        // resolution aborts with "sandbox_apply: Operation not permitted".
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(allow system-mac-syscall)"))
     }
 
     func testCanonicalizeExpandsTilde() {

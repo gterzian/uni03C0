@@ -35,22 +35,50 @@ the same sandbox settings), and tabs show at a glance whether their session
 is idle or working. The Projects menu switches the window to another
 project.
 
-## Sandbox 
+## Sandbox
 
-The agent runs inside a **Seatbelt sandbox** (default-deny). Everything it can
-touch is defined in Settings (app menu → Settings…):
+The agent runs inside a **Seatbelt sandbox** (default-deny): the policy
+defines everything it can touch, and everything else is off-limits — files,
+network, syscalls. Configuration lives in Settings (app menu → Settings…).
+
+### What you configure
 
 - **Working folder** — the top-level projects folder; every project inside it
   is read+write. This is the agent's workspace.
 - **Additional read/write paths** — toolchain homes, caches, frameworks,
-  Xcode (prefilled with what macOS development needs).
-- **`~/.pi`** — read+write (session data); system dirs — read-only.
-- **Internet** — only the whitelisted domains (subdomains included); the model
-  provider and the usual code sources (GitHub, crates.io, npm, PyPI, …) are
-  prefilled.
-- **Agent RPC endpoint** — the pi executable the client spawns as
-  `pi --mode rpc` (default: pi on PATH); point it at a different binary from
-  Settings.
+  Xcode (prefilled with what macOS development needs). One path per line.
+- **Allowed internet domains** — the only hosts the agent can reach
+  (subdomains included); the model provider and the usual code sources
+  (GitHub, crates.io, npm, PyPI, …) are prefilled. One domain per line.
+- **Agent RPC endpoint** — the pi executable spawned as `pi --mode rpc`
+  (default: pi on PATH); point it at a different binary from Settings.
+
+### What's fixed (not configurable)
+
+Part of the policy scaffold, always present:
+
+- **`~/.pi`** — read+write (sessions, config, auth).
+- **System directories** — read-only (`/usr`, `/opt/homebrew`,
+  `/System/Library`, …), plus temp folders (read+write).
+- **Your git configuration** — read-only (`~/.gitconfig`, `~/.config/git`,
+  `~/.git-credentials`, `~/.ssh`, …), so `git status`/`log`/… and SwiftPM
+  package resolution work inside the sandbox.
+- **Nested sandboxing** — the sandbox module's mac syscalls are permitted so
+  tools like SwiftPM can apply their own child sandboxes; they can never
+  loosen the outer profile.
+- **Network** — loopback only; the domain whitelist is enforced by the app's
+  proxy (below), and anything that ignores the proxy simply cannot connect.
+
+### When changes take effect
+
+Settings are **snapshotted when a session starts**. A running agent keeps the
+sandbox it started with until that session ends — Resume/Reload reuse the
+running process and do **not** re-apply settings, so after editing settings,
+quit and relaunch the app (new tabs also pick up current settings). Saved
+lists from an older app version automatically gain any new default entries
+once (one-shot migration); after that, your edits win wholesale.
+
+### Mechanism notes
 
 Two mechanism notes that shape the design:
 
@@ -66,6 +94,3 @@ Two mechanism notes that shape the design:
   `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, `NODE_OPTIONS=--use-env-proxy` (node
   only honors proxy env with this flag) and git proxy config; anything that
   ignores the proxy simply fails to connect — fail-closed, no bypass.
-
-Settings are applied when a new agent process starts (app launch). A running
-agent keeps its sandbox until the app restarts.
