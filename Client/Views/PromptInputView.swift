@@ -184,8 +184,12 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             guard let self, let container = self.container, let window = container.window else { return event }
             // Window not front (or a sheet is up): let the key window handle Esc.
             guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // Popup menu tracking (a dropdown is open): let it close on Esc.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu }) else { return event }
+            // A VISIBLE popup-menu-level window means a dropdown (or the path
+            // completion list) is tracking: let Esc close it instead of
+            // aborting. NB: ordered-out windows are still in NSApp.windows —
+            // the completion window lives hidden at .popUpMenu level for the
+            // whole session and would otherwise swallow every Esc.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
             // Prompt input has focus: its own Esc handling (completion → abort)
             // runs; don't fire the abort twice.
             if window.firstResponder === container.textView { return event }

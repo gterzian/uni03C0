@@ -10,8 +10,10 @@ Allowed (read-only):
 Forbidden (anything that writes or changes state):
 - `git add`, `git commit`, `git push`, `git pull`, `git fetch`, `git checkout`, `git switch`, `git reset`, `git revert`, `git rebase`, `git merge`, `git cherry-pick`, `git stash` (push/pop/drop), `git tag`, `git branch -m`, `git clean`, `git rm`, `git mv`, `git config` writes, `git init`, `git gc`, `git filter-branch`.
 
-The human owns the repository history. If a commit (or any other write
-operation) is needed, say so and let the human run it.
+The human owns the repository history. When the user asks to "commit" (or a
+commit is needed), that means **suggest a commit message** and let the human
+run it — the agent never runs `git commit` or any other write operation
+itself.
 
 ---
 
@@ -109,10 +111,10 @@ from two user-editable settings (first-run picker + Settings page):
   frameworks, Xcode. The project folder itself and `~/.pi` are always allowed
   (read+write); system dirs and the dyld cryptexes are fixed scaffold.
 - **Allowed internet domains** — the only hosts the agent may reach on the
-  internet (subdomains included). Defaults cover the model provider
-  (`deepseek.com`), the web-spec sites (`whatwg.org`, `w3c.org`, `w3c.github.io`)
-  and the code sources a coding agent needs to work (GitHub, crates.io, npm,
-  PyPI, the Go proxy, rustup/node downloads).
+  internet (subdomains included). Defaults cover the model providers
+  (DeepSeek, Anthropic, OpenAI, Gemini), the web-spec sites (`whatwg.org`,
+  `w3c.org`, `w3c.github.io`) and the code sources a coding agent needs to
+  work (GitHub, crates.io, npm, PyPI, the Go proxy, rustup/node downloads).
 
 Settings are snapshotted when an agent process spawns: **at app startup**
 (the app is single-window) or when the menu-bar quick prompt starts one. A
@@ -133,10 +135,13 @@ fails the launcher exits non-zero with the error on stderr.
 
 Built by `SandboxPolicy.source(...)` in Core: the **projects root** (every
 project inside it is read+write — the workspace) + `~/.pi` + dev dirs
-read/write, temp, system read, processes, IPC — plus two empirically required
-pieces: Apple's **dyld-support rules** (cryptex graft points + special
-syscalls; without them dyld aborts at startup) and **`path-ancestors` rules**
-for every allowed subtree (node's `realpathSync` lstats each component).
+read/write, temp, system read, processes, IPC — plus the macOS dev-tooling
+paths (xcode-select's `/var` symlink, `$TMPDIR` in `/var/folders`,
+`/usr/share`|`/usr/libexec`, `/etc`, and Preferences for the Xcode license
+check) and two empirically required pieces: Apple's **dyld-support rules**
+(cryptex graft points + special syscalls; without them dyld aborts at
+startup) and **`path-ancestors` rules** for every allowed subtree (node's
+`realpathSync` lstats each component).
 
 Network is **loopback-only**: the Seatbelt profile language on macOS 26
 accepts only `*` and `localhost` as network hosts (no IPs, no hostnames), so
@@ -216,14 +221,15 @@ concurrency.
   controls: Stop, Reload, the
   **model** + **thinking level** pickers (current choice shown beside the
   icon, a "choose model/thinking level" prompt until one is set), and Resume.
-  The **context-window usage %** sits at the leading edge of the toolbar.
-  Sending a prompt is disabled until both a model and a thinking level have
-  been chosen.
+  The live status readout (context %, model, thinking level) sits in the
+  prompt bar, not the toolbar. Sending a prompt is disabled until both a
+  model and a thinking level have been chosen.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
-- `SessionStatusBar` — removed. The model + thinking-level pickers and the
-  context-% reading live in the window toolbar (top edge), not in a bar under
-  the prompt input.
+- `SessionStatusBar` — removed. The model + thinking-level pickers live in
+  the window toolbar (top edge); the live status readout (context %, model,
+  thinking level) sits in very light gray at the bottom-right inside the
+  prompt input.
 - `TextRowView` / `ToolCallCardView` — cells.
 - `TranscriptText` — the single source of truth for styling **and**
   measurement, so measured height exactly matches rendered height.
@@ -234,7 +240,12 @@ concurrency.
   the turn settles — never one turn per queued message, unlike the TUI). The
   queued-steering banner above the bar lists every queued message, each with
   an edit button (restores it into the input; Return re-queues the edited
-  version) and a delete button.
+  version) and a delete button. A live status readout (context %, model,
+  thinking level) sits in very light gray at the bottom-right inside the
+  bar. **Esc aborts the in-flight turn from anywhere in the window**: a local
+  key monitor falls back to the text view's own Esc handling when the input
+  has focus, and defers to open dropdowns/sheets (a visible popup-menu-level
+  window closes on Esc instead of aborting).
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
   read it; the transcript coordinator observes the change, clears its height
@@ -308,18 +319,25 @@ Behavior details that matter:
   hot path). `noteHeightOfRows` queries hit the cache. Tool-card heights are
   invalidated on every content update (they grow in place); text rows are
   seeded from the cell and only invalidated on genuine change.
-- **Tool cards show their content, expandable.** Output previews at 30 lines
-  (args at 2), with a chevron button in the card header that expands to the
-  full content (the row re-measures via a shared expansion registry).
-  User messages are highlighted light-blue to stand out from assistant replies.
+- **Tool cards show their content, expandable.** One card per call: pi's RPC
+  strips the cumulative `message` from `message_update`, so `toolcall_start`/
+  `toolcall_delta` carry only a `contentIndex` — the card is created at
+  `toolcall_end` from the completed call block (real id + name + args), so it
+  never shows a placeholder "tool" name and `tool_execution_*` always matches
+  by the real id (no duplicate card; the result is appended into the same
+  card as output arrives). Output previews at 30 lines (args at 2), with a
+  chevron button in the card header that expands to the full content (the
+  row re-measures via a shared expansion registry). User messages are
+  highlighted light-blue to stand out from assistant replies.
 - **Zero rendering when off-screen.** When the window is occluded, minimized,
   or the app is hidden, the coordinator does **no** per-delta work: `applyModelChanges`
   bails and only sets `needsCatchUp`. The store keeps folding off-main; on return
   to the foreground one catch-up pass materializes the tail and refreshes the
   streaming row. (Visibility = occlusion state + not minimized + not hidden.)
-- **Context % in the toolbar.** `SessionViewModel.refreshContextStats()` polls
-  `get_session_stats` when a turn settles (and after load/reload) and surfaces
-  `contextUsage.percent` at the leading edge of the toolbar.
+- **Context % in the prompt-bar readout.** pi pushes no context event, so
+  `SessionViewModel` polls `get_session_stats` every 2s while a turn streams
+  (plus on settle and after load/reload) and surfaces `contextUsage.percent`
+  in the status readout at the bottom-right inside the prompt input.
 - **Session switch** is a `generation` bump → full `reloadData()` positioned at
   the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
 
