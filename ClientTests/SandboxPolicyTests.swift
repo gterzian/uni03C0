@@ -15,10 +15,15 @@ final class SandboxSettingsTests: XCTestCase {
         XCTAssertTrue(defaults.readOnlyPaths.contains("/Library/Frameworks"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/System/Library/Frameworks"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/Applications/Xcode.app"))
+        // Build output/caches and Homebrew (Intel) — writable dev dirs
+        XCTAssertTrue(defaults.readOnlyPaths.contains("~/Library/Developer"))
+        XCTAssertTrue(defaults.readOnlyPaths.contains("/usr/local"))
         // The requested spec-site prefill, plus the model provider and the
         // code sources (registries/git hosts) a coding agent needs to work.
         XCTAssertEqual(defaults.allowedHosts, [
             "deepseek.com",
+            "api.deepseek.com", "api.anthropic.com", "api.openai.com",
+            "generativelanguage.googleapis.com",
             "whatwg.org", "w3c.org", "w3c.github.io",
             "github.com", "githubusercontent.com",
             "crates.io", "npmjs.org", "pypi.org", "files.pythonhosted.org",
@@ -32,6 +37,11 @@ final class SandboxSettingsTests: XCTestCase {
         XCTAssertTrue(whitelist.allows("static.crates.io"))
         XCTAssertTrue(whitelist.allows("registry.npmjs.org"))
         XCTAssertTrue(whitelist.allows("raw.githubusercontent.com"))
+        // Model provider endpoints listed explicitly must match exactly.
+        XCTAssertTrue(whitelist.allows("api.deepseek.com"))
+        XCTAssertTrue(whitelist.allows("api.anthropic.com"))
+        XCTAssertTrue(whitelist.allows("api.openai.com"))
+        XCTAssertTrue(whitelist.allows("generativelanguage.googleapis.com"))
     }
 
     func testParseTrimsAndDropsComments() {
@@ -96,6 +106,26 @@ final class SandboxPolicyTests: XCTestCase {
         let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
         XCTAssertTrue(source.contains("(allow file-write* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/private/var/tmp\"))"))
         XCTAssertTrue(source.contains("(allow file-read* (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/private/var/tmp\"))"))
+    }
+
+    func testPolicyAllowsXcodeCommandLineTooling() {
+        // macOS dev tooling, verified empirically: xcode-select reads the
+        // /var/select developer-dir symlink, compilers write $TMPDIR
+        // (/var/folders), headers/configs live in /usr/share, /usr/libexec,
+        // /etc. Note: /var and /etc are symlinks, so the ROOT itself must be
+        // listed — a (subpath "/var/select") rule does not grant reading the
+        // /var symlink, so every /var/… path would still fail.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(subpath \"/var\") (subpath \"/private/var\")"))
+        XCTAssertTrue(source.contains("(subpath \"/etc\") (subpath \"/private/etc\")"))
+        XCTAssertTrue(source.contains("(subpath \"/usr/share\") (subpath \"/usr/libexec\")"))
+        XCTAssertTrue(source.contains("(allow file-write* (subpath \"/var/folders\") (subpath \"/private/var/folders\"))"))
+        // Preferences: the Xcode license check reads the plist directly.
+        XCTAssertTrue(source.contains("(subpath \"/Users/tester/Library/Preferences\") (subpath \"/Library/Preferences\")"))
+        // Ancestors for the new roots, so an lstat of /private/var succeeds.
+        XCTAssertTrue(source.contains("(path-ancestors \"/private/var\")"))
+        XCTAssertTrue(source.contains("(path-ancestors \"/private/etc\")"))
+        XCTAssertTrue(source.contains("(path-ancestors \"/usr/share\")"))
     }
 
     func testPolicyNetworkIsLoopbackOnly() {

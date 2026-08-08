@@ -53,11 +53,17 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             "/Library/Developer/CommandLineTools",
             "/Applications/Xcode.app",     // Xcode: SDKs, toolchains, swiftc
             "/opt/local",                  // MacPorts
+            "/usr/local",                  // Homebrew (Intel) / local installs
+            "~/Library/Developer",          // Xcode DerivedData, module caches
             "~/Library/Android/sdk",       // Android SDK
         ],
         allowedHosts: [
-            // The model provider — required for the agent to reach its model.
-            "deepseek.com",
+            // Model providers — the hosts the agent reaches its models through.
+            "deepseek.com",                 // DeepSeek
+            "api.deepseek.com",             // DeepSeek API
+            "api.anthropic.com",            // Anthropic
+            "api.openai.com",               // OpenAI
+            "generativelanguage.googleapis.com", // Google Gemini
             // Web-spec sites (the original prefill).
             "whatwg.org",
             "w3c.org",

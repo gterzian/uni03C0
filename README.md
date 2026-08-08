@@ -5,6 +5,8 @@ It spawns `pi --mode rpc` as a sandboxed subprocess and renders the conversation
 natively (SwiftUI + a hand-rolled `NSTableView` transcript) instead of running
 the terminal TUI.
 
+Status: pre-alpha; but already what yours truly uses for pi on a daily basis.
+
 ## Getting started
 
 Requirements: macOS 26, Xcode 26.x, and `pi` on PATH (global npm install —
@@ -18,17 +20,22 @@ environment.
 Tests: `xcodebuild -scheme ClientTests test`.
 
 **On first launch** the app walks you through setting up the agent's sandbox:
-choose a top-level working folder (everything inside it is read+write for the
-agent), review the additional read/write paths, and the allowed internet
-domains. After that, pick a project and start prompting. The app is
-single-window: it opens on your last project (or the setup screen), and the
-Projects menu switches projects by replacing the window.
 
-The prompt bar is the main surface: Return sends (or queues steering while the
-agent works), Shift+Return is a newline, Tab completes paths. The toolbar holds
-Stop, Reload, the model/thinking-level pickers, and Resume.
+1. choose a top-level working folder (everything inside it is read+write for the
+agent), 
 
-## Sandbox approach
+2. review the additional read/write paths, and 
+
+3. the allowed internet domains. 
+
+After that, pick a project and start prompting. The app is
+single-window, but **tabbed**: your project opens as the first tab, a "+"
+adds more sessions (one tab per folder, each a separate agent process with
+the same sandbox settings), and tabs show at a glance whether their session
+is idle or working. The Projects menu switches the window to another
+project.
+
+## Sandbox 
 
 The agent runs inside a **Seatbelt sandbox** (default-deny). Everything it can
 touch is defined in Settings (app menu → Settings…):
@@ -41,6 +48,9 @@ touch is defined in Settings (app menu → Settings…):
 - **Internet** — only the whitelisted domains (subdomains included); the model
   provider and the usual code sources (GitHub, crates.io, npm, PyPI, …) are
   prefilled.
+- **Agent RPC endpoint** — the pi executable the client spawns as
+  `pi --mode rpc` (default: pi on PATH); point it at a different binary from
+  Settings.
 
 Two mechanism notes that shape the design:
 
@@ -59,44 +69,3 @@ Two mechanism notes that shape the design:
 
 Settings are applied when a new agent process starts (app launch). A running
 agent keeps its sandbox until the app restarts.
-
-## Rendering approach
-
-The transcript stays fast and cheap no matter how long the conversation is:
-**rendering cost is a function of the visible rows, never of the context
-size.** A 600-message session opens and streams like a two-message one.
-
-Three pieces, each with one job:
-
-1. **`TranscriptStore`** (off-main) owns the whole history. It folds the RPC
-   event stream into rows and rebuilds from `get_messages` on session switch,
-   on a background thread.
-2. **`SessionViewModel`** (main) is a thin shim — connection, commands, small
-   UI state. It forwards frames to the store off-main so a delta never blocks
-   the UI.
-3. **`Coordinator`** (main) renders a windowed slice of the store through an
-   `NSTableView`: `numberOfRows` is just the window size; every cell and height
-   is a store lookup. SwiftUI never reads the transcript entries — updates flow
-   store → coordinator → table directly.
-
-Why it stays fast:
-
-- **Append-only streaming.** A change is always "something at the end changed,"
-   so new rows append via `insertRows` (O(added)) — inserting at the end never
-   shifts existing rows, so a scrolled-up viewport is untouched.
-- **Older history loads in compounding blocks** (doubling, capped) with a small
-   spinner at the top, and fetched rows are **never evicted** — scrolling back
-   down reuses cached heights, so it's always instant.
-- **A height cache** keyed by `(row, width)`, seeded from the visible cell's
-   own layout (no duplicate CoreText measure — the original 100%-CPU hot
-   path). Tool cards invalidate on content update so they grow in place.
-- **Smooth streaming, no bounce.** Text is batched (a few words at a time, not
-   per character) and each chunk crossfades in; the height change and the
-   follow-scroll land in one atomic `CATransaction`, so content flows off the
-   top instead of bouncing.
-- **Zero rendering when off-screen.** When the window is occluded, minimized,
-   or hidden, the coordinator does no per-delta work; one catch-up pass
-   materializes the tail when you return.
-- **Sticky follow that knows when to stop.** Following is on by default; the
-   moment you scroll up it disengages so streaming doesn't drag you back, and
-   re-engages when you return to the bottom. Arrow-Down jumps to the tail.

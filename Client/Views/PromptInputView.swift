@@ -12,6 +12,9 @@ struct PromptInputView: NSViewRepresentable {
     let cwd: URL
     let isEnabled: Bool
     let fontSize: CGFloat
+    /// Live status readout (context %, model, thinking level) shown in very
+    /// light gray at the bottom-right inside the prompt bar. Empty hides it.
+    let statusText: String
     /// Mirror of the input's text (kept in sync by `onDraftChange`), used to
     /// restore queued steering into the input for editing.
     let draft: String
@@ -33,8 +36,16 @@ struct PromptInputView: NSViewRepresentable {
     func updateNSView(_ nsView: PromptContainerView, context: Context) {
         context.coordinator.cwd = cwd
         context.coordinator.isEnabled = isEnabled
+        // Refresh the action closures: the representable is reused across tab
+        // switches (same structural identity), so the coordinator must target
+        // the currently active session, not the one it was created for.
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onAbort = onAbort
+        context.coordinator.onDraftChange = onDraftChange
         nsView.textView.isEditable = isEnabled
         nsView.textView.textColor = isEnabled ? .labelColor : .tertiaryLabelColor
+        nsView.statusLabel.stringValue = statusText
+        nsView.statusLabel.isHidden = statusText.isEmpty
         if nsView.textView.font?.pointSize != fontSize {
             nsView.textView.font = .systemFont(ofSize: fontSize)
         }
@@ -51,6 +62,11 @@ struct PromptInputView: NSViewRepresentable {
 
 final class PromptContainerView: NSView {
     let textView = PromptTextView()
+    /// Very-light-gray status readout pinned to the bottom-right inside the
+    /// prompt bar: context %, model, thinking level. Purely decorative — it
+    /// never intercepts clicks or keys.
+    let statusLabel = NSTextField(labelWithString: "")
+    private let scrollView = NSScrollView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -63,11 +79,19 @@ final class PromptContainerView: NSView {
     }
 
     private func setup() {
-        let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = false
         scrollView.drawsBackground = false
-        scrollView.borderType = .bezelBorder
+        // The input is rounded to match the window's own corner radius — the
+        // old bezel border left square corners that clashed with the window's
+        // rounded bottom edge. The background + border colors are dynamic
+        // (light/dark), so they're applied via `applyInputAppearance` and
+        // refreshed when the appearance changes.
+        scrollView.borderType = .noBorder
+        scrollView.wantsLayer = true
+        // Reserve the bottom strip for the status readout so typed text never
+        // scrolls under it.
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 16, right: 0)
 
         textView.isEditable = true
         textView.isRichText = false
@@ -82,13 +106,47 @@ final class PromptContainerView: NSView {
         textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
 
         scrollView.documentView = textView
+
+        statusLabel.font = .systemFont(ofSize: 10)
+        statusLabel.textColor = .tertiaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(250), for: .horizontal)
+        statusLabel.isHidden = true
+
         addSubview(scrollView)
+        addSubview(statusLabel)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
         ])
+        applyInputAppearance()
+    }
+
+    /// The window's corner radius, matched by the prompt input so the two
+    /// read as one surface instead of a square field poking into a rounded
+    /// window.
+    private static let cornerRadius: CGFloat = 10
+
+    /// Rounds the input and paints its background/border. Layer colors don't
+    /// follow the effective appearance automatically, so this re-runs on
+    /// light/dark changes.
+    private func applyInputAppearance() {
+        guard let layer = scrollView.layer else { return }
+        layer.cornerRadius = Self.cornerRadius
+        layer.borderWidth = 1
+        layer.borderColor = NSColor.separatorColor.cgColor
+        layer.backgroundColor = NSColor.textBackgroundColor.cgColor
+        layer.masksToBounds = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyInputAppearance()
     }
 }
 
@@ -110,15 +168,24 @@ final class PromptTextView: NSTextView {
 final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var cwd: URL
     var isEnabled = true
-    private let onSubmit: (String) -> Void
-    private let onAbort: () -> Void
-    private let onDraftChange: (String) -> Void
+    var onSubmit: (String) -> Void
+    var onAbort: () -> Void
+    var onDraftChange: (String) -> Void
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
     private var completionItems: [String] = []
     private var completionSelected = 0
     private var tokenStart: Int?
+    /// Local key monitor making Esc abort whenever the main window is front,
+    /// not just when the prompt input has focus. Falls back to the text view's
+    /// own Esc handling (completion dismiss → abort) when it is first
+    /// responder, so nothing double-fires.
+    ///
+    /// `nonisolated(unsafe)`: installed only on the main thread (from `attach`),
+    /// and deinit runs only after the last reference is dropped — so the read
+    /// from the nonisolated deinit never races the write.
+    private nonisolated(unsafe) var escapeMonitor: Any?
 
     init(cwd: URL, onSubmit: @escaping (String) -> Void, onAbort: @escaping () -> Void, onDraftChange: @escaping (String) -> Void) {
         self.cwd = cwd
@@ -127,11 +194,43 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         self.onDraftChange = onDraftChange
     }
 
+    deinit {
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+        }
+    }
+
     func attach(container: PromptContainerView) {
         self.container = container
         container.textView.delegate = self
         completionWindow = CompletionWindowController()
         completionWindow?.parentView = container
+        installEscapeMonitor()
+    }
+
+    /// Esc aborts the in-flight turn (thinking + tools) whenever this window is
+    /// key, regardless of where focus is. It defers to the text view when the
+    /// prompt input has focus (Esc there dismisses path completion first), and
+    /// passes through while a popup menu or sheet is up so Esc closes those
+    /// instead of aborting.
+    private func installEscapeMonitor() {
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 53 else { return event }
+            guard let self, let container = self.container, let window = container.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle Esc.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A VISIBLE popup-menu-level window means a dropdown (or the path
+            // completion list) is tracking: let Esc close it instead of
+            // aborting. NB: ordered-out windows are still in NSApp.windows —
+            // the completion window lives hidden at .popUpMenu level for the
+            // whole session and would otherwise swallow every Esc.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            // Prompt input has focus: its own Esc handling (completion → abort)
+            // runs; don't fire the abort twice.
+            if window.firstResponder === container.textView { return event }
+            self.onAbort()
+            return nil
+        }
     }
 
     var textView: PromptTextView? { container?.textView }

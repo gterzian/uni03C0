@@ -70,52 +70,104 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertEqual(done.state, .done)
     }
 
-    func testToolCallAppearsWhileModelStillStreamsArguments() {
+    func testToolCallStreamsSingleCardWithRealName() {
+        // Real RPC frames: `message_update` strips the cumulative message and
+        // the event's `partial`, so toolcall_start/delta carry only a
+        // contentIndex — the id/name/args are unknowable until toolcall_end,
+        // which carries the completed call block.
         let store = TranscriptStore()
 
         // The assistant message starts streaming text.
         _ = store.apply(frame(type: "message_start",
-            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}"))
+            #"{"type":"message_start","message":{"role":"assistant","id":"a1","content":[{"type":"text","text":""}]}}"#))
         XCTAssertEqual(store.count, 1)
 
-        // The model begins generating a tool call: the card appears
-        // immediately, long before tool_execution_start.
+        // toolcall_start (bare): no placeholder "tool" card yet.
         XCTAssertTrue(store.apply(frame(type: "message_update",
-            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"toolcall_start\",\"contentIndex\":1,\"id\":\"tc1\",\"toolName\":\"bash\"}}")))
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_start","contentIndex":1}}"#)))
+        XCTAssertEqual(store.count, 1, "no card until the id/name are known")
+
+        // toolcall_delta: still nothing — args arrive whole at toolcall_end.
+        XCTAssertTrue(store.apply(frame(type: "message_update",
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_delta","contentIndex":1,"delta":"{\"cmd\":\"ls\"}"}}"#)))
+        XCTAssertEqual(store.count, 1)
+
+        // toolcall_end: the card appears with the real name and pretty args.
+        XCTAssertTrue(store.apply(frame(type: "message_update",
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"tc1","name":"bash","arguments":{"cmd":"ls"}}}}"#)))
         XCTAssertEqual(store.count, 2)
         guard case .toolCall(let card)? = store.entry(at: 1)?.kind else {
             return XCTFail("expected tool call card")
         }
         XCTAssertEqual(card.id, "tc1")
         XCTAssertEqual(card.toolName, "bash")
+        XCTAssertTrue(card.arguments.contains(#""cmd""#))
         XCTAssertEqual(card.state, .running)
 
-        // Argument deltas accumulate live (toolcall_delta carries no id).
-        XCTAssertTrue(store.apply(frame(type: "message_update",
-            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"toolcall_delta\",\"contentIndex\":1,\"delta\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}")))
-        guard case .toolCall(let deltaCard)? = store.entry(at: 1)?.kind else {
-            return XCTFail("expected tool call card")
-        }
-        XCTAssertTrue(deltaCard.arguments.contains("ls"))
-
-        // toolcall_end: arguments become the pretty-printed block.
-        XCTAssertTrue(store.apply(frame(type: "message_update",
-            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"toolcall_end\",\"contentIndex\":1,\"toolCall\":{\"type\":\"toolCall\",\"id\":\"tc1\",\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}}}")))
-        guard case .toolCall(let ended)? = store.entry(at: 1)?.kind else {
-            return XCTFail("expected tool call card")
-        }
-        XCTAssertTrue(ended.arguments.contains("\"cmd\""))
-
-        // tool_execution_start must NOT create a duplicate card — the same id
-        // is reused and the args get the final pretty-printed form.
+        // tool_execution_start must NOT create a duplicate card — the real id
+        // matches, args get the final form, state stays running.
         XCTAssertTrue(store.apply(frame(type: "tool_execution_start",
-            "{\"type\":\"tool_execution_start\",\"toolCallId\":\"tc1\",\"toolName\":\"bash\",\"args\":{\"cmd\":\"ls -la\"}}")))
+            #"{"type":"tool_execution_start","toolCallId":"tc1","toolName":"bash","args":{"cmd":"ls -la"}}"#)))
         XCTAssertEqual(store.count, 2, "execution start must reuse the streamed card")
         guard case .toolCall(let executed)? = store.entry(at: 1)?.kind else {
             return XCTFail("expected tool call card")
         }
-        XCTAssertEqual(executed.state, .running)
         XCTAssertTrue(executed.arguments.contains("ls -la"))
+
+        // The result lands in the SAME card.
+        XCTAssertTrue(store.apply(frame(type: "tool_execution_update",
+            #"{"type":"tool_execution_update","toolCallId":"tc1","partialResult":{"content":[{"type":"text","text":"file.txt"}]}}"#)))
+        XCTAssertEqual(store.count, 2, "output updates the same card, never a second one")
+        guard case .toolCall(let updated)? = store.entry(at: 1)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(updated.output, "file.txt")
+
+        XCTAssertTrue(store.apply(frame(type: "tool_execution_end",
+            #"{"type":"tool_execution_end","toolCallId":"tc1","toolName":"bash","result":{"content":[{"type":"text","text":"file.txt"}]}}"#)))
+        guard case .toolCall(let done)? = store.entry(at: 1)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(done.state, .done)
+        XCTAssertEqual(done.output, "file.txt")
+    }
+
+    func testToolCallCardHandlesAnthropicInputAndOpenAIStringArgs() {
+        let store = TranscriptStore()
+
+        // Anthropic-style block: id/name/input.
+        XCTAssertTrue(store.apply(frame(type: "message_update",
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":0,"toolCall":{"type":"tool_use","id":"tc-a","name":"read","input":{"path":"/tmp/x"}}}}"#)))
+        guard case .toolCall(let anthropic)? = store.entry(at: 0)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(anthropic.id, "tc-a")
+        XCTAssertEqual(anthropic.toolName, "read")
+        XCTAssertTrue(anthropic.arguments.contains("path"))
+
+        // OpenAI-completions-style block: arguments arrive as a JSON-encoded
+        // string.
+        XCTAssertTrue(store.apply(frame(type: "message_update",
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"tc-b","name":"edit","arguments":"{\"path\":\"/tmp/y\"}"}}}"#)))
+        guard case .toolCall(let openai)? = store.entry(at: 1)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(openai.toolName, "edit")
+        XCTAssertTrue(openai.arguments.contains("path"))
+
+        // A toolcall_end without a usable block id must not fabricate a card:
+        // tool_execution_start creates it with the real id/name instead.
+        XCTAssertTrue(store.apply(frame(type: "message_update",
+            #"{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":2,"toolCall":{"type":"toolCall","name":"bash","arguments":{}}}}"#)))
+        XCTAssertEqual(store.count, 2, "no fabricated card when the id is unknown")
+        XCTAssertTrue(store.apply(frame(type: "tool_execution_start",
+            #"{"type":"tool_execution_start","toolCallId":"tc-c","toolName":"bash","args":{"cmd":"ls"}}"#)))
+        XCTAssertEqual(store.count, 3)
+        guard case .toolCall(let created)? = store.entry(at: 2)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(created.id, "tc-c")
+        XCTAssertEqual(created.toolName, "bash")
     }
 
     func testTurnStartPlaceholderPromotedByMessageStart() {
@@ -162,26 +214,30 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertEqual(store.entry(at: 0)?.kind, .userMessage(text: "hi"))
     }
 
-    func testToolCallCardGetsIdFromMessageBlock() {
+    func testToolCallExecutionStartCreatesCardWithoutStreamEvents() {
+        // Providers can skip the toolcall_* stream entirely (e.g. a resumed
+        // session): tool_execution_start alone must create the card with the
+        // real id/name.
         let store = TranscriptStore()
-        _ = store.apply(frame(type: "message_start",
-            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}"))
-
-        // toolcall_start WITHOUT id/toolName — the frame's `message` carries
-        // the authoritative content block.
-        XCTAssertTrue(store.apply(frame(type: "message_update",
-            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"toolcall_start\",\"contentIndex\":1},\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"},{\"type\":\"toolCall\",\"id\":\"tc9\",\"name\":\"bash\",\"arguments\":{}}]}}")))
-        guard case .toolCall(let card)? = store.entry(at: 1)?.kind else {
+        XCTAssertTrue(store.apply(frame(type: "tool_execution_start",
+            #"{"type":"tool_execution_start","toolCallId":"t9","toolName":"bash","args":{"cmd":"ls"}}"#)))
+        XCTAssertEqual(store.count, 1)
+        guard case .toolCall(let card)? = store.entry(at: 0)?.kind else {
             return XCTFail("expected tool call card")
         }
-        XCTAssertEqual(card.id, "tc9")
+        XCTAssertEqual(card.id, "t9")
         XCTAssertEqual(card.toolName, "bash")
+        XCTAssertEqual(card.state, .running)
 
-        // tool_execution_start with the same id reuses the card — no
-        // duplicate "tool" block above the real one.
-        XCTAssertTrue(store.apply(frame(type: "tool_execution_start",
-            "{\"type\":\"tool_execution_start\",\"toolCallId\":\"tc9\",\"toolName\":\"bash\",\"args\":{\"cmd\":\"ls\"}}")))
-        XCTAssertEqual(store.count, 2, "execution start must reuse the streamed card")
+        // And its result lands in that same single card.
+        XCTAssertTrue(store.apply(frame(type: "tool_execution_end",
+            #"{"type":"tool_execution_end","toolCallId":"t9","toolName":"bash","result":{"content":[{"type":"text","text":"ok"}]}}"#)))
+        XCTAssertEqual(store.count, 1, "execution start + end must be one card")
+        guard case .toolCall(let done)? = store.entry(at: 0)?.kind else {
+            return XCTFail("expected tool call card")
+        }
+        XCTAssertEqual(done.state, .done)
+        XCTAssertEqual(done.output, "ok")
     }
 
     func testUnrelatedFramesAreIgnored() {

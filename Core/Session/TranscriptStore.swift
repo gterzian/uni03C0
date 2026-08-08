@@ -27,9 +27,6 @@ public final class TranscriptStore: @unchecked Sendable {
 
     // Live-streaming state (meaningless after a rebuild).
     private var streamingEntryID: String?
-    /// `toolcall_*` events carry a `contentIndex` but deltas don't repeat the
-    /// call id, so map contentIndex → call id while the model generates it.
-    private var toolCallIDsByContentIndex: [Int: String] = [:]
     /// Id of the placeholder streaming row created on `turn_start` — immediate
     /// feedback (a pulsing caret) during time-to-first-token, before the real
     /// `message_start` has arrived.
@@ -92,7 +89,7 @@ public final class TranscriptStore: @unchecked Sendable {
                 changed = true
             }
         case "message_update":
-            if let event = frame.decodeAssistantEvent() { applyAssistantEvent(event, message: frame.decodeMessage()); changed = true }
+            if let event = frame.decodeAssistantEvent() { applyAssistantEvent(event); changed = true }
 
         case "agent_end", "turn_end":
             changed = endTurnPlaceholderOrFinalize()
@@ -213,7 +210,6 @@ public final class TranscriptStore: @unchecked Sendable {
         _version &+= 1
         _generation &+= 1
         streamingEntryID = nil
-        toolCallIDsByContentIndex.removeAll()
         turnStartPlaceholderID = nil
         lock.unlock()
         return true
@@ -258,9 +254,9 @@ public final class TranscriptStore: @unchecked Sendable {
         }
     }
 
-    private func applyAssistantEvent(_ event: AssistantMessageEvent, message: AgentMessage?) {
+    private func applyAssistantEvent(_ event: AssistantMessageEvent) {
         if event.isToolCall {
-            applyToolCallStreamEvent(event, message: message)
+            applyToolCallStreamEvent(event)
             return
         }
         guard let id = streamingEntryID,
@@ -295,7 +291,6 @@ public final class TranscriptStore: @unchecked Sendable {
         entry.kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)
         _entries[index] = entry
         streamingEntryID = nil
-        toolCallIDsByContentIndex.removeAll()
         turnStartPlaceholderID = nil
     }
 
@@ -331,48 +326,38 @@ public final class TranscriptStore: @unchecked Sendable {
 
     /// pi streams tool-call generation as `toolcall_start` / `toolcall_delta` /
     /// `toolcall_end` assistant-message events, well BEFORE `tool_execution_start`
-    /// (which fires only once the tool actually begins running). Creating the
-    /// card here makes the call appear the moment the model starts writing it,
-    /// instead of after pi's message-finalization + tool-preparation handoff.
-    /// The frame's `message` carries the authoritative content block — some
-    /// providers omit id/name on the events, and without them the card would
-    /// get a fabricated id that `tool_execution_start` can't match, leaving a
-    /// duplicate "tool" card above the real one.
-    private func applyToolCallStreamEvent(_ event: AssistantMessageEvent, message: AgentMessage?) {
-        let contentIndex = event.contentIndex ?? -1
-        // The partial message's content block at the event's contentIndex is
-        // the source of truth for id/name (it exists from toolcall_start on).
-        let block: ContentBlock? = {
-            guard let content = message?.content, content.indices.contains(contentIndex) else { return nil }
-            return content[contentIndex].isToolCall ? content[contentIndex] : nil
-        }()
-        let callID = event.id ?? block?.id ?? toolCallIDsByContentIndex[contentIndex] ?? makeID("tool")
-        let callName = event.toolName ?? block?.name ?? "tool"
+    /// (which fires only once the tool actually begins running). In RPC mode the
+    /// `message_update` envelope is stripped of the cumulative `message` and of
+    /// the event's `partial` snapshot, so `toolcall_start`/`toolcall_delta` carry
+    /// only a `contentIndex` — the call's id, name and arguments are unknowable
+    /// until `toolcall_end`, which carries the completed call block. The card is
+    /// therefore created at `toolcall_end` (real id + name + pretty args from the
+    /// block): there is never a placeholder "tool" card, and `tool_execution_start`
+    /// matches by the real id, so one card spans the whole call — the call shown
+    /// first, the result appended into it as output arrives.
+    private func applyToolCallStreamEvent(_ event: AssistantMessageEvent) {
         switch event.type {
-        case "toolcall_start":
-            toolCallIDsByContentIndex[contentIndex] = callID
-            if _entries.lastIndex(where: { $0.id == callID }) == nil {
+        case "toolcall_start", "toolcall_delta":
+            break // nothing renderable yet — everything arrives at toolcall_end
+        case "toolcall_end":
+            // The completed call block is the authoritative id/name/args source
+            // (anthropic: input; openai-completions: arguments, maybe a string).
+            guard let block = event.toolCall.flatMap(decodeToolCallBlock),
+                  let callID = block.id ?? event.id else { return }
+            let pretty = block.toolArgumentsPretty()
+            if let index = _entries.lastIndex(where: { $0.id == callID }),
+               case .toolCall(var card) = _entries[index].kind {
+                // Defensive: the card already exists (re-run / late event) —
+                // refresh name and args in place.
+                card.toolName = block.name ?? card.toolName
+                if !pretty.isEmpty { card.arguments = pretty }
+                _entries[index].kind = .toolCall(card: card)
+            } else {
                 _entries.append(TranscriptEntry(
                     id: callID,
-                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: callName, arguments: ""))
+                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: block.name ?? "tool", arguments: pretty))
                 ))
             }
-        case "toolcall_delta":
-            guard let delta = event.delta,
-                  let index = _entries.lastIndex(where: { $0.id == callID }),
-                  case .toolCall(var card) = _entries[index].kind else { return }
-            card.arguments += delta
-            _entries[index].kind = .toolCall(card: card)
-        case "toolcall_end":
-            guard let index = _entries.lastIndex(where: { $0.id == callID }),
-                  case .toolCall(var card) = _entries[index].kind else { return }
-            if let block {
-                let pretty = block.toolArgumentsPretty()
-                if !pretty.isEmpty { card.arguments = pretty }
-                if card.toolName == "tool" { card.toolName = block.name ?? card.toolName }
-            }
-            _entries[index].kind = .toolCall(card: card)
-            toolCallIDsByContentIndex[contentIndex] = nil
         default:
             break
         }
@@ -440,8 +425,7 @@ public final class TranscriptStore: @unchecked Sendable {
         _entries[index] = entry
     }
 
-    private func appendBashOutput(id: String?, delta: String) {
-        if let id, let index = _entries.lastIndex(where: { $0.id == id }) {
+    private func appendBashOutput(id: String?, delta: String) {        if let id, let index = _entries.lastIndex(where: { $0.id == id }) {
             var entry = _entries[index]
             guard case .toolCall(var card) = entry.kind else { return }
             card.output += delta
@@ -459,6 +443,14 @@ public final class TranscriptStore: @unchecked Sendable {
     private func makeID(_ prefix: String) -> String {
         counter &+= 1
         return "\(prefix)-\(counter)-\(UInt64(Date().timeIntervalSince1970 * 1000))"
+    }
+
+    /// Decodes the `toolcall_end.toolCall` block (a JSONValue) into the client's
+    /// tolerant content-block model, so anthropic `input` and openai
+    /// `arguments` (object or JSON-encoded string) both normalize.
+    private func decodeToolCallBlock(_ value: JSONValue) -> ContentBlock? {
+        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        return try? JSONDecoder().decode(ContentBlock.self, from: data)
     }
 }
 
