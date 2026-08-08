@@ -100,6 +100,7 @@ struct SessionView: View {
                     cwd: cwd,
                     isEnabled: inputEnabled(viewModel),
                     fontSize: FontSettings.shared.bodySize,
+                    statusText: statusText(viewModel),
                     draft: promptDraft,
                     onDraftChange: { promptDraft = $0 },
                     onSubmit: submit,
@@ -117,7 +118,6 @@ struct SessionView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let viewModel {
-                    contextLabel(viewModel)
                     stopButton(viewModel)
                     reloadButton(viewModel)
                     modelMenu(viewModel)
@@ -235,18 +235,27 @@ struct SessionView: View {
 
     // MARK: Toolbar
 
-    /// Context-window usage at the leading edge of the toolbar, so the runtime
-    /// status reads at a glance without a bar under the prompt input. Plain
-    /// text, not a Label — toolbars collapse labels to icon-only.
-    private func contextLabel(_ vm: SessionViewModel) -> some View {
-        let percent = vm.contextUsage?.percent
-        let text = percent.map { "\(Int(round($0)))%" } ?? "–"
-        return Text("ctx: \(text)")
-            .help("Context window usage")
+    /// The live status readout shown in very light gray at the bottom-right of
+    /// the prompt input: context-window usage, the current model, and the
+    /// current thinking level. Composed here from the session's observable
+    /// state (SwiftUI re-evaluates on change), so the AppKit prompt bar just
+    /// displays the string.
+    private func statusText(_ vm: SessionViewModel) -> String {
+        var parts: [String] = []
+        if let percent = vm.contextUsage?.percent {
+            parts.append("ctx \(Int(percent.rounded()))%")
+        }
+        if let name = vm.model?.name ?? vm.model?.id {
+            parts.append(name)
+        }
+        if let level = vm.thinkingLevel {
+            parts.append(level)
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Persistent stop button: spinner while a turn is in flight, disabled
-    /// when idle. Same action as Esc in the prompt bar.
+    /// when idle. Same action as Esc anywhere in the window.
     private func stopButton(_ vm: SessionViewModel) -> some View {
         Button {
             Task { try? await vm.abort() }
@@ -301,13 +310,26 @@ struct SessionView: View {
     }
 
     /// Thinking-level picker: current level shown beside the icon; a "choose
-    /// thinking level" prompt until one is set.
+    /// thinking level" prompt until one is set. The current level is always
+    /// present in the list (merged even if the runtime refresh hasn't caught
+    /// up) and checkmarked, so the menu always shows the live choice.
     private func thinkingMenu(_ vm: SessionViewModel) -> some View {
-        Menu {
-            if vm.availableThinkingLevels.isEmpty {
+        // Always include the current level, so the checkmarked item exists even
+        // if the runtime list is stale (e.g. right after a session switch).
+        let current = vm.thinkingLevel
+        let levels: [String]
+        if let current, vm.availableThinkingLevels.contains(current) {
+            levels = vm.availableThinkingLevels
+        } else if let current {
+            levels = [current] + vm.availableThinkingLevels
+        } else {
+            levels = vm.availableThinkingLevels
+        }
+        return Menu {
+            if levels.isEmpty {
                 Text("No thinking levels available")
             }
-            ForEach(vm.availableThinkingLevels, id: \.self) { level in
+            ForEach(levels, id: \.self) { level in
                 Button {
                     Task { try? await vm.setThinkingLevel(level) }
                 } label: {
@@ -324,20 +346,32 @@ struct SessionView: View {
         .help("Set thinking level")
     }
 
+    /// Resume menu: the current session (the one the live process has open) is
+    /// checkmarked, so the dropdown shows the live choice.
     private func resumeMenu(_ vm: SessionViewModel) -> some View {
-        Menu {
+        let currentFile = vm.sessionFile?.standardizedFileURL
+        return Menu {
             if recentSessions.isEmpty {
                 Text("No sessions yet")
             }
             ForEach(recentSessions) { session in
+                let isCurrent = session.path.standardizedFileURL == currentFile
                 Button {
                     Task { await vm.switchSession(session.path) }
                 } label: {
-                    VStack(alignment: .leading) {
-                        Text(session.title)
-                        Text(relativeTime(session.timestamp))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        // Checkmark marks the session the live process has open;
+                        // other rows get a clock glyph in the same slot so the
+                        // leading edge lines up.
+                        Image(systemName: isCurrent ? "checkmark" : "clock")
+                            .fontWeight(isCurrent ? .semibold : .regular)
+                            .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(session.title)
+                            Text(relativeTime(session.timestamp))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -351,6 +385,7 @@ struct SessionView: View {
     }
 
     private func relativeTime(_ date: Date) -> String {
+        guard date != .distantPast else { return "unknown date" }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return formatter.localizedString(for: date, relativeTo: Date())

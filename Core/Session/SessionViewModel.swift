@@ -26,8 +26,9 @@ public final class SessionViewModel {
     public private(set) var thinkingLevel: String?
     public private(set) var availableThinkingLevels: [String] = []
     /// Context-window usage (percentage of the model's context window in use),
-    /// refreshed from `get_session_stats` when a turn settles. Read by the
-    /// status bar.
+    /// refreshed from `get_session_stats`. Polled continuously while a turn is
+    /// streaming so the readout tracks the live context; refreshed once more
+    /// when the turn settles. Read by the status readout in the prompt bar.
     public private(set) var contextUsage: ContextUsage?
     public private(set) var sessionFile: URL?
     public private(set) var sessionName: String?
@@ -58,6 +59,15 @@ public final class SessionViewModel {
     public var onTranscriptChange: (() -> Void)?
 
     private var eventTask: Task<Void, Never>?
+    /// Periodic `get_session_stats` poller while the agent is streaming. pi has
+    /// no event that pushes context usage, so the client polls: `get_session_stats`
+    /// is a synchronous estimate on the agent side and the RPC loop interleaves
+    /// it with event streaming, so a 2s cadence costs ~nothing while keeping the
+    /// readout live. Started on the first turn-start and stopped on settle (the
+    /// true end of work — not `agent_end`/`turn_end`, which also fire between
+    /// tool rounds).
+    private static let contextPollInterval: Duration = .seconds(2)
+    private var contextPollTask: Task<Void, Never>?
 
     public init(cwd: URL, executable: String = PiExecutable.resolve(), projectsRoot: URL? = nil) {
         self.cwd = cwd
@@ -104,6 +114,7 @@ public final class SessionViewModel {
     public func stop() async {
         eventTask?.cancel()
         eventTask = nil
+        stopContextPolling()
         await controller.terminate()
         await proxy.stop()
     }
@@ -129,6 +140,7 @@ public final class SessionViewModel {
         switch frame.type {
         case "agent_start", "turn_start":
             isStreaming = true
+            startContextPolling()
         case "agent_end", "turn_end":
             // turn_end also fires BETWEEN tool rounds inside one agent run —
             // that is not the end of the work, so nothing is flushed here
@@ -140,6 +152,7 @@ public final class SessionViewModel {
             // combined prompt (never one turn per message like the TUI) — or,
             // after an abort, return it to the input for editing instead.
             isStreaming = false
+            stopContextPolling()
             if abortReturnsQueuedSteering {
                 // The user aborted: don't flush queued steering as a new
                 // prompt — return it to the input for editing instead.
@@ -296,6 +309,27 @@ public final class SessionViewModel {
             return
         }
         contextUsage = payload.contextUsage
+    }
+
+    /// Starts the continuous context-usage poller (idempotent). Runs until
+    /// `stopContextPolling()` — on `agent_settled` or session teardown.
+    private func startContextPolling() {
+        guard contextPollTask == nil else { return }
+        contextPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refreshContextStats()
+                do {
+                    try await Task.sleep(for: Self.contextPollInterval)
+                } catch {
+                    return // cancelled — the loop is done
+                }
+            }
+        }
+    }
+
+    private func stopContextPolling() {
+        contextPollTask?.cancel()
+        contextPollTask = nil
     }
 
     private func refreshState() async {

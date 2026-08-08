@@ -42,6 +42,8 @@ public enum SandboxPolicy {
             "/usr/local", "/opt/homebrew", "/usr/bin", "/bin", "/usr/lib",
             "/System/Library", "/Library/Frameworks", "/dev",
             "/private/tmp", "/private/var/tmp",
+            "/private/var", "/private/etc", "/usr/share", "/usr/libexec",
+            "/Library/Apple", "/Library/Preferences", "\(home)/Library/Preferences",
         ]).map { "(path-ancestors \"\($0)\")" }.joined(separator: " ")
 
         return """
@@ -67,6 +69,35 @@ public enum SandboxPolicy {
         ;; symlink, so tools writing to /tmp literally need that entry too.
         (allow file-read* (subpath "/tmp") (subpath "/private/tmp") (subpath "/private/var/tmp"))
         (allow file-write* (subpath "/tmp") (subpath "/private/tmp") (subpath "/private/var/tmp"))
+
+        ;; macOS development tooling (Xcode command-line tools). Verified
+        ;; empirically — without these, build tools fail inside the sandbox:
+        ;; - /var: `xcode-select` reads /var/select/developer_dir. /var is a
+        ;;   symlink to /private/var, and a (subpath "/var/select") rule does
+        ;;   NOT grant access to /var itself — the symlink read is denied, so
+        ;;   every /var/… path fails. Cover the root: (subpath "/var") plus
+        ;;   (subpath "/private/var") for the real spelling.
+        ;; - /var/folders: the per-user temp dir macOS sets $TMPDIR to; clang
+        ;;   refuses to create temp files when it is denied (write rule below).
+        ;; - /etc: system configs (hosts, shells, resolv.conf). Symlink to
+        ;;   /private/etc — both spellings listed.
+        ;; - /usr/share, /usr/libexec: system data, helpers, headers.
+        ;;   (/usr/include does not exist on macOS 26 — headers live in the
+        ;;   SDK under /Library/Developer.)
+        ;; - /Library/Apple: Apple support data.
+        ;; - Preferences (user + system): the Xcode license check reads
+        ;;   ~/Library/Preferences/com.apple.dt.Xcode.plist directly (not via
+        ;;   cfprefsd); without read access xcodebuild exits with "You have
+        ;;   not agreed to the Xcode license agreements" even after the user
+        ;;   accepted it.
+        (allow file-read* file-test-existence
+          (subpath "/var") (subpath "/private/var")
+          (subpath "/etc") (subpath "/private/etc")
+          (subpath "/usr/share") (subpath "/usr/libexec")
+          (subpath "/Library/Apple")
+          (subpath "\(home)/Library/Preferences") (subpath "/Library/Preferences"))
+        (allow file-write* (subpath "/var/folders") (subpath "/private/var/folders"))
+        (allow file-map-executable (subpath "/usr/libexec") (subpath "/usr/share"))
 
         ;; System read (+ executable mapping for dyld / runtimes)
         (allow file-read* (subpath "/usr/local") (subpath "/opt/homebrew") (subpath "/usr/bin") (subpath "/bin") (subpath "/usr/lib") (subpath "/System/Library") (subpath "/Library/Frameworks") (subpath "/dev"))
