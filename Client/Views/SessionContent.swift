@@ -1,6 +1,20 @@
 import Core
 import SwiftUI
 
+/// Shared metrics for the prompt bar height: the auto-grow minimum/maximum
+/// and the resize-handle clamp. The default matches the old fixed height.
+enum PromptBarMetrics {
+    static let minHeight: CGFloat = 64
+    static let maxHeight: CGFloat = 400
+    static let defaultHeight: CGFloat = 104
+
+    static func clamp(_ height: CGFloat) -> CGFloat {
+        // Round to whole points: fractional drag deltas would otherwise jitter
+        // the layer-backed input between pixel-rounded frames.
+        min(max(round(height), minHeight), maxHeight)
+    }
+}
+
 /// The live content of one session: transcript (AppKit) + prompt bar (AppKit-
 /// backed for Tab completion) + queued-steering banner. No lifecycle of its
 /// own — the owning view (`SessionTabsView`) starts and stops the session and
@@ -40,9 +54,26 @@ struct SessionContent: View {
 
             Divider()
 
+            // Error surfacing: a disconnected agent or the last send failure
+            // (auth/preflight/network) — never silently swallowed.
+            if case .disconnected(let message) = vm.connectionState {
+                errorBanner("Disconnected: \(message)", dismiss: nil)
+            } else if let error = vm.lastError {
+                errorBanner(error, dismiss: { vm.lastError = nil })
+            }
+
             if vm.hasQueuedSteering {
                 queuedSteeringBar(vm)
             }
+
+            // The resize handle pins the height (and disables auto-grow);
+            // until then the input grows with its content, clamped by
+            // PromptBarMetrics.
+            PromptResizeHandle(
+                currentHeight: tab.promptHeight,
+                onBegan: { tab.promptHeightIsCustom = true },
+                onResize: { tab.promptHeight = PromptBarMetrics.clamp($0) }
+            )
 
             PromptInputView(
                 cwd: tab.cwd,
@@ -50,11 +81,19 @@ struct SessionContent: View {
                 fontSize: FontSettings.shared.bodySize,
                 statusText: statusText(vm),
                 draft: tab.promptDraft,
+                restoreRequest: tab.restoreRequest,
                 onDraftChange: { tab.promptDraft = $0 },
                 onSubmit: submit,
-                onAbort: { Task { try? await vm.abort() } }
+                onAbort: { Task { try? await vm.abort() } },
+                onContentHeightChange: { needed in
+                    // Auto-grow with content until the user has pinned the
+                    // height with the resize handle. Always at least the
+                    // minimum, so a cleared prompt snaps back to a compact bar.
+                    guard !tab.promptHeightIsCustom else { return }
+                    tab.promptHeight = PromptBarMetrics.clamp(max(needed, PromptBarMetrics.minHeight))
+                }
             )
-            .frame(height: 104)
+            .frame(height: tab.promptHeight)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
@@ -88,6 +127,32 @@ struct SessionContent: View {
         }
     }
 
+    /// Red error banner above the prompt bar: stream/connection failures and
+    /// rejected sends. `dismiss` nil = persistent (the agent is gone).
+    private func errorBanner(_ text: String, dismiss: (() -> Void)?) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+                .textSelection(.enabled)
+            Spacer()
+            if let dismiss {
+                Button(action: dismiss) {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color.red.opacity(0.08))
+    }
+
     /// Banner above the prompt bar while steering messages are queued: one
     /// row per queued message, each with an edit button (restores the message
     /// into the input so Return re-queues the edited version) and a delete
@@ -105,15 +170,17 @@ struct SessionContent: View {
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Button {
-                        // Edit: restore this message into the input and drop it
-                        // from the queue; Return re-queues the edited version.
-                        tab.promptDraft = message
+                        // Restore: append this message to whatever is already
+                        // in the input (a push-back that leaves an in-flight
+                        // streamed paste alone) and drop it from the queue;
+                        // Return then sends the combined input.
+                        tab.restoreRequest = RestoreRequest(id: UUID(), text: message)
                         vm.removeQueuedSteering(at: index)
                     } label: {
                         Image(systemName: "pencil.circle")
                     }
                     .buttonStyle(.plain)
-                    .help("Edit this queued message")
+                    .help("Append this message to the prompt")
                     Button {
                         vm.removeQueuedSteering(at: index)
                     } label: {

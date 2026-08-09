@@ -49,7 +49,21 @@ public enum SandboxPolicy {
 
         return """
         (version 1)
-        (deny default)
+        ;; The general denial prefix: every default-deny fires a message to the
+        ;; unified log explaining where the error comes from (the app's
+        ;; sandbox) and what to do. The xcode limitation is stated here so it
+        ;; surfaces on any build-related denial.
+        (deny default (with message "uni03C0 sandbox denial: the app runs the agent in a default-deny Seatbelt sandbox (app Settings → Sandbox). The operation just attempted was not permitted. Fix: add the path to Additional read/write paths or the host to Allowed internet domains, then start a new session. Note: xcodebuild / SwiftPM CANNOT resolve Swift packages inside the sandbox (SPM runs its nested sandbox-exec, which the sandbox denies), so xcode/SPM builds only work from the terminal (./run.sh) with packages already resolved."))
+
+        ;; Operation-specific denial messages (surface via `with message` →
+        ;; unified log). These sit before the allows below, so the later allows
+        ;; still win for permitted operations and the message fires only on
+        ;; genuine denials.
+        (deny network-outbound (with message "uni03C0 sandbox: outbound network is loopback-only; the app's whitelist proxy is the agent's sole internet egress, and anything that ignores HTTP(S)_PROXY/ALL_PROXY fails to connect. Add the host to Allowed internet domains in Settings."))
+        (deny network-inbound (with message "uni03C0 sandbox: inbound network is loopback-only (local test servers bind 127.0.0.1)."))
+        (deny file-write* (with message "uni03C0 sandbox: file write denied outside the projects folder, ~/.pi, the configured dev directories, and temp."))
+        (deny sysctl-write (with message "uni03C0 sandbox: sysctl writes are denied."))
+        (deny system-socket (with message "uni03C0 sandbox: raw sockets are denied."))
 
         ;; Project workspace — read + write (+ executable mapping for built binaries)
         (allow file-read* (subpath "\(projectPath)"))

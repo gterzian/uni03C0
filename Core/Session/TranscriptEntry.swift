@@ -18,6 +18,13 @@ public enum TranscriptEntryKind: Hashable, Sendable {
     case userMessage(text: String)
     case assistantMessage(text: String, thinking: String, isStreaming: Bool)
     case toolCall(card: ToolCallCard)
+    /// A stream failure surfaced after the partial assistant message (network
+    /// errors, provider failures, truncation) — styled red in the transcript,
+    /// matching how the TUI renders `stopReason` failures.
+    case errorMessage(String)
+    /// A user- or system-initiated abort ("Operation aborted") — not a
+    /// failure, so styled weaker than an error.
+    case abortedMessage(String)
 
     public var isStreaming: Bool {
         if case .assistantMessage(_, _, let streaming) = self { return streaming }
@@ -42,14 +49,19 @@ public enum ToolCallState: Hashable, Sendable {
 public struct ToolCallCard: Hashable, Sendable, Identifiable {
     public var id: String
     public var toolName: String
+    /// Pretty-printed arguments for display (may be truncated).
     public var arguments: String
+    /// The raw structured arguments, untruncated — the diff view (edit tool)
+    /// parses this, never the display string.
+    public var argumentsValue: JSONValue?
     public var output: String
     public var state: ToolCallState
 
-    public init(id: String, toolName: String, arguments: String, output: String = "", state: ToolCallState = .running) {
+    public init(id: String, toolName: String, arguments: String, argumentsValue: JSONValue? = nil, output: String = "", state: ToolCallState = .running) {
         self.id = id
         self.toolName = toolName
         self.arguments = arguments
+        self.argumentsValue = argumentsValue
         self.output = output
         self.state = state
     }

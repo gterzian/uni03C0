@@ -73,26 +73,16 @@ enum SessionToolbar {
     }
 
     /// Thinking-level picker: current level shown beside the icon; a "choose
-    /// thinking level" prompt until one is set. The current level is always
-    /// present in the list (merged even if the runtime refresh hasn't caught
-    /// up) and checkmarked, so the menu always shows the live choice.
+    /// thinking level" prompt until one is set. The menu offers exactly the
+    /// levels pi reports via `get_available_thinking_levels` — the same list
+    /// the terminal TUI's selector shows — so the checkmarked choice always
+    /// matches what pi actually uses. No levels are invented or merged in.
     private static func thinkingMenu(_ vm: SessionViewModel) -> some View {
-        // Always include the current level, so the checkmarked item exists even
-        // if the runtime list is stale (e.g. right after a session switch).
-        let current = vm.thinkingLevel
-        let levels: [String]
-        if let current, vm.availableThinkingLevels.contains(current) {
-            levels = vm.availableThinkingLevels
-        } else if let current {
-            levels = [current] + vm.availableThinkingLevels
-        } else {
-            levels = vm.availableThinkingLevels
-        }
         return Menu {
-            if levels.isEmpty {
+            if vm.availableThinkingLevels.isEmpty {
                 Text("No thinking levels available")
             }
-            ForEach(levels, id: \.self) { level in
+            ForEach(vm.availableThinkingLevels, id: \.self) { level in
                 Button {
                     Task { try? await vm.setThinkingLevel(level) }
                 } label: {

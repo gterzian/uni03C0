@@ -78,8 +78,8 @@ unrelated things.
 - **Targets/modules are short and unprefixed:** `Core` (framework),
   `Client` (app), `ClientTests`. No `PiCore`/`AgentCore`, no `PiMacApp`.
 - **Internal types are concrete, not prefixed:** the process actor is
-  `ProcessController`, errors are `ProcessError`, client defaults are
-  `Defaults`. Don't reach for a `Core`/`Client`/`Agent` prefix just because a
+  `ProcessController`, errors are `ProcessError`, client settings are
+  `SandboxSettings`. Don't reach for a `Core`/`Client`/`Agent` prefix just because a
   name sounds generic — a concrete name is better than a prefixed one.
 - **`pi` appears only where the code actually talks to the binary or its
   RPC protocol:** `pi --mode rpc`, `PiExecutable.resolve()`, `~/.pi`,
@@ -93,11 +93,16 @@ unrelated things.
 
 ## Defaults
 
-A fresh session starts on the client's chosen model and thinking level
-(`Defaults` in `Core`): **DeepSeek V4 Flash** (`deepseek` /
-`deepseek-v4-flash`) and **thinking = max**. Applied once at spawn by
-`SessionViewModel.applyDefaults()`, so resume/reload never override the user's
-choices for a running session.
+The app follows pi's own defaults: a session starts exactly as it would in
+the terminal TUI. pi applies its settings (`defaultProvider` /
+`defaultModel` / `defaultThinkingLevel` in `~/.pi/agent/settings.json`) at
+spawn, and the app reads the live model + thinking level from `get_state`
+and events. Nothing is forced at spawn — the app never switches the model
+or thinking level behind the user's back, so the requests a session
+produces (and the provider-side prompt cache) are identical whether the
+session is driven from the app or the TUI. The thinking-level menu offers
+exactly the levels pi reports via `get_available_thinking_levels`, matching
+the TUI's selector.
 
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
@@ -219,7 +224,26 @@ end-of-task verification — WPT, TLA+ traces — inside the sandbox).
   inside the sandbox (no root, no debugserver attach). What works: direct
   probes (`ls`, `stat`, `kill -0`, `mdfind`, `mdutil`, `/usr/sbin/ioreg`,
   `otool -L`/`nm -u`/`strings` on the tool's binaries). `DYLD_INSERT_LIBRARIES`
-  interposition is refused on hardened Apple system binaries.
+  interposition is refused on hardened Apple system binaries. The policy's
+  deny rules carry `(with message …)` explanations — every denial logs a
+  "uni03C0 sandbox …" line to the unified log under
+  `com.apple.sandbox.reporting:violation`, next to the kernel's own
+  `Sandbox: <proc> deny(<n>) <op>` line. The agent never sees these: the
+  messages are unified-log-only (there is no stderr surface for denials on
+  macOS), so the operator reads them via `log show --last 10m --predicate
+  'eventMessage CONTAINS "uni03C0 sandbox"'` (must be run unsandboxed) and
+  tells the agent; the agent's own copy of this knowledge lives here.
+- **xcode/SPM builds do NOT work from inside the sandbox.** `xcodebuild`
+  resolving Swift packages runs SPM, which wraps manifest execution in
+  `sandbox-exec`; the sandbox denies the nested `sandbox_apply` (EPERM, and
+  no policy rule can lift it — even `(allow system-mac-syscall)` does not
+  cover it, verified). Building from the sandbox works only when the package
+  graph is already resolved: the build then skips "Resolve Package Graph"
+  and compiles from the cached DerivedData `SourcePackages`. When a build
+  fails with "Could not resolve package dependencies: sandbox-exec:
+  sandbox_apply: Operation not permitted", the fix is to run `./run.sh`
+  (or `xcodebuild`) once in the terminal to refresh the resolution, then the
+  same build succeeds in the sandbox.
 - **Not every failure is the sandbox — check the machine first.**
   `java_home`/`/usr/bin/java` reporting "Unable to locate a Java Runtime"
   looked sandbox-caused but was not: JVM discovery goes through the Spotlight
@@ -296,6 +320,14 @@ concurrency.
   hold the transcript.
 - `TranscriptEntry` / `TranscriptEntryKind` — the row model (user message,
   assistant message with thinking, tool call card).
+- `ToolCardExpansion` / `HeightCache` — the per-card expand registry and the
+  (id, width) → height cache; pure data, moved into Core so both are
+  unit-testable from `ClientTests` (which links Core only).
+- `TextDiff` / `EditToolArgs` — the pure line diff (prefix/suffix trim +
+  bounded LCS, GitHub removed-then-added ordering) and the edit-tool
+  arguments decoder behind the tool card's red/green diff view.
+- `StreamedPaste` — pure head/tail + chunk splitting for streaming very large
+  pastes into the prompt input (surrogate-safe boundaries).
 - `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
 - `PathCompletion` — filesystem path tab-completion for the prompt bar.
 - `SandboxSettings` — the persisted settings (dev directories, allowed
@@ -348,13 +380,27 @@ concurrency.
   instead of sending (the whole queue is flushed as ONE combined prompt when
   the turn settles — never one turn per queued message, unlike the TUI). The
   queued-steering banner above the bar lists every queued message, each with
-  an edit button (restores it into the input; Return re-queues the edited
-  version) and a delete button. A live status readout (context %, model,
-  thinking level) sits in very light gray at the bottom-right inside the
-  bar. **Esc aborts the in-flight turn from anywhere in the window**: a local
-  key monitor falls back to the text view's own Esc handling when the input
-  has focus, and defers to open dropdowns/sheets (a visible popup-menu-level
-  window closes on Esc instead of aborting).
+  an edit button (appends it to whatever is already in the input — a quick
+  push-back that coexists with an in-flight streamed paste, which keeps
+  pushing to the front; Return then sends the combined input) and a delete
+  button. A live status readout (context %, model, thinking level) sits in
+  very light gray at the bottom-right inside the bar, below a reserved strip
+  so text can never scroll under it. **Esc aborts the in-flight turn from
+  anywhere in the window** and then focuses the input so typing can start
+  immediately: a local key monitor falls back to the text view's own Esc
+  handling when the input has focus, and defers to open dropdowns/sheets (a
+  visible popup-menu-level window closes on Esc instead of aborting). The
+  bar is **resizable**: a drag handle above it pins the height (clamped
+  64…400); until dragged it auto-grows with the text and snaps back to the
+  minimum on send. **Large pastes become a windowed paste** (`StreamedPaste`
+  in Core): the full pasted text lives in a store (plain data, never laid
+  out), the text view holds only a bounded ~64KB window starting at the
+  bottom of the paste, and the input is disabled (editing a slice would
+  desync it from the store) with a spinner + ✕ visible. Scrolling slides the
+  window toward the head or the tail with a re-anchored viewport, so layout
+  stays bounded regardless of paste size — a multi-megabyte paste never
+  blocks the main thread and the conversation keeps scrolling. Enter submits
+  the full store.
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
   read it; the transcript coordinator observes the change, clears its height
@@ -397,19 +443,30 @@ Behavior details that matter:
 - **Tail always streams in.** New rows append via `insertRows` (cheap,
   O(added)); inserting at the end never shifts existing rows, so a scrolled-up
   viewport is untouched.
-- **Older history loads in compounding blocks.** `windowStart` only ever
-  decreases. When the viewport nears the top of the fetched region, a spinner
-  appears above the conversation and a block is prepended; the block size
-  doubles each time (capped), so sustained scrolling eventually pulls the whole
-  conversation into memory. Fetched rows are **never evicted** — scrolling back
-  down reuses cached heights, so it's always fast.
-- **Sticky follow.** Following is on by default. The moment the user scrolls
-  *up*, following disengages so streaming doesn't drag them back down; it
-  re-engages when they return to the bottom. Sending a message always jumps to
-  the bottom. Direction is detected from the scroll position (whether content
-  remains below the viewport), **not** from row indices — a tall streaming row
-  fills the viewport, so the last visible row can still be the tail even when
+- **Older history loads in compounding blocks, and is evictable once the
+  user scrolls back down.** `windowStart` decreases as older history is
+  prepended (scroll up; the block doubles each time, capped), and *increases
+  again* when the user scrolls back down and the rows above a buffer (a few
+  viewports) are no longer needed — those rows leave the table and their
+  cached heights are dropped. The **store keeps the full conversation**, so a
+  later scroll-up re-materializes them instantly (no RPC round trip); only
+  the view's window and height cache are pruned. The streaming tail (the
+  front of the window) is **never** popped.
+- **Sticky follow, no jumps.** Following is on by default. The moment the user
+  scrolls *up*, following disengages so streaming doesn't drag them back down;
+  it re-engages when they return to the bottom. Sending a message (or a
+  queued-steering flush) **never jumps the scroll** — the view stays exactly
+  where the user left it, even while the response streams in off-screen.
+  Direction is detected from the scroll position (whether content remains
+  below the viewport), **not** from row indices — a tall streaming row fills
+  the viewport, so the last visible row can still be the tail even when
   scrolled up.
+- **Stream failures surface in the transcript.** When an LLM stream ends with
+  `stopReason` `error`/`aborted`/`length` (network failures, provider errors,
+  truncation), the store appends a red error row below the partial assistant
+  message — the same wording as pi's TUI (`assistant-message.js`). Send
+  preflight failures (auth, rejected prompts) and a dead agent process surface
+  as an error banner above the prompt bar instead of being silently swallowed.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
   views). Streaming text is **batched** — the tail row updates at most every
   0.25s or once ~20 new characters accumulate (a few words), never per
@@ -437,8 +494,12 @@ Behavior details that matter:
   by the real id (no duplicate card; the result is appended into the same
   card as output arrives). Output previews at 30 lines (args at 2), with a
   chevron button in the card header that expands to the full content (the
-  row re-measures via a shared expansion registry). User messages are
-  highlighted light-blue to stand out from assistant replies.
+  row re-measures via a shared expansion registry). **Edit calls render a
+  GitHub-style diff** (removed lines red, added lines green) from the raw
+  `edits[]` arguments via `TextDiff`, instead of the raw JSON; the successful
+  tool output (a diff/patch string) is omitted as redundant, while errors
+  always show. User messages are highlighted light-blue to stand out from
+  assistant replies.
 - **Zero rendering when off-screen.** When the window is occluded, minimized,
   or the app is hidden, the coordinator does **no** per-delta work: `applyModelChanges`
   bails and only sets `needsCatchUp`. The store keeps folding off-main; on return

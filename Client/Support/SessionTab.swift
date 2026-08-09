@@ -2,6 +2,15 @@ import Core
 import Foundation
 import Observation
 
+/// A one-shot "append this text to the prompt input" request, used when
+/// restoring queued steering into the input. The `id` distinguishes a new
+/// request from a stale one when the view re-renders (the coordinator records
+/// the last id it applied).
+struct RestoreRequest: Equatable {
+    let id: UUID
+    let text: String
+}
+
 /// One live session — one tab in the tabbed main window (also used by the
 /// single-session view and the menu-bar quick prompt). Owns the
 /// `SessionViewModel` (connection, RPC commands, UI state) plus the small bits
@@ -25,6 +34,17 @@ final class SessionTab: Identifiable {
     /// Mirror of the prompt input's text, so "edit queued steering" can
     /// restore a queued message into the input.
     var promptDraft = ""
+    /// One-shot restore requests (queued steering back into the input). The
+    /// restore APPENDS to whatever is already in the input — a quick push
+    /// back — and never disturbs an in-flight streamed paste (which keeps
+    /// pushing to the front).
+    var restoreRequest: RestoreRequest?
+    /// Height of the prompt input. Auto-grows with content until the user
+    /// drags the resize handle, which pins it (`promptHeightIsCustom`).
+    var promptHeight: CGFloat = PromptBarMetrics.defaultHeight
+    /// True once the user has dragged the resize handle: the height is then
+    /// user-fixed and no longer follows the content.
+    var promptHeightIsCustom = false
 
     /// Prevents stopping a tab twice (close + window teardown) — a stopped
     /// session's process is gone and must not be terminated again.
@@ -33,10 +53,11 @@ final class SessionTab: Identifiable {
     init(cwd: URL, projectsRoot: URL?) {
         self.cwd = cwd
         self.viewModel = SessionViewModel(cwd: cwd, projectsRoot: projectsRoot)
-        // When an abort ends the turn, queued steering is returned to the
-        // prompt input instead of being sent.
+        // When an abort ends the turn, queued steering is appended back into
+        // the prompt input (a push-back that coexists with any in-flight
+        // streamed paste, which keeps pushing to the front).
         viewModel.onRestoreSteeringToInput = { [weak self] text in
-            self?.promptDraft = text
+            self?.restoreRequest = RestoreRequest(id: UUID(), text: text)
         }
     }
 

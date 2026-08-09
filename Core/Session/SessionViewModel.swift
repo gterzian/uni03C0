@@ -20,6 +20,10 @@ public final class SessionViewModel {
     }
 
     public private(set) var connectionState: ConnectionState = .starting
+    /// The last send/prompt failure (preflight errors, auth failures, …), shown
+    /// as a dismissible error banner above the prompt bar. Cleared on the next
+    /// successful send. Set by the view layer (SessionContent's dismiss button).
+    public var lastError: String?
     public private(set) var isStreaming = false
     public private(set) var model: ModelInfo?
     public private(set) var availableModels: [ModelInfo] = []
@@ -105,10 +109,14 @@ public final class SessionViewModel {
             await self?.consumeEvents()
         }
         await refreshState()
-        // A fresh session starts on the client's preferred model and thinking
-        // level. Applied once at spawn, so a resume/reload never overrides what
-        // the user chose for a running session.
-        await applyDefaults()
+        // No defaults are forced at spawn: the session starts exactly as it
+        // would in the terminal TUI — pi applies its own settings
+        // (defaultProvider / defaultModel / defaultThinkingLevel) at spawn
+        // and the app reads the live model + thinking level from get_state
+        // and events. Never switching the model or thinking level behind the
+        // user's back keeps the requests the session produces — and thus the
+        // provider-side prompt cache — identical whether the session is
+        // driven from the app or the TUI.
         // Switching the model can change which thinking levels it supports, so
         // re-fetch the runtime options (models + levels) for the status bar.
         await refreshRuntimeOptions()
@@ -204,9 +212,17 @@ public final class SessionViewModel {
         abortReturnsQueuedSteering = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let response = try await controller.send(.prompt(message: trimmed))
-        if response.success == false {
-            throw ProcessError.commandFailed(response.error ?? "prompt rejected")
+        do {
+            let response = try await controller.send(.prompt(message: trimmed))
+            if response.success == false {
+                throw ProcessError.commandFailed(response.error ?? "prompt rejected")
+            }
+            lastError = nil
+        } catch {
+            // Surface send failures (auth/preflight/network) to the UI instead
+            // of silently swallowing them.
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            throw error
         }
     }
 
@@ -291,19 +307,6 @@ public final class SessionViewModel {
         _ = try? await controller.send(.switchSession(path: path.path))
         await refreshState()
         await loadMessages()
-    }
-
-    /// Applies the client defaults to a freshly spawned session: the DeepSeek
-    /// Flash model and the maximum thinking level. Best-effort (ignores
-    /// failures) so an environment without those defaults falls back to the
-    /// agent's own.
-    private func applyDefaults() async {
-        if model?.id != Defaults.modelID || model?.provider != Defaults.modelProvider {
-            try? await setModel(Defaults.modelProvider, Defaults.modelID)
-        }
-        if thinkingLevel != Defaults.thinkingLevel {
-            try? await setThinkingLevel(Defaults.thinkingLevel)
-        }
     }
 
     /// Refreshes the context-window usage percentage from `get_session_stats`.

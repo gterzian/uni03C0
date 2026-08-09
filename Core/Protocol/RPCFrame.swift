@@ -161,6 +161,13 @@ public struct AgentMessage: Codable, Sendable, Equatable {
     public var toolName: String?
     public var isError: Bool?
     public var timestamp: Int64?
+    /// How the assistant response ended ("end", "error", "aborted", "length").
+    /// Present on `message_end`/`turn_end` for assistant messages; the client
+    /// surfaces `error`/`aborted`/`length` as transcript error rows.
+    public var stopReason: String?
+    /// The failure text carried with `stopReason == "error"` (network failures,
+    /// provider errors, …) or "aborted".
+    public var errorMessage: String?
 }
 
 /// A tolerant content block model. Provider formats differ (anthropic uses

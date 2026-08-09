@@ -15,6 +15,12 @@ extension TranscriptEntryKind {
         case .assistantMessage(let text, let thinking, let isStreaming):
             return TranscriptText.measuredHeight(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, width: width)
 
+        case .errorMessage(let text):
+            return TranscriptText.measuredHeight(text: text, thinking: nil, role: .error, isStreaming: false, width: width)
+
+        case .abortedMessage(let text):
+            return TranscriptText.measuredHeight(text: text, thinking: nil, role: .aborted, isStreaming: false, width: width)
+
         case .toolCall(let card):
             return Self.toolCallHeight(card, width: width)
         }
@@ -36,21 +42,3 @@ extension TranscriptEntryKind {
     }
 }
 
-/// Shared expansion state for tool-call cards, keyed by card id. The card's
-/// expand button toggles it (through the coordinator, so the row re-measures);
-/// `toolCallHeight` reads it. Lives here because it only affects measurement
-/// and presentation, not the wire protocol.
-final class ToolCardExpansion {
-    static let shared = ToolCardExpansion()
-    private var expanded: Set<String> = []
-
-    func toggle(_ id: String) {
-        if expanded.contains(id) {
-            expanded.remove(id)
-        } else {
-            expanded.insert(id)
-        }
-    }
-
-    func isExpanded(_ id: String) -> Bool { expanded.contains(id) }
-}

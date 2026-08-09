@@ -11,8 +11,15 @@ public enum PathCompletion {
     /// substitute for the token under the cursor), or `[]` when nothing matches.
     public static func candidates(for fragment: String, cwd: URL) -> [String] {
         let expanded = (fragment as NSString).expandingTildeInPath
-        let dirPart = (expanded as NSString).deletingLastPathComponent
-        let partial = (expanded as NSString).lastPathComponent
+        // A trailing slash means the token points AT a directory: the partial
+        // to match is empty and the directory itself is the base (shell
+        // semantics — Tab on "Sources/" completes names inside Sources, not
+        // "Sources" again, which used to produce a bogus "/Sources/" with a
+        // leading slash). Detected on the ORIGINAL fragment: tilde expansion
+        // strips the trailing slash.
+        let endsInSlash = fragment.hasSuffix("/") && fragment != "/"
+        let dirPart = endsInSlash ? expanded : (expanded as NSString).deletingLastPathComponent
+        let partial = endsInSlash ? "" : (expanded as NSString).lastPathComponent
 
         let base: URL
         if dirPart.isEmpty {
