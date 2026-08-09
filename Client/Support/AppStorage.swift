@@ -2,21 +2,25 @@ import AppKit
 import SwiftUI
 
 /// App data locations per §8 of the design: the native client's own small
-/// footprint lives in the standard Library folders under a bundle-ID-scoped
-/// subdirectory; `~/.pi` is pi's and is only read (or mutated via RPC).
+/// footprint lives in the standard Library folders under an app-name-scoped
+/// subdirectory (`~/Library/Application Support/uni03C0`); `~/.pi` is pi's
+/// and is only read (or mutated via RPC).
 enum AppStorage {
-    static let bundleID = Bundle.main.bundleIdentifier ?? "com.gterzian.client"
+    /// The data-directory name — the app's display name, not the bundle ID,
+    /// so the Library footprint reads as "uni03C0" and is independent of the
+    /// bundle identifier.
+    static let directoryName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "uni03C0"
 
     static var applicationSupportDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent(bundleID, isDirectory: true)
+        let dir = base.appendingPathComponent(directoryName, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
     static var cachesDirectory: URL {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent(bundleID, isDirectory: true)
+        let dir = base.appendingPathComponent(directoryName, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

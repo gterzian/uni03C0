@@ -123,12 +123,3 @@ public enum PiExecutable {
         return common[0]
     }
 }
-
-/// The agent defaults the client applies on a fresh session: the model and
-/// thinking level a new conversation starts with, independent of the
-/// underlying agent's own defaults.
-public enum Defaults {
-    public static let modelProvider = "deepseek"
-    public static let modelID = "deepseek-v4-flash"
-    public static let thinkingLevel = "max"
-}

@@ -55,17 +55,41 @@ struct ToolCallCardView: View {
         _isExpanded = State(initialValue: isInitiallyExpanded)
     }
 
+    /// The parsed edit operations when this is an edit tool call with
+    /// well-formed args; nil otherwise (fall back to the plain rendering).
+    private var editOperations: [EditOperation]? {
+        guard card.toolName == "edit" else { return nil }
+        // Prefer the raw structured args (untruncated); fall back to parsing
+        // the display string (history that predates argumentsValue).
+        let ops = EditToolArgs.parse(card.argumentsValue)
+        if !ops.isEmpty { return ops }
+        let fromString = EditToolArgs.parse(json: card.arguments)
+        return fromString.isEmpty ? nil : fromString
+    }
+
+    private var hasExpandableContent: Bool {
+        editOperations != nil || !card.arguments.isEmpty || !card.output.isEmpty
+    }
+
     var body: some View {
+        let ops = editOperations
         VStack(alignment: .leading, spacing: 6) {
             header
-            if !card.arguments.isEmpty {
+            if let ops, !ops.isEmpty {
+                // GitHub-style red/green diff instead of the raw arguments.
+                EditDiffView(operations: ops, isExpanded: isExpanded)
+            } else if !card.arguments.isEmpty {
                 Text(card.arguments)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(isExpanded ? nil : 2)
                     .textSelection(.enabled)
             }
-            if !card.output.isEmpty {
+            // The raw output: errors always show (never hidden behind the
+            // diff), other tools show as before; a successful edit's output is
+            // the diff/patch text, redundant next to the pretty diff, so it is
+            // omitted for cards that render one.
+            if !card.output.isEmpty, card.state == .failed || ops == nil {
                 Text(card.output)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(card.state == .failed ? Color.red : .primary)
@@ -101,7 +125,7 @@ struct ToolCallCardView: View {
         // transient whitespace.
         .contentShape(Rectangle())
         .onTapGesture {
-            guard !card.output.isEmpty || !card.arguments.isEmpty else { return }
+            guard hasExpandableContent else { return }
             isExpanded.toggle()
             onToggleExpand()
         }
@@ -117,7 +141,7 @@ struct ToolCallCardView: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.primary)
             Spacer()
-            if !card.output.isEmpty || !card.arguments.isEmpty {
+            if hasExpandableContent {
                 // Passive state indicator — the whole card is the click target.
                 Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                     .font(.system(size: 10))
@@ -175,5 +199,86 @@ struct ToolCallCardView: View {
         case .done: Color(nsColor: .separatorColor)
         case .failed: .red.opacity(0.5)
         }
+    }
+}
+
+/// GitHub-style red/green diff for edit tool calls: one block per edit
+/// operation — a path header, then removed lines (red), added lines (green),
+/// and context lines (plain). Collapsed shows a short preview; expanded shows
+/// every line. Pure SwiftUI over `TextDiff`, so the row measures exactly like
+/// any other card content (`NSHostingController.sizeThatFits`).
+struct EditDiffView: View {
+    let operations: [EditOperation]
+    let isExpanded: Bool
+
+    /// Line budget (headers + diff lines) for the collapsed preview.
+    private static let collapsedLineBudget = 14
+
+    private enum DiffRow: Hashable {
+        case path(String)
+        case line(DiffLine)
+    }
+
+    var body: some View {
+        let rows = buildRows()
+        let shown = isExpanded ? rows : Array(rows.prefix(Self.collapsedLineBudget))
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(shown.enumerated()), id: \.offset) { _, row in
+                rowView(row)
+            }
+            if !isExpanded, rows.count > Self.collapsedLineBudget {
+                Text("…")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func buildRows() -> [DiffRow] {
+        var rows: [DiffRow] = []
+        for op in operations {
+            rows.append(.path(op.path))
+            for line in TextDiff.diff(old: op.oldText, new: op.newText) {
+                rows.append(.line(line))
+            }
+        }
+        return rows
+    }
+
+    @ViewBuilder
+    private func rowView(_ row: DiffRow) -> some View {
+        switch row {
+        case .path(let path):
+            Text(path)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.top, 8)
+                .padding(.bottom, 2)
+                .padding(.horizontal, 6)
+        case .line(let line):
+            diffLineView(line)
+        }
+    }
+
+    private func diffLineView(_ line: DiffLine) -> some View {
+        let (sign, foreground, background): (String, Color, Color) = switch line.kind {
+        case .removed: ("-", .red, Color.red.opacity(0.10))
+        case .added: ("+", .green, Color.green.opacity(0.10))
+        case .same: (" ", .primary, .clear)
+        }
+        return HStack(spacing: 6) {
+            Text(sign)
+                .foregroundStyle(foreground)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(width: 10, alignment: .trailing)
+            Text(line.text.isEmpty ? " " : line.text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(line.kind == .same ? Color.primary : foreground)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 0.5)
+        .background(background)
     }
 }

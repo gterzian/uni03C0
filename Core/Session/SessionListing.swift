@@ -57,11 +57,13 @@ public enum SessionListing {
         var title: String?
         var userCount = 0
 
-        guard let handle = try? FileHandle(forReadingFrom: file),
-              let data = try? handle.readToEnd() else {
+        guard let handle = try? FileHandle(forReadingFrom: file) else {
             return Summary(id: id, path: file, timestamp: timestamp, title: file.lastPathComponent)
         }
-        try? handle.close()
+        defer { try? handle.close() }
+        // Only the head of the file matters (session header + first messages);
+        // a bounded read keeps listing cheap regardless of session length.
+        let data = (try? handle.read(upToCount: 256 * 1024)) ?? Data()
 
         let lines = data.split(separator: 0x0A)
         let limit = min(lines.count, 400)

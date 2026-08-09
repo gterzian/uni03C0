@@ -77,8 +77,15 @@ public final class TranscriptStore: @unchecked Sendable {
 
     /// Folds one RPC frame into the transcript. Returns true if it mutated the
     /// transcript (i.e. the renderer should be notified).
+    ///
+    /// The whole mutation runs under the lock: folding happens off the main
+    /// thread (detached tasks) while the renderer reads on the main thread, so
+    /// every write must be serialized against `entry(at:)`/`count`/… — not just
+    /// the version bump.
     @discardableResult
     public func apply(_ frame: RPCFrame) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
         var changed = false
         switch frame.type {
         case "message_start":
@@ -108,9 +115,7 @@ public final class TranscriptStore: @unchecked Sendable {
             break // response/compaction/queue/extension frames: not surfaced in v1
         }
         if changed {
-            lock.lock()
             _version &+= 1
-            lock.unlock()
         }
         return changed
     }
@@ -173,6 +178,7 @@ public final class TranscriptStore: @unchecked Sendable {
                             id: cardID,
                             toolName: block.name ?? "tool",
                             arguments: block.toolArgumentsPretty(),
+                            argumentsValue: block.toolArguments,
                             state: .done
                         )
                         result.append(TranscriptEntry(id: cardID, kind: .toolCall(card: card)))
@@ -180,6 +186,13 @@ public final class TranscriptStore: @unchecked Sendable {
                     default:
                         break
                     }
+                }
+                // Surface stream failures recorded in the session (network
+                // errors etc.) the same way live folding does.
+                if let kind = Self.failureKind(for: message),
+                   !blocks.contains(where: { $0.isToolCall }),
+                   let messageID = message.id {
+                    result.append(TranscriptEntry(id: "\(messageID)-error", kind: kind))
                 }
             } else if message.role == "toolResult" {
                 // Attach the output to the matching tool-call card (by id).
@@ -292,6 +305,43 @@ public final class TranscriptStore: @unchecked Sendable {
         _entries[index] = entry
         streamingEntryID = nil
         turnStartPlaceholderID = nil
+        // Surface stream failures (network errors, aborts, truncation) the way
+        // the TUI does: an error row after the partial assistant message.
+        appendFailureRowIfNeeded(for: message, blocks: blocks)
+    }
+
+    /// Appends a notice row when a message ended in error/aborted/truncated
+    /// (the stop reasons pi reports for failed LLM streams). Skipped when the
+    /// message carries tool calls — their failures show in the cards.
+    private func appendFailureRowIfNeeded(for message: AgentMessage, blocks: [ContentBlock]) {
+        guard !blocks.contains(where: { $0.isToolCall }) else { return }
+        guard let kind = Self.failureKind(for: message) else { return }
+        let id = message.id ?? makeID("assistant")
+        _entries.append(TranscriptEntry(id: "\(id)-error", kind: kind))
+    }
+
+    /// The TUI-equivalent failure/notice kind for a message's stop reason, or
+    /// nil when the message ended normally. Wording matches
+    /// `assistant-message.js`; severity is split so aborts (user-initiated)
+    /// render weaker than hard failures:
+    /// - "error" → errorMessage("Error: …") — a hard failure
+    /// - "aborted" → abortedMessage(…) — user-initiated, not an error
+    /// - "length" → errorMessage("Response was truncated before completion.")
+    static func failureKind(for message: AgentMessage) -> TranscriptEntryKind? {
+        switch message.stopReason {
+        case "error":
+            return .errorMessage("Error: \(message.errorMessage ?? "Unknown error")")
+        case "aborted":
+            let errorMessage = message.errorMessage
+            if let errorMessage, errorMessage != "Request was aborted" {
+                return .abortedMessage(errorMessage)
+            }
+            return .abortedMessage("Operation aborted")
+        case "length":
+            return .errorMessage("Response was truncated before completion.")
+        default:
+            return nil
+        }
     }
 
     /// Reserves the response slot after the echoed user message: a placeholder
@@ -351,11 +401,12 @@ public final class TranscriptStore: @unchecked Sendable {
                 // refresh name and args in place.
                 card.toolName = block.name ?? card.toolName
                 if !pretty.isEmpty { card.arguments = pretty }
+                if let raw = block.toolArguments { card.argumentsValue = raw }
                 _entries[index].kind = .toolCall(card: card)
             } else {
                 _entries.append(TranscriptEntry(
                     id: callID,
-                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: block.name ?? "tool", arguments: pretty))
+                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: block.name ?? "tool", arguments: pretty, argumentsValue: block.toolArguments))
                 ))
             }
         default:
@@ -370,6 +421,7 @@ public final class TranscriptStore: @unchecked Sendable {
             // The card already exists from the streamed toolcall_* events:
             // swap in the final pretty-printed args, keep it running.
             card.arguments = start.args?.prettyPrinted() ?? card.arguments
+            card.argumentsValue = start.args ?? card.argumentsValue
             card.toolName = start.toolName ?? card.toolName
             card.state = .running
             _entries[index].kind = .toolCall(card: card)
@@ -379,6 +431,7 @@ public final class TranscriptStore: @unchecked Sendable {
             id: id,
             toolName: start.toolName ?? "tool",
             arguments: start.args?.prettyPrinted() ?? "",
+            argumentsValue: start.args,
             state: .running
         )
         _entries.append(TranscriptEntry(id: id, kind: .toolCall(card: card)))

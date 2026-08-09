@@ -1,6 +1,6 @@
 name: Client
 options:
-  bundleIdPrefix: com.gterzian.client
+  bundleIdPrefix: com.uni03c0
   deploymentTarget:
     macOS: "26.0"
   createIntermediateGroups: true
@@ -32,7 +32,7 @@ targets:
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client.Core
+        PRODUCT_BUNDLE_IDENTIFIER: com.uni03c0.Core
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         GENERATE_INFOPLIST_FILE: YES
         SKIP_INSTALL: YES
@@ -64,7 +64,7 @@ targets:
           cp "${BUILT_PRODUCTS_DIR}/sandbox-launcher" "${TARGET_BUILD_DIR}/${EXECUTABLE_FOLDER_PATH}/"
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client
+        PRODUCT_BUNDLE_IDENTIFIER: com.uni03c0
         PRODUCT_NAME: "uni03C0"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
@@ -81,7 +81,7 @@ targets:
         product: Subprocess
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.gterzian.client.ClientTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.uni03c0.ClientTests
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"

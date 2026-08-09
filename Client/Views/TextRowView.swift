@@ -21,7 +21,13 @@ enum TranscriptText {
         body.lineSpacing = 2
         body.lineBreakMode = .byWordWrapping
         let bodyFont = NSFont.systemFont(ofSize: FontSettings.shared.bodySize)
-        let bodyColor: NSColor = role == .user ? .labelColor : .labelColor
+        // Notice/error rows (stream failures, aborts): hard failures render
+        // red; user-initiated aborts render secondary (weaker).
+        let bodyColor: NSColor = switch role {
+        case .error: .systemRed
+        case .aborted: .secondaryLabelColor
+        case .user, .assistant: .labelColor
+        }
 
         let result = NSMutableAttributedString()
 
@@ -86,11 +92,22 @@ final class TextRowView: NSView {
     enum Role {
         case user
         case assistant
+        /// A stream-failure row (network errors, aborts, truncation) — styled
+        /// red via `TranscriptText`.
+        case error
+        /// An abort notice ("Operation aborted") — user-initiated, styled
+        /// weaker than an error (secondary color, not red).
+        case aborted
     }
 
     /// Light-blue highlight behind user messages (the user's own words stand
-    /// out from the agent's replies).
-    private static let userHighlight = NSColor(calibratedRed: 0.87, green: 0.93, blue: 1.0, alpha: 1.0)
+    /// out from the agent's replies). Dynamic: a deep blue in dark mode so
+    /// white label text stays readable, pale blue in light mode.
+    private static let userHighlight = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 0.16, green: 0.21, blue: 0.35, alpha: 1.0)
+            : NSColor(calibratedRed: 0.87, green: 0.93, blue: 1.0, alpha: 1.0)
+    }
 
     private let textView = NSTextView()
     private var role: Role = .assistant
@@ -123,6 +140,18 @@ final class TextRowView: NSView {
         textView.isSelectable = true
         textView.drawsBackground = false
         textView.isRichText = false
+        // No spell/grammar checking on transcript content: it can be very
+        // large, and CoreNLP's language-ID asserts on big inputs (crashes the
+        // app on NSTextCheckingOperationQueue). Code also reads better without
+        // underline squiggles.
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.isAutomaticTextCompletionEnabled = false
         textView.isVerticallyResizable = false
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true

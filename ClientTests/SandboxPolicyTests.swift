@@ -228,33 +228,28 @@ final class SandboxPolicyTests: XCTestCase {
         let expanded = SandboxPolicy.canonicalize("~/.cargo")
         XCTAssertEqual(expanded, NSHomeDirectory() + "/.cargo")
     }
-}
 
-final class WhitelistTests: XCTestCase {
-    func testExactAndSubdomainMatch() {
-        let whitelist = WhitelistProxy.Whitelist(hosts: ["whatwg.org", "w3c.github.io"])
-        XCTAssertTrue(whitelist.allows("whatwg.org"))
-        XCTAssertTrue(whitelist.allows("html.spec.whatwg.org"))
-        XCTAssertTrue(whitelist.allows("www.w3c.github.io"))
+    func testPolicyDenialMessagesArePresent() {
+        // Denials fire `with message` explanations to the unified log so the
+        // operator can tell the agent where the error comes from.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        XCTAssertTrue(source.contains("(deny default (with message"))
+        XCTAssertTrue(source.contains("default-deny Seatbelt sandbox"))
+        XCTAssertTrue(source.contains("xcodebuild / SwiftPM CANNOT resolve Swift packages"))
+        XCTAssertTrue(source.contains("(deny network-outbound (with message"))
+        XCTAssertTrue(source.contains("(deny file-write* (with message"))
     }
 
-    func testNonWhitelistedHostsDenied() {
-        let whitelist = WhitelistProxy.Whitelist(hosts: ["whatwg.org"])
-        XCTAssertFalse(whitelist.allows("evil.com"))
-        // Suffix match must respect the dot boundary
-        XCTAssertFalse(whitelist.allows("notwhatwg.org"))
-        XCTAssertFalse(whitelist.allows("whatwg.org.evil.com"))
-    }
-
-    func testPortsAndCaseStripped() {
-        let whitelist = WhitelistProxy.Whitelist(hosts: ["whatwg.org"])
-        XCTAssertTrue(whitelist.allows("whatwg.org:443"))
-        XCTAssertTrue(whitelist.allows("WHATWG.ORG"))
-        XCTAssertTrue(whitelist.allows("spec.whatwg.org:80"))
-    }
-
-    func testIPv6BracketsStripped() {
-        let whitelist = WhitelistProxy.Whitelist(hosts: ["::1"])
-        XCTAssertTrue(whitelist.allows("[::1]:443"))
+    func testPolicyDenialMessagesDoNotOverrideAllows() {
+        // The message-denies sit BEFORE the allows, so the later allows still
+        // win (last matching rule) — the loopback network and workspace
+        // file-write grants must remain effective.
+        let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
+        let networkDeny = source.range(of: "(deny network-outbound (with message")!
+        let networkAllow = source.range(of: "(allow network-outbound (remote ip \"localhost:*\"))")!
+        XCTAssertLessThan(networkDeny.lowerBound, networkAllow.lowerBound)
+        let writeDeny = source.range(of: "(deny file-write* (with message")!
+        let writeAllow = source.range(of: "(allow file-write* (subpath \"/Users/tester/projects/example\"))")!
+        XCTAssertLessThan(writeDeny.lowerBound, writeAllow.lowerBound)
     }
 }

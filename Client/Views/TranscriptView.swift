@@ -17,10 +17,15 @@ import SwiftUI
 /// `row == storeIndex - windowStart`).
 ///
 /// - **The tail always grows:** `windowEnd` tracks the store and streams in via
-///   cheap `insertRows` at the bottom. Scrolling down is therefore always fast.
-/// - **Fetched history is kept in memory:** `windowStart` only ever *decreases*.
-///   Rows (and their measured heights) are never dropped, so once revealed, a
-///   row stays in the height cache and scrolling back to it is instant.
+///   cheap `insertRows` at the bottom. Scrolling down is therefore always fast,
+///   and the front (the live tail) is never popped.
+/// - **Old history is evictable, never lost:** `windowStart` decreases as older
+///   history is prepended (scroll up) and *increases again* when the user
+///   scrolls back down and rows above a buffer are no longer needed — the rows
+///   leave the table and their cached heights are dropped. The store keeps the
+///   full conversation, so a later scroll-up re-materializes them instantly
+///   (no RPC round trip). The buffer (a few viewports) keeps fast re-scrolling
+///   smooth.
 /// - **Older history is fetched in compounding blocks:** when the viewport
 ///   nears the top of the fetched region, a spinner appears at the top of the
 ///   conversation and a block of history is prepended. Each successive fetch is
@@ -78,11 +83,24 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var scrollToBottomPending = false
 
     /// The materialized window over store indices: table row `r` displays
-    /// `store.entry(at: windowStart + r)`. `windowStart` only decreases (older
-    /// history is prepended); `windowEnd` only increases (tail streams in).
+    /// `store.entry(at: windowStart + r)`. `windowEnd` only ever increases —
+    /// the streaming tail is never popped. `windowStart` decreases when older
+    /// history is prepended (scroll up) and increases when the user scrolls
+    /// back down and rows above the buffer are evicted. The store keeps the
+    /// full conversation, so evicted rows re-materialize instantly on a later
+    /// scroll-up (no RPC round trip).
     private var windowStart = 0
     private var windowEnd = 0
     private var lastGeneration: UInt64 = 0
+
+    /// Rows kept materialized above the viewport while the user scrolls down
+    /// (so scrolling back up doesn't immediately stall). Beyond this, older
+    /// rows are evicted from the window and their heights dropped.
+    private let bufferViewports = 3
+    private let minBufferRows = 30
+    /// True while a deferred eviction is pending (drives mutual exclusion with
+    /// the compounding history fetch).
+    private var isEvictingOlder = false
 
     /// Size of the next upward history fetch, in rows. Compounding: doubles
     /// after every fetch so sustained scrolling eventually pulls everything.
@@ -265,7 +283,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         let newCount = store.count
         var didAppend = false
-        var appendedStart = windowEnd
 
         // The store is otherwise append-only; the only shrink is a turn-start
         // placeholder dropped when a turn aborts before any message_start.
@@ -280,7 +297,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // the end never shifts the rows above, so a scrolled-up viewport is
         // untouched.
         if newCount > windowEnd {
-            appendedStart = windowEnd
             let oldEnd = windowEnd
             windowEnd = newCount
             let tableRange = (oldEnd - windowStart)..<(newCount - windowStart)
@@ -293,25 +309,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             didAppend = true
         }
 
-        // Re-engage following when the user just sent a message, and jump them
-        // to the bottom even if they were scrolled up (explicit send = they
-        // want to see the response). The echoed user message is followed by
-        // the turn-start placeholder row, so scan the whole appended range.
-        let appendedUserMessage = didAppend && {
-            for i in appendedStart..<newCount {
-                if let entry = store.entry(at: i), case .userMessage = entry.kind { return true }
-            }
-            return false
-        }()
-        if appendedUserMessage {
-            isFollowing = true
-            followTail()
-            return
-        }
-
-        // Follow (scroll the streaming tail down) only while following is
-        // engaged. It's engaged by default and disengaged the moment the user
-        // scrolls up; re-engaged when they return to the bottom or send.
+        // Deliberately NO jump-to-bottom on send: the scroll stays exactly
+        // where the user left it (they may be reading history while a queued
+        // steering message is flushed). The tail still streams in off-screen;
+        // following re-engages only when the user returns to the bottom.
         guard isFollowing else { return }
 
         // Batched in-place refresh of streaming rows: a few words at a time,
@@ -456,6 +457,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             }
         }
 
+        // Evict first (the user scrolled down past the buffer), then fetch
+        // (they neared the top of the window). The two are mutually exclusive
+        // by construction — near-top vs far-from-top.
+        checkEvictOlder(store: store, firstVisibleStore: firstVisibleStore, visible: visible)
         checkFetchOlder(store: store, firstVisibleStore: firstVisibleStore, visible: visible)
     }
 
@@ -470,12 +475,72 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: - Fetching older history (compounding, with spinner)
 
+    /// Evicts materialized rows above the viewport once they exceed the buffer
+    /// (the user scrolled back down through history they'd pulled in). The
+    /// store keeps the full conversation, so re-scrolling up re-materializes
+    /// them instantly; only the view's rows and cached heights are dropped,
+    /// and the streaming tail (the front of the window) is never touched.
+    private func checkEvictOlder(store: TranscriptStore, firstVisibleStore: Int, visible: NSRange) {
+        guard !isEvictingOlder, !isFetchingOlder, windowStart > 0 else { return }
+        let rowsAbove = firstVisibleStore - windowStart
+        let buffer = max(viewportRows() * bufferViewports, minBufferRows)
+        guard rowsAbove > buffer else { return }
+        isEvictingOlder = true
+        // Defer to the next run-loop turn (like the fetch) so the scroll event
+        // finishes before the table is reshaped.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.evictOlder()
+            self.isEvictingOlder = false
+        }
+    }
+
+    /// Removes the rows above the buffer from the top of the window, drops
+    /// their cached heights, and re-anchors the viewport so the visible
+    /// content doesn't move. Recomputes everything from the current geometry
+    /// (the scroll may have moved since the check was deferred).
+    private func evictOlder() {
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.length > 0 else { return }
+        let firstVisibleStore = windowStart + visible.location
+        let rowsAbove = firstVisibleStore - windowStart
+        let buffer = max(viewportRows() * bufferViewports, minBufferRows)
+        guard rowsAbove > buffer else { return }
+        let drop = rowsAbove - buffer
+        guard drop > 0, windowStart + drop <= windowEnd else { return }
+
+        let anchorRow = visible.location
+        let anchorOffset = tableView.rect(ofRow: anchorRow).origin.y - tableView.visibleRect.origin.y
+
+        // Drop the cached heights for the evicted rows; a later re-fetch
+        // re-measures them.
+        for i in windowStart..<(windowStart + drop) {
+            if let entry = viewModel?.store.entry(at: i) {
+                heights.invalidate(entry.id)
+            }
+        }
+        windowStart += drop
+        tableView.removeRows(at: IndexSet(integersIn: 0..<drop), withAnimation: [])
+        tableView.tile()
+
+        // Re-anchor the first previously-visible row to its old screen offset.
+        let row = anchorRow - drop
+        guard row >= 0, row < (windowEnd - windowStart) else { return }
+        let rowY = tableView.rect(ofRow: row).origin.y
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, rowY - anchorOffset)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+
+        // The last fetch was given back: restart the compounding block so a
+        // re-scroll-up starts small instead of pulling a huge block.
+        fetchBlock = max(initialChunkRows() / 2, 20)
+    }
+
     /// If the viewport is near the top of the fetched region and more history
     /// exists above, fetch the next (compounding) block. Shows the spinner, lets
     /// it paint, then prepends the block and re-anchors the viewport.
     private func checkFetchOlder(store: TranscriptStore, firstVisibleStore: Int, visible: NSRange) {
         guard windowStart > 0 else { return } // whole conversation already fetched
-        guard !isFetchingOlder else { return }
+        guard !isFetchingOlder, !isEvictingOlder else { return }
         let margin = max(4, visible.length / 3)
         guard firstVisibleStore - windowStart <= margin else { return }
 
@@ -525,6 +590,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         fetchBlock = max(chunk / 2, 20)
         lastGeneration = store.currentGeneration
         isFetchingOlder = false
+        isEvictingOlder = false
         isFollowing = true
         viewModel?.isFetchingOlder = false
         tableView.reloadData()
@@ -625,6 +691,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             view.identifier = .textRow
             view.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
             return view
+        case .errorMessage(let text):
+            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            view.identifier = .textRow
+            view.configure(text: text, thinking: nil, role: .error, isStreaming: false)
+            return view
+        case .abortedMessage(let text):
+            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            view.identifier = .textRow
+            view.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
+            return view
         case .toolCall(let card):
             let view = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
             view.identifier = .toolRow
@@ -641,6 +717,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false)
         case .assistantMessage(let text, let thinking, let isStreaming):
             (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
+        case .errorMessage(let text):
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false)
+        case .abortedMessage(let text):
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
         case .toolCall(let card):
             (cell as? ToolCallHostView)?.configure(card: card) { [weak self] in
                 self?.toggleToolCard(card.id)
@@ -678,46 +758,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let row else { return }
         heights.invalidate(id)
         tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
-    }
-}
-
-// MARK: - Height cache
-
-/// Never remeasure text on every layout pass. Cache height keyed by
-/// content+width, invalidate only on genuine change. Grows only as history is
-/// revealed and is never evicted — fetched rows stay in memory so scrolling
-/// back down is always fast.
-final class HeightCache {
-    private struct Entry {
-        var width: CGFloat
-        var height: CGFloat
-    }
-
-    private var cache: [String: Entry] = [:]
-
-    func height(for id: String, width: CGFloat, measure: () -> CGFloat) -> CGFloat {
-        if let cached = cache[id], abs(cached.width - width) < 0.5 {
-            return cached.height
-        }
-        let height = measure()
-        cache[id] = Entry(width: width, height: height)
-        return height
-    }
-
-    func invalidate(_ id: String) {
-        cache.removeValue(forKey: id)
-    }
-
-    /// Drops every cached height (e.g. after a font-size change).
-    func clear() {
-        cache.removeAll()
-    }
-
-    /// Pre-seeds the cache from an authoritative source (e.g. the visible
-    /// cell's own layout) so later `height(for:width:measure:)` calls hit
-    /// without running the measure closure.
-    func store(_ id: String, width: CGFloat, height: CGFloat) {
-        cache[id] = Entry(width: width, height: height)
     }
 }
 
