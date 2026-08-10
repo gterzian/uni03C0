@@ -100,6 +100,16 @@ struct SessionContent: View {
         .sheet(isPresented: $tab.showingHistory) {
             SessionHistorySheet(cwd: tab.cwd, viewModel: vm)
         }
+        .onChange(of: vm.lastError) { _, error in
+            if let error {
+                AccessibilityNotification.Announcement("Error: \(error)").post()
+            }
+        }
+        .onChange(of: vm.connectionState) { _, state in
+            if case .disconnected(let message) = state {
+                AccessibilityNotification.Announcement("Disconnected: \(message)").post()
+            }
+        }
     }
 
     private func inputEnabled(_ vm: SessionViewModel) -> Bool {

@@ -1,6 +1,7 @@
 import Core
 import Foundation
 import Observation
+import SwiftUI
 
 /// A one-shot "append this text to the prompt input" request, used when
 /// restoring queued steering into the input. The `id` distinguishes a new
@@ -58,6 +59,12 @@ final class SessionTab: Identifiable {
         // streamed paste, which keeps pushing to the front).
         viewModel.onRestoreSteeringToInput = { [weak self] text in
             self?.restoreRequest = RestoreRequest(id: UUID(), text: text)
+        }
+        // Accessibility: announce when the agent's work settles, so a
+        // VoiceOver user gets the same "done, you can type" signal the
+        // visual UI gives.
+        viewModel.onAgentSettled = {
+            AccessibilityNotification.Announcement("Agent finished working").post()
         }
     }
 

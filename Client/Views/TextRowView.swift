@@ -84,6 +84,19 @@ enum TranscriptText {
     }
 }
 
+/// The row label VoiceOver reads before the message text — distinguishes the
+/// speaker/kind without relying on color or layout.
+extension TextRowView.Role {
+    var accessibilityLabel: String {
+        switch self {
+        case .user: "User message"
+        case .assistant: "Assistant message"
+        case .error: "Error"
+        case .aborted: "Aborted message"
+        }
+    }
+}
+
 /// A read-only, selectable multi-line text cell for user/assistant messages.
 /// Backed by an `NSTextView` (selectable text, correct wrapping); the table
 /// supplies the row height via `TranscriptText.measuredHeight`, and `layout()`
@@ -102,15 +115,29 @@ final class TextRowView: NSView {
 
     /// Light-blue highlight behind user messages (the user's own words stand
     /// out from the agent's replies). Dynamic: a deep blue in dark mode so
-    /// white label text stays readable, pale blue in light mode.
+    /// white label text stays readable, pale blue in light mode. With Increase
+    /// Contrast enabled the blue is strengthened in both modes. Resolved per
+    /// draw, so a mid-session toggle applies without reconfiguring rows.
     private static let userHighlight = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+            return dark
+                ? NSColor(calibratedRed: 0.21, green: 0.30, blue: 0.50, alpha: 1.0)
+                : NSColor(calibratedRed: 0.66, green: 0.79, blue: 1.0, alpha: 1.0)
+        }
+        return dark
             ? NSColor(calibratedRed: 0.16, green: 0.21, blue: 0.35, alpha: 1.0)
             : NSColor(calibratedRed: 0.87, green: 0.93, blue: 1.0, alpha: 1.0)
     }
 
     private let textView = NSTextView()
     private var role: Role = .assistant
+    /// Whether this row currently renders a streaming assistant message — the
+    /// caret pulse and text fade only apply then.
+    private var isStreamingRow = false
+    /// Observer for the Reduce Motion toggle, so the caret pulse stops/starts
+    /// without waiting for the next configure.
+    private var reduceMotionObserver: NSObjectProtocol?
     /// Whether the light-blue user highlight is currently applied. Setting
     /// `drawsBackground` on every configure — even to the same value — forces
     /// AppKit to eagerly re-layout the whole text container synchronously
@@ -159,10 +186,49 @@ final class TextRowView: NSView {
         textView.textContainerInset = NSSize(width: 0, height: 6)
         textView.autoresizingMask = [.width]
         addSubview(textView)
+        // VoiceOver: the row is a labelled text area; the label distinguishes
+        // the speaker/kind, the value is the message text.
+        textView.setAccessibilityElement(true)
+        textView.setAccessibilityRole(.textArea)
+        // If the user toggles Reduce Motion mid-session, stop the caret pulse
+        // (or restart it) without waiting for the next streaming delta.
+        reduceMotionObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if self.reduceMotion {
+                self.stopCaretPulse()
+            } else if self.isStreamingRow {
+                if self.increaseContrast {
+                    self.stopCaretPulse()
+                    self.applyHighContrastCaret()
+                } else {
+                    self.startCaretPulse()
+                }
+            }
+        }
+    }
+
+    /// Whether the user has Reduce Motion enabled (System Settings →
+    /// Accessibility → Display). Streaming animation (caret pulse, text fade)
+    /// is purely decorative, so it is skipped when set.
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Whether the user has Increase Contrast enabled (System Settings →
+    /// Accessibility → Display). The streaming caret is drawn solid and
+    /// static so its visibility doesn't depend on pulsing.
+    private var increaseContrast: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
     }
 
     func configure(text: String, thinking: String?, role: Role, isStreaming: Bool) {
         self.role = role
+        isStreamingRow = isStreaming
+        textView.setAccessibilityLabel(role.accessibilityLabel)
         let oldString = textView.string
         textView.textStorage?.setAttributedString(
             TranscriptText.attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming)
@@ -170,7 +236,7 @@ final class TextRowView: NSView {
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read
         // as a constant flicker while streaming.)
-        if isStreaming, role == .assistant, !oldString.isEmpty {
+        if isStreaming, role == .assistant, !oldString.isEmpty, !reduceMotion {
             fadeInNewlyAppendedText(over: oldString)
         }
         let shouldHighlight = role == .user
@@ -181,8 +247,14 @@ final class TextRowView: NSView {
                 textView.backgroundColor = Self.userHighlight
             }
         }
-        if isStreaming, role == .assistant {
-            startCaretPulse()
+        if isStreaming, role == .assistant, !reduceMotion {
+            if increaseContrast {
+                // Increase Contrast: a solid, static caret — no pulsing.
+                stopCaretPulse()
+                applyHighContrastCaret()
+            } else {
+                startCaretPulse()
+            }
         } else {
             stopCaretPulse()
         }
@@ -276,10 +348,21 @@ final class TextRowView: NSView {
         storage.addAttribute(.foregroundColor, value: color, range: range)
     }
 
+    /// The streaming caret rendered for Increase Contrast: solid, strong, and
+    /// static — visibility never depends on pulsing.
+    private func applyHighContrastCaret() {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        let range = NSRange(location: storage.length - 1, length: 1)
+        storage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+    }
+
     deinit {
-        // AppKit views deallocate on the main thread; the timer was created
-        // and must be invalidated there.
         MainActor.assumeIsolated {
+            if let reduceMotionObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(reduceMotionObserver)
+            }
+            // AppKit views deallocate on the main thread; the timer was created
+            // and must be invalidated there.
             caretTimer?.invalidate()
             caretTimer = nil
         }

@@ -158,8 +158,22 @@ final class PromptContainerView: NSView {
 
         scrollView.documentView = textView
 
+        // VoiceOver: the prompt is a labelled text area; the label keeps it
+        // distinct from the transcript above it.
+        textView.setAccessibilityElement(true)
+        textView.setAccessibilityRole(.textArea)
+        textView.setAccessibilityLabel("Message")
+        textView.setAccessibilityHelp("Enter a message for the agent. Tab completes file paths; Escape aborts the current operation.")
+
         statusLabel.font = .systemFont(ofSize: 10)
-        statusLabel.textColor = .tertiaryLabelColor
+        // Very-light-gray readout normally; strengthened under Increase
+        // Contrast. Dynamic color (resolved per draw), so a toggle applies
+        // live.
+        statusLabel.textColor = NSColor(name: nil) { _ in
+            NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+                ? .secondaryLabelColor
+                : .tertiaryLabelColor
+        }
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(250), for: .horizontal)
