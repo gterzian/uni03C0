@@ -214,7 +214,7 @@ struct ToolCallCardView: View {
         case .done: Color(nsColor: .separatorColor)
         // Solid red under Increase Contrast — the failure isn't carried by
         // alpha alone.
-        case .failed: NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? .red : .red.opacity(0.5)
+        case .failed: DisplayOptions.increaseContrast ? .red : .red.opacity(0.5)
         }
     }
 }

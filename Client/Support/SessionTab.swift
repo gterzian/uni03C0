@@ -64,7 +64,7 @@ final class SessionTab: Identifiable {
         // VoiceOver user gets the same "done, you can type" signal the
         // visual UI gives.
         viewModel.onAgentSettled = {
-            AccessibilityNotification.Announcement("Agent finished working").post()
+            AccessibilityNotification.Announcement(Announcements.agentFinished).post()
         }
     }
 

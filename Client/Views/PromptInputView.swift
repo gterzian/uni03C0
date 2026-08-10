@@ -170,7 +170,7 @@ final class PromptContainerView: NSView {
         // Contrast. Dynamic color (resolved per draw), so a toggle applies
         // live.
         statusLabel.textColor = NSColor(name: nil) { _ in
-            NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            DisplayOptions.increaseContrast
                 ? .secondaryLabelColor
                 : .tertiaryLabelColor
         }
