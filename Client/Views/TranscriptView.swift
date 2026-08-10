@@ -155,6 +155,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         column.width = 640
         tv.addTableColumn(column)
 
+        // VoiceOver: the table is the conversation; rows carry their own
+        // per-role labels (see TextRowView).
+        tv.setAccessibilityElement(true)
+        tv.setAccessibilityRole(.table)
+        tv.setAccessibilityLabel("Conversation")
+        tv.setAccessibilityHelp("The conversation with the agent. Arrow-Down jumps to the latest message.")
+
         let sv = TranscriptScrollView()
         sv.documentView = tv
         sv.hasVerticalScroller = true

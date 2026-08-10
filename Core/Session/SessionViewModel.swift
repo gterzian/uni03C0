@@ -62,6 +62,11 @@ public final class SessionViewModel {
     /// directly.
     public var onTranscriptChange: (() -> Void)?
 
+    /// Accessibility hook: called when an agent run settles (the whole turn,
+    /// including tool rounds, finished). The view layer posts an announcement
+    /// so a VoiceOver user knows the work is done.
+    public var onAgentSettled: (() -> Void)?
+
     private var eventTask: Task<Void, Never>?
     /// Periodic `get_session_stats` poller while the agent is streaming. pi has
     /// no event that pushes context usage, so the client polls: `get_session_stats`
@@ -187,6 +192,7 @@ public final class SessionViewModel {
             // The new assistant messages carry the context reading, so the
             // usage is now accurate.
             await refreshContextStats()
+            onAgentSettled?()
 
         case "thinking_level_changed":
             if let level = frame.levelText() { thinkingLevel = level }

@@ -129,7 +129,22 @@ struct ToolCallCardView: View {
             isExpanded.toggle()
             onToggleExpand()
         }
+        // VoiceOver: the card is one labelled element with a "toggle full
+        // content" action; the args/output texts inside stay separate elements.
+        .accessibilityLabel(cardAccessibilityLabel)
+        .accessibilityAction(named: Text("Toggle full content")) {
+            guard hasExpandableContent else { return }
+            isExpanded.toggle()
+            onToggleExpand()
+        }
+        .accessibilityAddTraits(hasExpandableContent ? .isButton : [])
         .padding(.vertical, 4)
+    }
+
+    /// Accessibility label: "Tool bash, done" — the state word matches the
+    /// visual state readout.
+    private var cardAccessibilityLabel: String {
+        "Tool \(card.toolName), \(card.state.label)"
     }
 
     private var header: some View {
@@ -197,7 +212,9 @@ struct ToolCallCardView: View {
         switch card.state {
         case .running: Color(nsColor: .separatorColor)
         case .done: Color(nsColor: .separatorColor)
-        case .failed: .red.opacity(0.5)
+        // Solid red under Increase Contrast — the failure isn't carried by
+        // alpha alone.
+        case .failed: NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? .red : .red.opacity(0.5)
         }
     }
 }
