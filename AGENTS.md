@@ -514,6 +514,19 @@ Behavior details that matter:
   `SessionViewModel` polls `get_session_stats` every 2s while a turn streams
   (plus on settle and after load/reload) and surfaces `contextUsage.percent`
   in the status readout at the bottom-right inside the prompt input.
+- **Per-turn cache rate under the final answer.** Every LLM call's usage
+  (`input`/`cacheRead`/`cacheWrite`, carried on `message_end` and in
+  `get_messages`) is folded into the `TranscriptStore`'s per-turn accumulator;
+  the row ending the turn shows `⚡ cache N%` — the **turn average** across all
+  steps (tool-use calls included), not just the final request. Below 99% it
+  renders orange; a step that re-billed more than 20k previously-cached tokens
+  (pi's own `cache-stats.js` miss math: `min(prevPrompt, prompt) − cacheRead`)
+  flags the turn `· large miss`. Detection is cross-turn: the first request of
+  a turn compares against the previous turn's last request, so an idle gap
+  (cache eviction) between turns is caught. Aborted turns (`EMPTY_USAGE`, all
+  zeros) never attach a rate. The line is entry-level data (not part of the
+  row kind) so it flows through the same height cache / measurement as the
+  text, and precision adapts so a 99.97% hit never rounds to a false 100%.
 - **Session switch** is a `generation` bump → full `reloadData()` positioned at
   the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
 

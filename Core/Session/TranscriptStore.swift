@@ -33,6 +33,26 @@ public final class TranscriptStore: @unchecked Sendable {
     private var turnStartPlaceholderID: String?
     private var counter: UInt64 = 0
 
+    // Per-turn cache accounting. The average is accumulated across every LLM
+    // call of a turn (all the toolUse steps + the final answer) and attached to
+    // the turn-ending row. The miss detector mirrors pi's `cache-stats.js`:
+    // a step re-billed `min(prevPrompt, prompt) - cacheRead` tokens; a turn
+    // whose any step re-billed more than `largeMissMinTokens` is flagged.
+    private var turnInput = 0
+    private var turnCacheRead = 0
+    private var turnCacheWrite = 0
+    private var turnHasLargeMiss = false
+    /// Cross-turn miss detection state: the previous LLM request's prompt
+    /// tokens. Deliberately NOT reset at turn boundaries — an idle gap between
+    /// turns is exactly when the cache is evicted, and the first request of the
+    /// new turn must compare against the previous turn's last request.
+    private var lastPromptTokens = 0
+    private var hasPreviousRequest = false
+    /// A step whose request re-billed at least this many previously-cached
+    /// tokens counts as a full (large) cache miss. Matches pi's cache-miss
+    /// notice threshold (20k tokens).
+    private static let largeMissMinTokens = 20_000
+
     public init() {}
 
     // MARK: - Read API (any thread, cheap, lock-guarded)
@@ -128,6 +148,19 @@ public final class TranscriptStore: @unchecked Sendable {
         // tool_use ids in order, for attaching subsequent tool_result blocks.
         var pendingToolCalls: [String] = []
 
+        // Turn cache accounting, rebuilt from the message history (the live
+        // state is meaningless after a session switch). Locals: the rebuild
+        // loop runs without the lock; instance state is synced at the end.
+        var turnInput = 0
+        var turnCacheRead = 0
+        var turnCacheWrite = 0
+        var turnHasLargeMiss = false
+        // Cross-turn miss detection state, carried across user boundaries so
+        // an idle gap between turns is detected (cache evicted -> next turn's
+        // first request re-bills the whole prompt).
+        var lastPromptTokens = 0
+        var hasPreviousRequest = false
+
         for message in messages {
             let blocks = message.content ?? []
             if message.role == "user" {
@@ -157,20 +190,28 @@ public final class TranscriptStore: @unchecked Sendable {
                         result[index].attachToolOutput(text)
                     }
                 }
+                // A new turn begins: fresh average, keep cross-turn miss state.
+                turnInput = 0
+                turnCacheRead = 0
+                turnCacheWrite = 0
+                turnHasLargeMiss = false
             } else if message.role == "assistant" {
                 // Flatten content blocks in order: text/thinking entries and
                 // tool-call cards, preserving interleaving.
+                var lastTextEntryIndex: Int?
                 for block in blocks {
                     switch block.type {
                     case "text":
                         let text = block.text ?? ""
                         if !text.isEmpty {
                             result.append(TranscriptEntry(id: message.id.map { "\($0)-text" } ?? makeID("assistant"), kind: .assistantMessage(text: text, thinking: "", isStreaming: false)))
+                            lastTextEntryIndex = result.count - 1
                         }
                     case "thinking":
                         let thinking = block.thinking ?? ""
                         if !thinking.isEmpty {
                             result.append(TranscriptEntry(id: message.id.map { "\($0)-think" } ?? makeID("assistant"), kind: .assistantMessage(text: "", thinking: thinking, isStreaming: false)))
+                            lastTextEntryIndex = result.count - 1
                         }
                     case "tool_use", "toolCall", "tool_call":
                         let cardID = block.id ?? makeID("tool")
@@ -185,6 +226,37 @@ public final class TranscriptStore: @unchecked Sendable {
                         pendingToolCalls.append(cardID)
                     default:
                         break
+                    }
+                }
+                // Turn cache accounting: every step contributes; a step that
+                // re-billed most of the previous prompt flags a large miss.
+                if let usage = message.usage {
+                    turnInput += usage.input ?? 0
+                    turnCacheRead += usage.cacheRead ?? 0
+                    turnCacheWrite += usage.cacheWrite ?? 0
+                    let prompt = usage.promptTokens
+                    if hasPreviousRequest, prompt > 0 {
+                        let missed = min(lastPromptTokens, prompt) - (usage.cacheRead ?? 0)
+                        if missed > Self.largeMissMinTokens {
+                            turnHasLargeMiss = true
+                        }
+                    }
+                    if prompt > 0 {
+                        lastPromptTokens = prompt
+                        hasPreviousRequest = true
+                    }
+                }
+                // Cache read rate for the turn: attach the AGGREGATE rate to the
+                // final response entry (the last text/thinking row), never a
+                // tool-call turn. Requires real usage (aborted EMPTY_USAGE is
+                // all zeros and must not attach a rate).
+                if !blocks.contains(where: { $0.isToolCall }),
+                   (message.usage?.promptTokens ?? 0) > 0,
+                   let index = lastTextEntryIndex {
+                    let total = turnInput + turnCacheRead + turnCacheWrite
+                    if total > 0 {
+                        result[index].cacheHitRate = Double(turnCacheRead) / Double(total)
+                        result[index].cacheMiss = turnHasLargeMiss
                     }
                 }
                 // Surface stream failures recorded in the session (network
@@ -224,6 +296,13 @@ public final class TranscriptStore: @unchecked Sendable {
         _generation &+= 1
         streamingEntryID = nil
         turnStartPlaceholderID = nil
+        // Carry the rebuilt history's cross-turn miss state into live folding:
+        // the next request's miss detection must compare against the last
+        // request in the history (an idle gap since then evicts the cache).
+        // The turn totals reset — the next user message opens a new turn.
+        self.lastPromptTokens = lastPromptTokens
+        self.hasPreviousRequest = hasPreviousRequest
+        resetTurnAccounting()
         lock.unlock()
         return true
     }
@@ -244,6 +323,9 @@ public final class TranscriptStore: @unchecked Sendable {
             // the response slot right below it so the client can show the
             // pulsing caret during time-to-first-token.
             beginTurnPlaceholder()
+            // A new turn begins: fresh average, but keep the cross-turn
+            // miss-detection state (idle gaps evict the cache).
+            resetTurnAccounting()
         } else if message.role == "toolResult" {
             // openai-completions providers deliver tool results as separate
             // messages; attach to the matching execution card.
@@ -302,12 +384,63 @@ public final class TranscriptStore: @unchecked Sendable {
         let text = blocks.filter { $0.type == "text" }.compactMap { $0.text }.joined(separator: "\n\n")
         let thinking = blocks.filter { $0.type == "thinking" }.compactMap { $0.thinking }.joined(separator: "\n")
         entry.kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)
+        // Turn cache accounting: every step (tool-use or final) contributes to
+        // the turn average; a step that re-billed most of the previous prompt
+        // flags a large miss.
+        accumulateTurnUsage(message.usage)
+        // The turn-ending message (no tool calls) carries the turn average —
+        // the per-request rate of the final call alone would ignore the steps
+        // that built the context. Requires real usage (promptTokens > 0): an
+        // aborted turn's EMPTY_USAGE (all zeros) must not attach a rate.
+        if !blocks.contains(where: { $0.isToolCall }), (message.usage?.promptTokens ?? 0) > 0 {
+            entry.cacheHitRate = turnCacheHitRate
+            entry.cacheMiss = turnHasLargeMiss
+        }
         _entries[index] = entry
         streamingEntryID = nil
         turnStartPlaceholderID = nil
         // Surface stream failures (network errors, aborts, truncation) the way
         // the TUI does: an error row after the partial assistant message.
         appendFailureRowIfNeeded(for: message, blocks: blocks)
+    }
+
+    /// Accumulates one LLM request's usage into the current turn's totals and
+    /// updates the large-miss flag against the previous request's prompt.
+    private func accumulateTurnUsage(_ usage: TokenUsage?) {
+        guard let usage else { return }
+        turnInput += usage.input ?? 0
+        turnCacheRead += usage.cacheRead ?? 0
+        turnCacheWrite += usage.cacheWrite ?? 0
+        let prompt = usage.promptTokens
+        if hasPreviousRequest, prompt > 0 {
+            let missed = min(lastPromptTokens, prompt) - (usage.cacheRead ?? 0)
+            if missed > Self.largeMissMinTokens {
+                turnHasLargeMiss = true
+            }
+        }
+        if prompt > 0 {
+            lastPromptTokens = prompt
+            hasPreviousRequest = true
+        }
+    }
+
+    /// The turn's aggregate cache hit rate (0–1): cache reads over the sum of
+    /// every step's prompt tokens. Nil when the turn had no reported usage.
+    private var turnCacheHitRate: Double? {
+        let total = turnInput + turnCacheRead + turnCacheWrite
+        guard total > 0 else { return nil }
+        return Double(turnCacheRead) / Double(total)
+    }
+
+    /// Starts a new turn's cache accounting: zero the accumulated totals but
+    /// KEEP the cross-turn miss-detection state (an idle gap between turns is
+    /// exactly when the cache is evicted; the next turn's first step must
+    /// compare against the previous turn's last request).
+    private func resetTurnAccounting() {
+        turnInput = 0
+        turnCacheRead = 0
+        turnCacheWrite = 0
+        turnHasLargeMiss = false
     }
 
     /// Appends a notice row when a message ended in error/aborted/truncated
