@@ -39,8 +39,11 @@ extension TranscriptEntry {
         ))
         let controller = NSHostingController(rootView: view)
         let size = controller.sizeThatFits(in: NSSize(width: max(width, 320), height: .greatestFiniteMagnitude))
-        // Round up so the table never clips the last line.
-        return max(ceil(size.height), 44)
+        // Round up so the table never clips the last line, plus 2pt slack: the
+        // card's rendered height can transiently exceed sizeThatFits (streaming
+        // output grows between batched height updates) and the hosting view is
+        // clipped to the row, so an under-measure would truncate the card.
+        return max(ceil(size.height), 44) + 2
     }
 }
 

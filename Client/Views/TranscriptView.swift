@@ -250,8 +250,37 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let storeIndex = windowStart + row
         guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
         let width = max(tableView.bounds.width, 320)
-        return heights.height(for: entry.id, width: width) {
+        let height = heights.height(for: entry.id, width: width) {
             entry.measuredHeight(forWidth: width)
+        }
+        // TEMP diagnostics for the top-cut chase.
+        let prefix = (Self.label(of: entry) as NSString).substring(to: min(20, (Self.label(of: entry) as NSString).length))
+        Self.debugLog("ROW id=\(String(entry.id.prefix(8))) w=\(width) h=\(height) text=\(prefix.replacingOccurrences(of: "\n", with: "\\n"))")
+        return height
+    }
+
+    private static func label(of entry: TranscriptEntry) -> String {
+        switch entry.kind {
+        case .userMessage(let t), .errorMessage(let t), .abortedMessage(let t): return t
+        case .assistantMessage(let t, _, _): return t
+        case .toolCall(let c): return "[tool \(c.toolName)]"
+        }
+    }
+
+    /// Set PI_DEBUG_TOP_CUT=1 to enable the top-cut diagnostics (they append
+    /// per-row geometry to /tmp/topcut.log — off by default because they fire
+    /// on every layout).
+    private static var topCutDebugEnabled: Bool {
+        ProcessInfo.processInfo.environment["PI_DEBUG_TOP_CUT"] == "1"
+    }
+
+    private static func debugLog(_ entry: String) {
+        if let handle = FileHandle(forWritingAtPath: "/tmp/topcut.log") {
+            handle.seekToEndOfFile()
+            handle.write((entry + "\n").data(using: .utf8)!)
+            try? handle.close()
+        } else {
+            try? (entry + "\n").write(toFile: "/tmp/topcut.log", atomically: true, encoding: .utf8)
         }
     }
 
@@ -623,11 +652,23 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     @discardableResult
     private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) -> Bool {
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
+        let width = max(tableView.bounds.width, 320)
+        // A reused cell can still hold a stale (wider) frame after a window
+        // resize. Render AND measure at the real width: a stale frame would
+        // wrap the text wider (fewer lines), under-seed the cached height, and
+        // the row would then render short — the taller text overflows upward
+        // and the message's top is clipped.
+        if abs(cell.frame.width - width) > 1 {
+            cell.frame.size.width = width
+        }
         configure(cell, with: entry, in: tableView)
         cell.layoutSubtreeIfNeeded()
         if let textRow = cell as? TextRowView {
-            let width = max(tableView.bounds.width, 320)
-            heights.store(entry.id, width: width, height: textRow.contentHeight + 2)
+            let seeded = textRow.contentHeight(atWidth: width) + 2
+            heights.store(entry.id, width: width, height: seeded)
+            if Self.topCutDebugEnabled {
+                Self.debugLog("STORE id=\(String(entry.id.prefix(8))) w=\(width) h=\(seeded)")
+            }
             return true
         }
         // Tool cards: arguments/output grow in place while the call runs, so a
