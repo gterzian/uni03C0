@@ -28,6 +28,8 @@ Then, build and run with:
 
 After that, pick a project and start prompting.
 
+![uni03C0](artifacts/example_screen.png)
+
 ## Sandbox
 
 The agent runs inside a **Seatbelt sandbox** (default-deny): the policy
