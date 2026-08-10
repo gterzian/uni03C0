@@ -26,6 +26,15 @@ final class ToolCallHostView: NSView {
             let hosting = NSHostingView(rootView: root)
             hosting.sizingOptions = []
             hosting.translatesAutoresizingMaskIntoConstraints = false
+            // A cell must never paint outside its row: the SwiftUI card's
+            // rendered height can transiently exceed the measured row height
+            // (streaming output grows between batched height updates, and
+            // sizeThatFits can differ by a fraction), and an unclipped hosting
+            // view then draws over the NEXT row — covering the top of the
+            // following user/assistant message ("cut off at the top, as if
+            // scrolled down").
+            hosting.wantsLayer = true
+            hosting.layer?.masksToBounds = true
             addSubview(hosting)
             NSLayoutConstraint.activate([
                 hosting.leadingAnchor.constraint(equalTo: leadingAnchor),

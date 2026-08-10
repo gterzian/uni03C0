@@ -85,6 +85,29 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
+  RenderingTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      # The AppKit rendering layer (Client target sources are not linkable by
+      # ClientTests, which links Core only) plus its dependencies.
+      - Client/Views/MarkdownText.swift
+      - Client/Views/TextRowView.swift
+      - Client/Views/CodeCopyButton.swift
+      - Client/Accessibility/DisplayOptions.swift
+      - Client/Support/FontSettings.swift
+      - RenderingTests
+    dependencies:
+      - target: Core
+      - package: Subprocess
+        product: Subprocess
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uni03c0.RenderingTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The renderer sources assume the Client target's MainActor default.
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
 
 schemes:
   Client:
@@ -106,3 +129,12 @@ schemes:
       config: Debug
       targets:
         - ClientTests
+  RenderingTests:
+    build:
+      targets:
+        Core: all
+        RenderingTests: [test]
+    test:
+      config: Debug
+      targets:
+        - RenderingTests

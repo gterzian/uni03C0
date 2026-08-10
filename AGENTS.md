@@ -297,6 +297,16 @@ Three targets (see `project.yml`):
   built on documented pi RPC behavior. Tests **never** spawn a real `pi`
   process or hit a live model — pi's behavior is faked from its documented
   protocol. Run via `xcodebuild -scheme ClientTests test`.
+- **RenderingTests** (unit-test bundle, XCTest, `MainActor`): unit tests for
+  the AppKit rendering layer (`MarkdownText`, `TranscriptText`, `TextRowView`,
+  `CodeCopyButton`). Because the renderer lives in the Client target (which
+  ClientTests cannot link — it links Core only), this target compiles the
+  renderer sources directly alongside the tests. Covers inline/block styling,
+  code-block ranges and cards/copy buttons, block spacing, soft/hard line
+  breaks, and the load-bearing measurement invariant (rendered height ==
+  measured height). Run via `xcodebuild -scheme RenderingTests test`; can also
+  be run with plain `swiftc` + a tiny XCTest shim when the sandbox blocks
+  package resolution.
 
 Concurrency defaults are set per target in `project.yml`:
 `Core = nonisolated`, `Client = MainActor`, both Swift 6 strict
@@ -535,6 +545,171 @@ thread mostly idle in the event loop (the per-tick work is confined to the
 streaming row); a large-context session should scroll smoothly and open
 instantly; streaming while the window is occluded should do no render work.
 
+## Rendering lessons (verified on macOS 26, 2026-08)
+
+These cost real debugging time this session; check them before touching the
+markdown renderer or the transcript rows.
+
+- **`paragraphSpacingBefore`/`paragraphSpacing` inflate EVERY line fragment**
+  of a multi-line paragraph on this SDK — a 16pt line becomes 30pt with 8/6
+  spacing, applied per line, not once at the paragraph boundary (verified in
+  isolation). Never use them for block separation. `MarkdownText` separates
+  blocks with explicit spacer lines (an empty line whose font height equals
+  the gap).
+- **Soft breaks parse to a SPACE, not `\n`.** `AttributedString(markdown:)`
+  emits a single newline inside a paragraph as a dedicated run with
+  `.softBreak` intent whose text is a space (hard breaks — two trailing
+  spaces — are `.lineBreak` runs with `\n`). Re-emit a real `\n` for both,
+  or multi-line prose collapses to one line.
+- **The text view is flipped; the row is not.** Layout-manager rects
+  (`boundingRect`, line fragments) are in the text view's (flipped, top-down)
+  container coordinates. Positioning subviews of the row requires
+  `textView.convert(rect, to: row)`. Worse: **in a non-flipped cell, a text
+  view taller than the row overflows UPWARD — clipping the TOP of the
+  message, not the bottom** (the intuitive assumption is backwards). This is
+  why the code-card overlay and any row-height under-measure manifest as
+  "the top of the message is cut off, as if scrolled down".
+- **A row's height must be measured at the width it renders at.** A reused
+  cell can hold a stale (wider) frame after a window resize; measuring
+  `contentHeight` at that stale width under-reports the height, the row
+  renders short, and the text overflows upward. The coordinator forces the
+  cell to the table's width and seeds via `contentHeight(atWidth:)`.
+- **The load-bearing measurement invariant**: `TranscriptText.measuredHeight`
+  (`boundingRect`, `.usesFontLeading`) must equal the cell's layout-manager
+  `usedRect` height. Every test that compares them catches clipping/padding
+  drift. The text view and the measurement must use the same usable width
+  (container width − 2×8 line-fragment padding) and the same insets.
+- **`NSTextAttachmentViewProvider` is not exposed in Swift on this SDK.**
+  Interactive elements inside text use the cell API (`NSTextAttachmentCell`);
+  the layout manager sizes attachments from the `cellSize` property (never
+  `cellSize(forBounds:)`). The code-card/copy-button chrome is drawn as
+  overlay views instead, positioned from the layout manager per code-block
+  range.
+- **DeepSeek context caching is best-effort and node-local**: identical
+  prompts intermittently miss entirely after short gaps (76s, 3min, 46min
+  all observed) and fully recover on the very next request. The app's
+  cross-turn "large miss" detection is working as designed — the miss is
+  real on the provider side, not an app-data artifact.
+
+## Known issue: the "top cut off" row (OPEN — investigation state)
+
+**Symptom**: the top of a message row is clipped — "as if scrolled down in a
+scrollable container". The first line is partially hidden. Reported on
+user messages and assistant messages directly following a tool-call block.
+The user notes it NEVER happens on a message sent after an abort — it
+correlates with the normal (streaming) turn flow.
+
+**Diagnostics** (gated, off by default): set `PI_DEBUG_TOP_CUT=1` and run;
+`TranscriptView` appends per-row geometry to `/tmp/topcut.log`
+(`ROW`/`STORE` entries for every height lookup/seed, plus `TOP-CUT` when a
+row's first line sits above its bounds). `TextRowView.layout` fires the
+`TOP-CUT` detection. Remove both once resolved.
+
+**What the log shows (2026-08, width 1052)**: the cut rows have
+`bounds.height` 72/120/186 while the text view (content) is 118/166/217 —
+the row is ~46pt short, the text overflows upward (a non-flipped cell
+overflows UP). Crucially, heightOfRow and the height cache NEVER return
+those short values (the ROW/STORE log shows correct heights, and the
+streaming heights grow in sync 30→94→158→…→1118). So the short row
+heights are NOT coming from the measurement or the cache — the cell view
+is being left with a stale/short frame (width updated to 1052, height not)
+for some rows. The TOP-CUT entries appear BEFORE the heightOfRow calls in
+the log — the cells are laid out at a wrong height first.
+
+**What to check next**:
+- Why NSTableView leaves some cells at a stale frame height (width applied,
+  height not) — the cell framing/layout order in `TranscriptView`
+  (cell reuse across rows of different heights; `makeCell` returns cells
+  with a zero frame and the table's sizing isn't taking effect for some
+  rows).
+- The correlation with the streaming flow vs abort (the abort path removes
+  the turn-start placeholder; the normal path leaves rows whose heights
+  were never applied). The user's abort observation is the strongest
+  discriminator.
+- The `id` prefix in the log is useless for assistant rows (all share
+  "assistan") — log the row index / full id in the next iteration.
+
+**Already fixed (related, verified)**: paragraph-spacing per-line
+inflation; soft-break newline collapse; code-card coordinate conversion;
+stale-width height seeding in `updateVisibleCell`
+(`contentHeight(atWidth:)`); tool-card hosting-view clipping. The
+remaining top-cut is a separate, unfixed row-framing issue.
+
+## Tests
+
+Two unit-test bundles, both deterministic (no pi process, no network, no
+live model):
+
+- **ClientTests** — Core-only logic: framing, request encoding, response
+  decoding, store folding, diff, sandbox policy. Links Core only.
+- **RenderingTests** — the AppKit renderer. Compiles the renderer sources
+  (Client/Views/MarkdownText.swift, TextRowView.swift, CodeCopyButton.swift,
+  Client/Accessibility/DisplayOptions.swift, Client/Support/FontSettings.swift)
+  directly into the bundle, because ClientTests cannot link the Client target
+  and Core must stay AppKit-free. Default actor isolation `MainActor` (the
+  renderer sources assume the Client target's default).
+
+### Running
+
+From a terminal (package resolution cannot run inside the sandbox):
+
+```
+xcodebuild -scheme ClientTests test
+xcodebuild -scheme RenderingTests test
+```
+
+Inside the sandbox, xcodebuild's "Resolve Package Graph" step fails (SPM's
+`sandbox-exec`), so run the rendering tests with plain `swiftc` instead — the
+same files, driven by a tiny XCTest shim:
+
+```
+# build a stub XCTest module + library once (it provides XCTestCase + the
+# assertion functions the real test files import)
+swiftc -emit-library -module-name XCTest -swift-version 6 \
+  -default-isolation MainActor -target arm64-apple-macosx26.0 \
+  -emit-module -emit-module-path /tmp/xctest/mod XCTestStub.swift \
+  -o /tmp/xctest/libXCTest.dylib
+# compile the renderer + tests + a runner into one binary and run it
+swiftc -swift-version 6 -default-isolation MainActor \
+  -target arm64-apple-macosx26.0 -o /tmp/xctest/rendertests \
+  /tmp/xctest/main.swift Client/Views/MarkdownText.swift \
+  Client/Views/TextRowView.swift Client/Views/CodeCopyButton.swift \
+  Client/Accessibility/DisplayOptions.swift /tmp/Stubs/FontSettings.swift \
+  RenderingTests/*.swift -I /tmp/CoreStub -I /tmp/xctest/mod \
+  -L /tmp/xctest -lXCTest && DYLD_LIBRARY_PATH=/private/tmp/xctest \
+  /tmp/xctest/rendertests
+```
+
+(The exact flags live in the shell history / scratch space; the essential
+pieces are: the stub `XCTest` module must be compiled with
+`-default-isolation MainActor`, `FontSettings` must be stubbed because the
+`@Observable` macro's plugin server is blocked in the sandbox, `Core` needs an
+empty stub module for TextRowView's `import Core`, and the runner calls every
+`test*` method explicitly since pure-Swift methods are not ObjC-visible.)
+
+### Adding a rendering test
+
+- Add a `RenderingTests/SomeThingTests.swift` file — the target's sources are
+the whole `RenderingTests` directory, so `xcodegen generate` picks it up
+(no project.yml edit).
+- Tests are plain `XCTestCase` subclasses on the main actor; use the
+  `RenderTestHelper` utilities in `RenderingTests/TestHelpers.swift`
+  (attribute extraction, text layout, line pitches, measurement).
+- **The load-bearing invariant**: `TranscriptText.measuredHeight`
+  (`boundingRect`) must agree with the cell's `contentHeight` (layout
+  manager) — keep tests asserting this; it is what catches row-height drift
+  (clipping).
+- Pass the **same** parameters to `configure` and `measuredHeight` when
+  comparing heights (a `cacheHitRate` adds the cache line, ~15pt).
+- `TextRowView` exposes internal test hooks (`renderedCodeBlockCount`,
+  `renderedCopyButtonCount`, `renderedCodeCardFrame(at:)`,
+  `codeBlocksForTesting`, `copyButtonsForTesting`) for the chrome/layout
+  tests; add more if a new test needs them.
+- Prefer asserting **rendered geometry and attributes** (fonts, traits,
+  ranges, rects) over internals, and keep the two historical regressions
+  covered: no paragraphSpacingBefore/After on blocks (per-line inflation),
+  and soft breaks preserved (newline collapse).
+
 ## Conventions
 
 - `project.yml` drives `xcodegen` — regenerate the project after adding/removing
@@ -553,6 +728,6 @@ instantly; streaming while the window is occluded should do no render work.
 
 ## TODO
 
-- **Code-block copy button.** Fenced code blocks (```) in assistant messages
-  should offer a copy button to grab the whole block, shown only when the
-  block is part of the main response (not inside thinking traces).
+_Empty — the copy-button TODO (fenced code blocks in assistant messages) is
+implemented via the corner `CodeCopyButton` + card overlay in `TextRowView`
+(driven by `MarkdownText`'s reported code-block ranges)._
