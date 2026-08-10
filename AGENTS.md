@@ -97,12 +97,17 @@ The app follows pi's own defaults: a session starts exactly as it would in
 the terminal TUI. pi applies its settings (`defaultProvider` /
 `defaultModel` / `defaultThinkingLevel` in `~/.pi/agent/settings.json`) at
 spawn, and the app reads the live model + thinking level from `get_state`
-and events. Nothing is forced at spawn — the app never switches the model
-or thinking level behind the user's back, so the requests a session
-produces (and the provider-side prompt cache) are identical whether the
-session is driven from the app or the TUI. The thinking-level menu offers
-exactly the levels pi reports via `get_available_thinking_levels`, matching
-the TUI's selector.
+and events. The model is never forced at spawn — a session starts exactly
+as it would in the terminal TUI, so the requests it produces (and the
+provider-side prompt cache) are identical whether the session is driven
+from the app or the TUI. The thinking level is the one exception: the
+user's default is the HIGHEST level the current model supports, so when no
+level has been explicitly chosen (no `defaultThinkingLevel` in
+settings.json, no level saved in a resumed session, no menu pick in this
+session) the app raises pi's built-in `medium` to the highest available via
+`set_thinking_level`; explicit choices are always respected. The
+thinking-level menu offers exactly the levels pi reports via
+`get_available_thinking_levels`, matching the TUI's selector.
 
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
