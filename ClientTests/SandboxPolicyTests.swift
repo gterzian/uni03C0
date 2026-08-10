@@ -21,11 +21,15 @@ final class SandboxSettingsTests: XCTestCase {
         XCTAssertTrue(defaults.readOnlyPaths.contains("~/Library/Developer"))
         XCTAssertTrue(defaults.readOnlyPaths.contains("/usr/local"))
         // The requested spec-site prefill, plus the model provider and the
-        // code sources (registries/git hosts) a coding agent needs to work.
+        // code sources (registries/git hosts) a coding agent needs to work,
+        // and the subscription/OAuth hosts so a terminal `/login` also works
+        // from the app.
         XCTAssertEqual(defaults.allowedHosts, [
             "deepseek.com",
             "api.deepseek.com", "api.anthropic.com", "api.openai.com",
             "generativelanguage.googleapis.com",
+            "claude.ai", "platform.claude.com", "chatgpt.com",
+            "auth.openai.com", "githubcopilot.com", "x.ai", "openrouter.ai",
             "whatwg.org", "w3c.org", "w3c.github.io",
             "github.com", "githubusercontent.com",
             "crates.io", "npmjs.org", "pypi.org", "files.pythonhosted.org",

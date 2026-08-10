@@ -65,6 +65,19 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             "api.anthropic.com",            // Anthropic
             "api.openai.com",               // OpenAI
             "generativelanguage.googleapis.com", // Google Gemini
+            // Subscription / OAuth hosts — so a provider logged in from the
+            // terminal (`pi` + `/login`, which stores tokens in
+            // ~/.pi/agent/auth.json) also works from the app: the same
+            // auth.json is read at spawn, and these are the API + OAuth
+            // token-refresh hosts the subscriptions need (Claude Pro/Max,
+            // ChatGPT Plus/Pro via Codex, GitHub Copilot, xAI, OpenRouter).
+            "claude.ai",                    // Claude subscription OAuth
+            "platform.claude.com",          // Anthropic OAuth token refresh
+            "chatgpt.com",                  // OpenAI Codex (ChatGPT subscription)
+            "auth.openai.com",              // OpenAI OAuth
+            "githubcopilot.com",            // GitHub Copilot API + proxy
+            "x.ai",                         // xAI (Grok/X subscription) API + OAuth
+            "openrouter.ai",                // OpenRouter OAuth-minted keys
             // Web-spec sites (the original prefill).
             "whatwg.org",
             "w3c.org",
