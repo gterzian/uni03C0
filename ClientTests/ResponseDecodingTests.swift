@@ -87,4 +87,31 @@ final class ResponseDecodingTests: XCTestCase {
         XCTAssertEqual(assistant?.content?[1].isToolCall, true)
         XCTAssertEqual(assistant?.content?[1].name, "bash")
     }
+
+    func testAgentMessageDecodesUsage() throws {
+        // Documented usage shape on the finalized assistant message.
+        let frame = response(command: "get_messages", dataJSON: """
+        {"messages":[
+          {"role":"assistant","id":"a1","content":[{"type":"text","text":"done"}],
+           "usage":{"input":2119,"output":217,"cacheRead":640,"cacheWrite":0}}
+        ]}
+        """)
+        let payload = frame.dataPayload(MessagesPayload.self)
+        let usage = payload?.messages.first?.usage
+        XCTAssertEqual(usage?.input, 2119)
+        XCTAssertEqual(usage?.cacheRead, 640)
+        XCTAssertEqual(usage?.cacheWrite, 0)
+        XCTAssertEqual(usage?.output, 217)
+        // 640 read / (640 read + 2119 uncached) = 23.2%.
+        XCTAssertEqual(usage?.cacheHitRate ?? 0, 640.0 / 2759.0, accuracy: 0.0001)
+    }
+
+    func testUsageCacheHitRateHandlesMissingFields() {
+        let usage = TokenUsage(input: nil, output: nil, cacheRead: nil, cacheWrite: nil)
+        XCTAssertNil(usage.cacheHitRate)
+        let allZero = TokenUsage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0)
+        XCTAssertNil(allZero.cacheHitRate)
+        let full = TokenUsage(input: 0, output: 0, cacheRead: 100, cacheWrite: 0)
+        XCTAssertEqual(full.cacheHitRate ?? 0, 1.0, accuracy: 0.0001)
+    }
 }

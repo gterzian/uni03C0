@@ -7,10 +7,19 @@ import Foundation
 public struct TranscriptEntry: Identifiable, Hashable, Sendable {
     public let id: String
     public var kind: TranscriptEntryKind
+    /// Cache read share (0–1) of the LLM requests that produced this turn, when
+    /// the provider reported usage and the message ended a turn. Surfaced as a
+    /// small cache line under the final assistant response.
+    public var cacheHitRate: Double?
+    /// True when any step of the turn re-billed the whole previous prompt (a
+    /// full cache eviction) — highlighted separately in the cache line.
+    public var cacheMiss: Bool
 
-    public init(id: String, kind: TranscriptEntryKind) {
+    public init(id: String, kind: TranscriptEntryKind, cacheHitRate: Double? = nil, cacheMiss: Bool = false) {
         self.id = id
         self.kind = kind
+        self.cacheHitRate = cacheHitRate
+        self.cacheMiss = cacheMiss
     }
 }
 

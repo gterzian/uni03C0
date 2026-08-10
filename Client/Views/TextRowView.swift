@@ -15,7 +15,9 @@ enum TranscriptText {
         text: String,
         thinking: String?,
         role: TextRowView.Role,
-        isStreaming: Bool
+        isStreaming: Bool,
+        cacheHitRate: Double? = nil,
+        cacheMiss: Bool = false
     ) -> NSAttributedString {
         let body = NSMutableParagraphStyle()
         body.lineSpacing = 2
@@ -61,6 +63,33 @@ enum TranscriptText {
                 .foregroundColor: NSColor.systemBlue.withAlphaComponent(0.6),
             ]))
         }
+        // Cache read rate for the finished turn, below the final response.
+        // Very light by default; a hit under 99% draws attention (orange), and
+        // a full cache eviction anywhere in the turn is flagged "large miss".
+        // Precision adapts so a 99.97% hit never rounds up to a false "100%".
+        if let cacheHitRate, !isStreaming, role == .assistant {
+            let percent = cacheHitRate * 100
+            let color: NSColor = (cacheMiss || percent < 99)
+                ? .systemOrange
+                : (DisplayOptions.increaseContrast ? .secondaryLabelColor : .tertiaryLabelColor)
+            var formatted = String(format: "%.2f", percent)
+            var digits = 2
+            while percent < 100 && formatted.hasPrefix("100") && digits < 4 {
+                digits += 1
+                formatted = String(format: "%.\(digits)f", percent)
+            }
+            // Trim trailing zeros: 99.70 → 99.7, 100.00 → 100.
+            if formatted.contains(".") {
+                while formatted.hasSuffix("0") { formatted.removeLast() }
+                if formatted.hasSuffix(".") { formatted.removeLast() }
+            }
+            let suffix = cacheMiss ? " · large miss" : ""
+            result.append(NSAttributedString(string: "\n⚡ cache \(formatted)%\(suffix)", attributes: [
+                .font: NSFont.systemFont(ofSize: FontSettings.shared.bodySize - 2),
+                .foregroundColor: color,
+                .paragraphStyle: body,
+            ]))
+        }
         return result
     }
 
@@ -69,9 +98,11 @@ enum TranscriptText {
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
-        width: CGFloat
+        width: CGFloat,
+        cacheHitRate: Double? = nil,
+        cacheMiss: Bool = false
     ) -> CGFloat {
-        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming)
+        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
         guard attributed.length > 0 else { return 30 }
         let usableWidth = max(width - horizontalPadding, 60)
         let bounds = attributed.boundingRect(
@@ -212,13 +243,13 @@ final class TextRowView: NSView {
         }
     }
 
-    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool) {
+    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool, cacheHitRate: Double? = nil, cacheMiss: Bool = false) {
         self.role = role
         isStreamingRow = isStreaming
         textView.setAccessibilityLabel(role.accessibilityLabel)
         let oldString = textView.string
         textView.textStorage?.setAttributedString(
-            TranscriptText.attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming)
+            TranscriptText.attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
         )
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read

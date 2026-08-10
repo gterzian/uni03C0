@@ -6,14 +6,16 @@ import SwiftUI
 /// `TranscriptText` so measurement always matches rendering exactly. Cached per
 /// (id, width) in the transcript coordinator's `HeightCache`; the streaming
 /// row's entry is invalidated (at a throttled rate) as deltas arrive.
-extension TranscriptEntryKind {
+extension TranscriptEntry {
+    /// Measures the whole row: the kind's content plus the per-turn cache line
+    /// (which is entry-level data, not part of the kind).
     func measuredHeight(forWidth width: CGFloat) -> CGFloat {
-        switch self {
+        switch kind {
         case .userMessage(let text):
             return TranscriptText.measuredHeight(text: text, thinking: nil, role: .user, isStreaming: false, width: width)
 
         case .assistantMessage(let text, let thinking, let isStreaming):
-            return TranscriptText.measuredHeight(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, width: width)
+            return TranscriptText.measuredHeight(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, width: width, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
 
         case .errorMessage(let text):
             return TranscriptText.measuredHeight(text: text, thinking: nil, role: .error, isStreaming: false, width: width)

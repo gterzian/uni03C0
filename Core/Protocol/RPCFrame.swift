@@ -160,6 +160,9 @@ public struct AgentMessage: Codable, Sendable, Equatable {
     public var toolCallId: String?
     public var toolName: String?
     public var isError: Bool?
+    /// Token/cache accounting for the LLM request that produced this message
+    /// (assistant messages). Surfaced as the per-turn cache read rate.
+    public var usage: TokenUsage?
     public var timestamp: Int64?
     /// How the assistant response ended ("end", "error", "aborted", "length").
     /// Present on `message_end`/`turn_end` for assistant messages; the client
@@ -168,6 +171,42 @@ public struct AgentMessage: Codable, Sendable, Equatable {
     /// The failure text carried with `stopReason == "error"` (network failures,
     /// provider errors, …) or "aborted".
     public var errorMessage: String?
+}
+
+/// Token/cache usage attached to an assistant message by the provider adapter
+/// (`usage` on the finalized message). All fields optional: providers differ
+/// in what they report, and the client only reads the cache split.
+public struct TokenUsage: Codable, Sendable, Equatable {
+    /// Prompt tokens billed at the uncached (input) rate.
+    public var input: Int?
+    public var output: Int?
+    /// Prompt tokens served from the provider's context cache.
+    public var cacheRead: Int?
+    /// Prompt tokens written to the cache (cache-write premium, when billed).
+    public var cacheWrite: Int?
+
+    public init(input: Int? = nil, output: Int? = nil, cacheRead: Int? = nil, cacheWrite: Int? = nil) {
+        self.input = input
+        self.output = output
+        self.cacheRead = cacheRead
+        self.cacheWrite = cacheWrite
+    }
+
+    /// Total prompt tokens billed for the request (uncached + cache read +
+    /// cache write).
+    public var promptTokens: Int {
+        (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0)
+    }
+
+    /// Cache read share of the full prompt (0–1), or nil when no usage/tokens.
+    public var cacheHitRate: Double? {
+        let read = cacheRead ?? 0
+        let write = cacheWrite ?? 0
+        let uncached = input ?? 0
+        let total = read + write + uncached
+        guard total > 0 else { return nil }
+        return Double(read) / Double(total)
+    }
 }
 
 /// A tolerant content block model. Provider formats differ (anthropic uses

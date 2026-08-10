@@ -12,6 +12,7 @@ final class TranscriptStoreTests: XCTestCase {
             "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
         XCTAssertEqual(store.count, 1)
         XCTAssertEqual(store.entry(at: 0)?.kind, .assistantMessage(text: "", thinking: "", isStreaming: true))
+        XCTAssertNil(store.entry(at: 0)?.cacheHitRate)
 
         // A text delta appends to the streaming row.
         XCTAssertTrue(store.apply(frame(type: "message_update",
@@ -23,10 +24,66 @@ final class TranscriptStoreTests: XCTestCase {
             "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\" world\"}}")))
         XCTAssertEqual(store.entry(at: 0)?.kind, .assistantMessage(text: "Hello world", thinking: "", isStreaming: true))
 
-        // message_end finalizes it (isStreaming -> false).
+        // message_end finalizes it (isStreaming -> false); usage sets the rate.
         XCTAssertTrue(store.apply(frame(type: "message_end",
-            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"Hello world\"}]}}")))
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"Hello world\"}],\"usage\":{\"input\":100,\"output\":10,\"cacheRead\":900,\"cacheWrite\":0}}}")))
         XCTAssertEqual(store.entry(at: 0)?.kind, .assistantMessage(text: "Hello world", thinking: "", isStreaming: false))
+        XCTAssertEqual(store.entry(at: 0)?.cacheHitRate ?? 0, 0.9, accuracy: 0.0001)
+    }
+
+    func testToolCallTurnDoesNotAttachCacheRate() {
+        let store = TranscriptStore()
+        // A tool-use assistant message ends a step, not a turn: no rate row.
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"toolCall\",\"id\":\"t1\",\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}],\"usage\":{\"input\":100,\"cacheRead\":900},\"stopReason\":\"toolUse\"}}")))
+        XCTAssertNil(store.entry(at: 0)?.cacheHitRate)
+    }
+
+    func testLiveTurnAggregatesStepsIntoTurnAverage() {
+        let store = TranscriptStore()
+        // User message opens the turn (fresh average).
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u1\",\"content\":[{\"type\":\"text\",\"text\":\"do it\"}]}}")))
+        // Step 1: tool-use (cached).
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"toolCall\",\"id\":\"t1\",\"name\":\"bash\",\"arguments\":{}}],\"usage\":{\"input\":1000,\"cacheRead\":9000},\"stopReason\":\"toolUse\"}}")))
+        // Step 2: final answer (cached).
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a2\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a2\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}],\"usage\":{\"input\":300,\"cacheRead\":27000},\"stopReason\":\"stop\"}}")))
+
+        // Final row is the answer; rate spans BOTH steps: (9000+27000)/(1000+9000+300+27000).
+        guard case .assistantMessage(let text, _, _)? = store.entry(at: 2)?.kind else {
+            return XCTFail("expected final assistant row")
+        }
+        XCTAssertEqual(text, "done")
+        XCTAssertEqual(store.entry(at: 2)?.cacheHitRate ?? 0, 36000.0 / 37300.0, accuracy: 0.0001)
+        XCTAssertFalse(store.entry(at: 2)?.cacheMiss ?? true)
+    }
+
+    func testLiveTurnFlagsLargeMissAfterIdle() {
+        let store = TranscriptStore()
+        // Turn 1: fully cached.
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u1\",\"content\":[{\"type\":\"text\",\"text\":\"q1\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"ans1\"}],\"usage\":{\"input\":1000,\"cacheRead\":99000},\"stopReason\":\"stop\"}}")))
+        // Turn 2, first step: cache fully evicted (0 read, 100k input).
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u2\",\"content\":[{\"type\":\"text\",\"text\":\"q2\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a2\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}")))
+        XCTAssertTrue(store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a2\",\"content\":[{\"type\":\"text\",\"text\":\"ans2\"}],\"usage\":{\"input\":100000,\"cacheRead\":0},\"stopReason\":\"stop\"}}")))
+
+        XCTAssertTrue(store.entry(at: 3)?.cacheMiss ?? false)
     }
 
     func testAppendsUserMessage() {
@@ -257,6 +314,63 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertTrue(store.rebuild(from: [message]))
         XCTAssertEqual(store.count, 1)
         XCTAssertEqual(store.entry(at: 0)?.kind, .assistantMessage(text: "fresh", thinking: "", isStreaming: false))
+    }
+
+    func testRebuildAttachesCacheRateToFinalResponse() {
+        let store = TranscriptStore()
+        // Final response with usage: the text entry carries the rate.
+        let final = AgentMessage(role: "assistant", content: [ContentBlock(type: "text", text: "done")], id: "a1",
+                                 usage: TokenUsage(input: 100, output: 10, cacheRead: 900, cacheWrite: 0))
+        // Tool-use step: no rate on its own (intermediate request inside a turn),
+        // but its usage feeds the turn average.
+        let toolStep = AgentMessage(role: "assistant", content: [
+            ContentBlock(type: "toolCall", id: "t1", name: "bash", arguments: nil),
+        ], id: "a2", usage: TokenUsage(input: 50, output: 0, cacheRead: 950, cacheWrite: 0))
+
+        XCTAssertTrue(store.rebuild(from: [toolStep, final]))
+        XCTAssertEqual(store.count, 2)
+        XCTAssertEqual(store.entry(at: 1)?.kind, .assistantMessage(text: "done", thinking: "", isStreaming: false))
+        // Turn average across both calls: (950 + 900) / (50+950 + 100+900) = 1850/2000.
+        XCTAssertEqual(store.entry(at: 1)?.cacheHitRate ?? 0, 1850.0 / 2000.0, accuracy: 0.0001)
+        XCTAssertFalse(store.entry(at: 1)?.cacheMiss ?? true)
+        XCTAssertNil(store.entry(at: 0)?.cacheHitRate)
+    }
+
+    func testRebuildAggregatesStepsIntoTurnAverage() {
+        let store = TranscriptStore()
+        // Three steps in one turn: two tool-use + final. Average must span all.
+        let step1 = AgentMessage(role: "assistant", content: [ContentBlock(type: "toolCall", id: "t1", name: "bash", arguments: nil)],
+                                 id: "s1", usage: TokenUsage(input: 1000, output: 0, cacheRead: 9000, cacheWrite: 0))
+        let step2 = AgentMessage(role: "assistant", content: [ContentBlock(type: "toolCall", id: "t2", name: "read", arguments: nil)],
+                                 id: "s2", usage: TokenUsage(input: 2000, output: 0, cacheRead: 18000, cacheWrite: 0))
+        let final = AgentMessage(role: "assistant", content: [ContentBlock(type: "text", text: "done")],
+                                 id: "s3", usage: TokenUsage(input: 300, output: 10, cacheRead: 27000, cacheWrite: 0))
+
+        XCTAssertTrue(store.rebuild(from: [step1, step2, final]))
+        // (9000 + 18000 + 27000) / (1000+9000 + 2000+18000 + 300+27000) = 54000/57300.
+        XCTAssertEqual(store.entry(at: 2)?.cacheHitRate ?? 0, 54000.0 / 57300.0, accuracy: 0.0001)
+        XCTAssertFalse(store.entry(at: 2)?.cacheMiss ?? true)
+    }
+
+    func testRebuildFlagsLargeMissOnEviction() {
+        let store = TranscriptStore()
+        // A turn whose first step fully re-billed the previous turn's prompt:
+        // the previous request was 100k prompt tokens, this one reads 0 cached.
+        let previous = AgentMessage(role: "assistant", content: [ContentBlock(type: "text", text: "prev")],
+                                    id: "p1", usage: TokenUsage(input: 1000, output: 0, cacheRead: 99000, cacheWrite: 0))
+        let evicted = AgentMessage(role: "assistant", content: [ContentBlock(type: "text", text: "after idle")],
+                                   id: "e1", usage: TokenUsage(input: 100000, output: 0, cacheRead: 0, cacheWrite: 0))
+        // 100k prompt re-billed (was 100k before, 0 cached now) — well past 20k.
+        XCTAssertTrue(store.rebuild(from: [previous, evicted]))
+        XCTAssertTrue(store.entry(at: 1)?.cacheMiss ?? false)
+        XCTAssertFalse(store.entry(at: 0)?.cacheMiss ?? true)
+    }
+
+    func testRebuildWithoutUsageHasNoRate() {
+        let store = TranscriptStore()
+        let message = AgentMessage(role: "assistant", content: [ContentBlock(type: "text", text: "no usage")], id: "a1")
+        XCTAssertTrue(store.rebuild(from: [message]))
+        XCTAssertNil(store.entry(at: 0)?.cacheHitRate)
     }
 
     func testVersionAndGenerationAdvance() {

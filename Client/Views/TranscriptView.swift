@@ -251,7 +251,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
         let width = max(tableView.bounds.width, 320)
         return heights.height(for: entry.id, width: width) {
-            entry.kind.measuredHeight(forWidth: width)
+            entry.measuredHeight(forWidth: width)
         }
     }
 
@@ -696,7 +696,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .assistantMessage(let text, let thinking, let isStreaming):
             let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             view.identifier = .textRow
-            view.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
+            view.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
             return view
         case .errorMessage(let text):
             let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
@@ -723,7 +723,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .userMessage(let text):
             (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false)
         case .assistantMessage(let text, let thinking, let isStreaming):
-            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming)
+            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
         case .errorMessage(let text):
             (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false)
         case .abortedMessage(let text):
