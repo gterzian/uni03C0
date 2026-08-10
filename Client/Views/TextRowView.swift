@@ -120,7 +120,7 @@ final class TextRowView: NSView {
     /// draw, so a mid-session toggle applies without reconfiguring rows.
     private static let userHighlight = NSColor(name: nil) { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+        if DisplayOptions.increaseContrast {
             return dark
                 ? NSColor(calibratedRed: 0.21, green: 0.30, blue: 0.50, alpha: 1.0)
                 : NSColor(calibratedRed: 0.66, green: 0.79, blue: 1.0, alpha: 1.0)
@@ -190,18 +190,19 @@ final class TextRowView: NSView {
         // the speaker/kind, the value is the message text.
         textView.setAccessibilityElement(true)
         textView.setAccessibilityRole(.textArea)
-        // If the user toggles Reduce Motion mid-session, stop the caret pulse
-        // (or restart it) without waiting for the next streaming delta.
+        // If the user toggles Reduce Motion / Increase Contrast mid-session,
+        // stop the caret pulse (or restart it) without waiting for the next
+        // streaming delta.
         reduceMotionObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            forName: DisplayOptions.didChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            if self.reduceMotion {
+            if DisplayOptions.reduceMotion {
                 self.stopCaretPulse()
             } else if self.isStreamingRow {
-                if self.increaseContrast {
+                if DisplayOptions.increaseContrast {
                     self.stopCaretPulse()
                     self.applyHighContrastCaret()
                 } else {
@@ -209,20 +210,6 @@ final class TextRowView: NSView {
                 }
             }
         }
-    }
-
-    /// Whether the user has Reduce Motion enabled (System Settings →
-    /// Accessibility → Display). Streaming animation (caret pulse, text fade)
-    /// is purely decorative, so it is skipped when set.
-    private var reduceMotion: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    }
-
-    /// Whether the user has Increase Contrast enabled (System Settings →
-    /// Accessibility → Display). The streaming caret is drawn solid and
-    /// static so its visibility doesn't depend on pulsing.
-    private var increaseContrast: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
     }
 
     func configure(text: String, thinking: String?, role: Role, isStreaming: Bool) {
@@ -236,7 +223,7 @@ final class TextRowView: NSView {
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read
         // as a constant flicker while streaming.)
-        if isStreaming, role == .assistant, !oldString.isEmpty, !reduceMotion {
+        if isStreaming, role == .assistant, !oldString.isEmpty, !DisplayOptions.reduceMotion {
             fadeInNewlyAppendedText(over: oldString)
         }
         let shouldHighlight = role == .user
@@ -247,8 +234,8 @@ final class TextRowView: NSView {
                 textView.backgroundColor = Self.userHighlight
             }
         }
-        if isStreaming, role == .assistant, !reduceMotion {
-            if increaseContrast {
+        if isStreaming, role == .assistant, !DisplayOptions.reduceMotion {
+            if DisplayOptions.increaseContrast {
                 // Increase Contrast: a solid, static caret — no pulsing.
                 stopCaretPulse()
                 applyHighContrastCaret()

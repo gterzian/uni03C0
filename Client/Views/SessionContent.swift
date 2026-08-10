@@ -102,12 +102,12 @@ struct SessionContent: View {
         }
         .onChange(of: vm.lastError) { _, error in
             if let error {
-                AccessibilityNotification.Announcement("Error: \(error)").post()
+                AccessibilityNotification.Announcement(Announcements.error(error)).post()
             }
         }
         .onChange(of: vm.connectionState) { _, state in
             if case .disconnected(let message) = state {
-                AccessibilityNotification.Announcement("Disconnected: \(message)").post()
+                AccessibilityNotification.Announcement(Announcements.disconnected(message)).post()
             }
         }
     }
