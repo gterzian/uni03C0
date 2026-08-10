@@ -50,11 +50,21 @@ enum TranscriptText {
             }
         }
         if !text.isEmpty {
-            result.append(NSAttributedString(string: text, attributes: [
-                .font: bodyFont,
-                .foregroundColor: bodyColor,
-                .paragraphStyle: body,
-            ]))
+            // Assistant final responses and user messages render as markdown
+            // (headers, bold, code blocks, lists, links…). Streaming text stays
+            // plain: the delta path must stay cheap, and re-parsing every chunk
+            // would reflow the row mid-stream. The flip to final is a single
+            // cached parse, so the restyle at settle costs one render pass.
+            let rendersMarkdown = (role == .user) || (role == .assistant && !isStreaming)
+            if rendersMarkdown {
+                result.append(MarkdownText.body(text: text, bodySize: FontSettings.shared.bodySize))
+            } else {
+                result.append(NSAttributedString(string: text, attributes: [
+                    .font: bodyFont,
+                    .foregroundColor: bodyColor,
+                    .paragraphStyle: body,
+                ]))
+            }
         }
         if isStreaming {
             result.append(NSAttributedString(string: "▌", attributes: [
@@ -132,7 +142,7 @@ extension TextRowView.Role {
 /// Backed by an `NSTextView` (selectable text, correct wrapping); the table
 /// supplies the row height via `TranscriptText.measuredHeight`, and `layout()`
 /// sizes the text view to match so content is never clipped.
-final class TextRowView: NSView {
+final class TextRowView: NSView, NSTextViewDelegate {
     enum Role {
         case user
         case assistant
@@ -196,6 +206,7 @@ final class TextRowView: NSView {
     private func setup() {
         textView.isEditable = false
         textView.isSelectable = true
+        textView.delegate = self
         textView.drawsBackground = false
         textView.isRichText = false
         // No spell/grammar checking on transcript content: it can be very
@@ -406,5 +417,15 @@ final class TextRowView: NSView {
         let used = layoutManager.usedRect(for: container).height
         let height = used + textView.textContainerInset.height * 2
         textView.frame = NSRect(x: 0, y: 0, width: width, height: max(height, bounds.height))
+    }
+
+    // MARK: - NSTextViewDelegate
+
+    /// Markdown links are clickable: open them in the default browser. The
+    /// row is read-only, so this is the only interaction links need.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL else { return false }
+        NSWorkspace.shared.open(url)
+        return true
     }
 }
