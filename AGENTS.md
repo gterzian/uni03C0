@@ -487,8 +487,9 @@ Behavior details that matter:
   0.25s or once ~20 new characters accumulate (a few words), never per
   character-delta — and each batched chunk **crossfades in**, so the text
   materializes in word groups instead of popping character by character. The
-  streaming row's cached height is seeded from the cell's own layout and only
-  ever grows (never oscillates). The height change and the follow-scroll are
+  streaming row's height is re-measured on each batched refresh via the same
+  `measuredHeight` function the authoritative path uses (the fast path and the
+  fallback can never disagree). The height change and the follow-scroll are
   applied in one atomic `CATransaction` so AppKit renders only the final
   state — content flows off the top instead of bouncing. Tool cards stream
   output with the same batching (their cached height is invalidated on every
@@ -496,11 +497,20 @@ Behavior details that matter:
   arrives).
 - **Arrow-Down jumps to the tail.** The transcript table overrides Down-arrow
   to scroll to the bottom in one step and re-engage following.
-- **Height cache.** Keyed by `(id, width)`, seeded from the visible cell's
-  layout (avoids a duplicate CoreText measure — that was the original 100%-CPU
-  hot path). `noteHeightOfRows` queries hit the cache. Tool-card heights are
-  invalidated on every content update (they grow in place); text rows are
-  seeded from the cell and only invalidated on genuine change.
+- **Height cache.** Keyed by `(id, width)` where `width` is the row's render
+  width (`rowWidth`). ONE measurement function —
+  `entry.measuredHeight(forWidth:)` — feeds both `heightOfRow` (on cache
+  miss) and the visible-cell refresh (`updateVisibleCell`), so the two paths
+  agree by construction; the fast path stores that measured value rather than
+  seeding from the cell's own layout. Tool-card heights are invalidated on
+  every content update (they grow in place); text rows are invalidated on
+  genuine change, and `resetToTail` clears the whole cache on session switch
+  (ids are only unique within a session).
+- **Cells are pre-sized at creation.** `makeCell` frames every cell to its
+  row's measured height before returning it — NSTableView does not reliably
+  re-frame a cell whose height changed (the width follows via autoresizing,
+  the height does not), so a cell recycled from a shorter row would otherwise
+  lay out at the stale short height and clip the message's top.
 - **Tool cards show their content, expandable.** One card per call: pi's RPC
   strips the cumulative `message` from `message_update`, so `toolcall_start`/
   `toolcall_delta` carry only a `contentIndex` — the card is created at
@@ -569,11 +579,14 @@ markdown renderer or the transcript rows.
   message, not the bottom** (the intuitive assumption is backwards). This is
   why the code-card overlay and any row-height under-measure manifest as
   "the top of the message is cut off, as if scrolled down".
-- **A row's height must be measured at the width it renders at.** A reused
-  cell can hold a stale (wider) frame after a window resize; measuring
-  `contentHeight` at that stale width under-reports the height, the row
-  renders short, and the text overflows upward. The coordinator forces the
-  cell to the table's width and seeds via `contentHeight(atWidth:)`.
+- **A row's height must be measured at the width it RENDERS at — the table
+  column's width, not `tableView.bounds.width`.** The bounds include the
+  scroller gutter (a legacy vertical scroller costs ~32pt), so measuring at
+  the bounds width over-reports: the text wraps narrower than measured, the
+  row renders short, and the taller text overflows upward — the "top cut
+  off" symptom. All height measurement goes through the coordinator's
+  `rowWidth(in:)` (the column width), used by `heightOfRow`, `makeCell`, and
+  the streaming refresh alike.
 - **The load-bearing measurement invariant**: `TranscriptText.measuredHeight`
   (`boundingRect`, `.usesFontLeading`) must equal the cell's layout-manager
   `usedRect` height. Every test that compares them catches clipping/padding
@@ -590,50 +603,6 @@ markdown renderer or the transcript rows.
   all observed) and fully recover on the very next request. The app's
   cross-turn "large miss" detection is working as designed — the miss is
   real on the provider side, not an app-data artifact.
-
-## Known issue: the "top cut off" row (OPEN — investigation state)
-
-**Symptom**: the top of a message row is clipped — "as if scrolled down in a
-scrollable container". The first line is partially hidden. Reported on
-user messages and assistant messages directly following a tool-call block.
-The user notes it NEVER happens on a message sent after an abort — it
-correlates with the normal (streaming) turn flow.
-
-**Diagnostics** (gated, off by default): set `PI_DEBUG_TOP_CUT=1` and run;
-`TranscriptView` appends per-row geometry to `/tmp/topcut.log`
-(`ROW`/`STORE` entries for every height lookup/seed, plus `TOP-CUT` when a
-row's first line sits above its bounds). `TextRowView.layout` fires the
-`TOP-CUT` detection. Remove both once resolved.
-
-**What the log shows (2026-08, width 1052)**: the cut rows have
-`bounds.height` 72/120/186 while the text view (content) is 118/166/217 —
-the row is ~46pt short, the text overflows upward (a non-flipped cell
-overflows UP). Crucially, heightOfRow and the height cache NEVER return
-those short values (the ROW/STORE log shows correct heights, and the
-streaming heights grow in sync 30→94→158→…→1118). So the short row
-heights are NOT coming from the measurement or the cache — the cell view
-is being left with a stale/short frame (width updated to 1052, height not)
-for some rows. The TOP-CUT entries appear BEFORE the heightOfRow calls in
-the log — the cells are laid out at a wrong height first.
-
-**What to check next**:
-- Why NSTableView leaves some cells at a stale frame height (width applied,
-  height not) — the cell framing/layout order in `TranscriptView`
-  (cell reuse across rows of different heights; `makeCell` returns cells
-  with a zero frame and the table's sizing isn't taking effect for some
-  rows).
-- The correlation with the streaming flow vs abort (the abort path removes
-  the turn-start placeholder; the normal path leaves rows whose heights
-  were never applied). The user's abort observation is the strongest
-  discriminator.
-- The `id` prefix in the log is useless for assistant rows (all share
-  "assistan") — log the row index / full id in the next iteration.
-
-**Already fixed (related, verified)**: paragraph-spacing per-line
-inflation; soft-break newline collapse; code-card coordinate conversion;
-stale-width height seeding in `updateVisibleCell`
-(`contentHeight(atWidth:)`); tool-card hosting-view clipping. The
-remaining top-cut is a separate, unfixed row-framing issue.
 
 ## Tests
 
