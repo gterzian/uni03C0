@@ -116,22 +116,15 @@ public final class SessionViewModel {
         await refreshState()
         // No model is forced at spawn: the session starts exactly as it would
         // in the terminal TUI — pi applies its own settings
-        // (defaultProvider / defaultModel) at spawn and the app reads the
-        // live model from get_state and events. Never switching the model
-        // behind the user's back keeps the requests the session produces —
-        // and thus the provider-side prompt cache — identical whether the
-        // session is driven from the app or the TUI.
-        // The thinking level is the one exception: the user's default
-        // preference is the HIGHEST level the model supports, not pi's
-        // built-in "medium", so when nothing has been explicitly chosen the
-        // app raises it (see applyHighestThinkingLevelIfUnset). An explicit
-        // choice — a settings.json defaultThinkingLevel, a level saved in a
-        // resumed session, or a menu pick in this session — is always
-        // respected.
+        // (defaultProvider / defaultModel / defaultThinkingLevel) at spawn and
+        // the app reads the live model and thinking level from get_state and
+        // events. Never switching the model or the thinking level behind the
+        // user's back keeps the requests the session produces — and thus the
+        // provider-side prompt cache — identical whether the session is driven
+        // from the app or the TUI.
         // Switching the model can change which thinking levels it supports, so
         // re-fetch the runtime options (models + levels) for the status bar.
         await refreshRuntimeOptions()
-        await applyHighestThinkingLevelIfUnset()
         await refreshContextStats()
     }
 
@@ -291,14 +284,12 @@ public final class SessionViewModel {
             self.model = model
         }
         // The set of supported thinking levels depends on the model: re-fetch
-        // after a switch so the menu matches the new model, and re-apply the
-        // highest-level default when the user hasn't chosen one.
+        // after a switch so the menu matches the new model. The thinking level
+        // itself is left as pi has it — switching the model never forces one.
         await refreshRuntimeOptions()
-        await applyHighestThinkingLevelIfUnset()
     }
 
     public func setThinkingLevel(_ level: String) async throws {
-        hasUserChosenThinkingLevel = true
         _ = try await controller.send(.setThinkingLevel(level: level))
         thinkingLevel = level
     }
@@ -318,7 +309,6 @@ public final class SessionViewModel {
               let path = payload.sessionFile else { return }
         _ = try? await controller.send(.switchSession(path: path))
         await refreshState()
-        await applyHighestThinkingLevelIfUnset()
         await loadMessages()
     }
 
@@ -326,7 +316,6 @@ public final class SessionViewModel {
     public func switchSession(_ path: URL) async {
         _ = try? await controller.send(.switchSession(path: path.path))
         await refreshState()
-        await applyHighestThinkingLevelIfUnset()
         await loadMessages()
     }
 
@@ -382,33 +371,6 @@ public final class SessionViewModel {
         availableModels = models?.models ?? []
         let levels = try? await controller.send(.getAvailableThinkingLevels()).dataPayload(LevelsPayload.self)
         availableThinkingLevels = levels?.levels ?? []
-    }
-
-    /// pi's built-in thinking-level default when no `defaultThinkingLevel` is
-    /// configured in `~/.pi/agent/settings.json`. The app treats a session
-    /// still sitting on this value as "the user never chose" and raises it to
-    /// the highest available level instead.
-    private static let piDefaultThinkingLevel = "medium"
-    /// True once the user has picked a thinking level from the menu in this
-    /// session — after that the app never auto-changes it.
-    private var hasUserChosenThinkingLevel = false
-
-    /// The "highest thinking level as the default" rule. pi's own default is
-    /// "medium"; the app instead raises an unchosen level to the highest the
-    /// current model supports (`get_available_thinking_levels` is ascending,
-    /// so `.last` is the highest). Only pi's built-in default (or an absent
-    /// level) is raised — an explicitly configured level (a settings.json
-    /// `defaultThinkingLevel`, a level saved in a resumed session, or a menu
-    /// pick in this session) is always respected. pi persists the raised
-    /// level as the settings default, so this is effectively a one-shot
-    /// migration to the user's preference.
-    private func applyHighestThinkingLevelIfUnset() async {
-        guard !hasUserChosenThinkingLevel else { return }
-        let current = thinkingLevel
-        guard current == nil || current == Self.piDefaultThinkingLevel else { return }
-        guard let highest = availableThinkingLevels.last, highest != current else { return }
-        _ = try? await controller.send(.setThinkingLevel(level: highest))
-        thinkingLevel = highest
     }
 
     /// Rebuilds the transcript from `get_messages` off the main thread,
