@@ -545,28 +545,6 @@ final class TextRowView: NSView, NSTextViewDelegate {
                 )
             }
         }
-
-        // Diagnostic for the top-cut investigation (only when enabled):
-        // log any state where the first line would be clipped at the row's
-        // top ("cut off as if scrolled down").
-        let topCutDebug = ProcessInfo.processInfo.environment["PI_DEBUG_TOP_CUT"] == "1"
-        if topCutDebug, bounds.height > 0, layoutManager.numberOfGlyphs > 0 {
-            let firstFrag = layoutManager.lineFragmentRect(forGlyphAt: 0, effectiveRange: nil)
-            let firstTopInCell = textView.frame.height - firstFrag.minY - firstFrag.height
-            if firstTopInCell > bounds.height + 1 {
-                let entry = String(
-                    format: "TOP-CUT bounds=%@ tv=%@ firstTop=%.1f content=%.1f",
-                    NSStringFromRect(bounds), NSStringFromRect(textView.frame), firstTopInCell, contentHeight
-                )
-                if let handle = FileHandle(forWritingAtPath: "/tmp/topcut.log") {
-                    handle.seekToEndOfFile()
-                    handle.write((entry + "\n").data(using: .utf8)!)
-                    try? handle.close()
-                } else {
-                    try? (entry + "\n").write(toFile: "/tmp/topcut.log", atomically: true, encoding: .utf8)
-                }
-            }
-        }
     }
 
     // MARK: - NSTextViewDelegate

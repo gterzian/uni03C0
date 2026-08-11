@@ -133,6 +133,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         return max(tableView.rows(in: tableView.visibleRect).length, 1)
     }
 
+    /// The width rows actually RENDER at: the table column's width. Measuring
+    /// at `tableView.bounds.width` over-reports — the bounds include the
+    /// scroller gutter (legacy scroller, ~32pt) — so the text wraps NARROWER
+    /// than measured, the row renders short, and the taller text overflows
+    /// upward: the top-cut. The column is the source of truth for the render
+    /// width; the 320 floor matches the measurement's usable-width floor.
+    private func rowWidth(in tableView: NSTableView) -> CGFloat {
+        max(tableView.tableColumns.first?.width ?? tableView.bounds.width, 320)
+    }
+
     /// Rows materialized at the tail on load / reload (a few screens).
     private func initialChunkRows() -> Int {
         max(40, viewportRows() * 5)
@@ -249,39 +259,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let store = viewModel?.store else { return 24 }
         let storeIndex = windowStart + row
         guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
-        let width = max(tableView.bounds.width, 320)
+        let width = rowWidth(in: tableView)
         let height = heights.height(for: entry.id, width: width) {
             entry.measuredHeight(forWidth: width)
         }
-        // TEMP diagnostics for the top-cut chase.
-        let prefix = (Self.label(of: entry) as NSString).substring(to: min(20, (Self.label(of: entry) as NSString).length))
-        Self.debugLog("ROW id=\(String(entry.id.prefix(8))) w=\(width) h=\(height) text=\(prefix.replacingOccurrences(of: "\n", with: "\\n"))")
         return height
-    }
-
-    private static func label(of entry: TranscriptEntry) -> String {
-        switch entry.kind {
-        case .userMessage(let t), .errorMessage(let t), .abortedMessage(let t): return t
-        case .assistantMessage(let t, _, _): return t
-        case .toolCall(let c): return "[tool \(c.toolName)]"
-        }
-    }
-
-    /// Set PI_DEBUG_TOP_CUT=1 to enable the top-cut diagnostics (they append
-    /// per-row geometry to /tmp/topcut.log — off by default because they fire
-    /// on every layout).
-    private static var topCutDebugEnabled: Bool {
-        ProcessInfo.processInfo.environment["PI_DEBUG_TOP_CUT"] == "1"
-    }
-
-    private static func debugLog(_ entry: String) {
-        if let handle = FileHandle(forWritingAtPath: "/tmp/topcut.log") {
-            handle.seekToEndOfFile()
-            handle.write((entry + "\n").data(using: .utf8)!)
-            try? handle.close()
-        } else {
-            try? (entry + "\n").write(toFile: "/tmp/topcut.log", atomically: true, encoding: .utf8)
-        }
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
@@ -629,6 +611,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         isEvictingOlder = false
         isFollowing = true
         viewModel?.isFetchingOlder = false
+        // Heights are keyed by (id, width) and ids are only unique WITHIN a
+        // session; a session switch must never serve the previous session's
+        // cached heights for same-width rows.
+        heights.clear()
         tableView.reloadData()
         scheduleScrollToBottom()
     }
@@ -645,37 +631,61 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// Reconfigures the visible cell for `row` and seeds its cached height from
-    /// the cell's own layout (avoids a duplicate CoreText measure — that was
-    /// the 100%-CPU hot path). Returns false if the cell isn't currently
-    /// visible, in which case the caller should invalidate the height so it
-    /// falls back to a measurement.
+    /// the SAME function `heightOfRow` uses on a cache miss
+    /// (`entry.measuredHeight(forWidth:)`), so the fast path and the
+    /// authoritative path can never disagree about a row's height. The cell is
+    /// resized to that height BEFORE layout, so its text view never lays out
+    /// inside a stale (too-short) frame — the original source of the top-cut.
+    /// Returns false if the cell isn't currently visible, in which case the
+    /// caller should invalidate the height so it falls back to a measurement.
     @discardableResult
     private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) -> Bool {
+        // The table can transiently hold fewer rows than the window (e.g. a
+        // visibility catch-up racing a session-switch reload); view(atColumn:)
+        // RAISES on an out-of-range row instead of returning nil.
+        guard row >= 0, row < tableView.numberOfRows else { return false }
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
-        let width = max(tableView.bounds.width, 320)
-        // A reused cell can still hold a stale (wider) frame after a window
-        // resize. Render AND measure at the real width: a stale frame would
-        // wrap the text wider (fewer lines), under-seed the cached height, and
-        // the row would then render short — the taller text overflows upward
-        // and the message's top is clipped.
-        if abs(cell.frame.width - width) > 1 {
-            cell.frame.size.width = width
-        }
-        configure(cell, with: entry, in: tableView)
-        cell.layoutSubtreeIfNeeded()
-        if let textRow = cell as? TextRowView {
-            let seeded = textRow.contentHeight(atWidth: width) + 2
-            heights.store(entry.id, width: width, height: seeded)
-            if Self.topCutDebugEnabled {
-                Self.debugLog("STORE id=\(String(entry.id.prefix(8))) w=\(width) h=\(seeded)")
+        let width = rowWidth(in: tableView)
+
+        if cell is TextRowView {
+            // Single source of truth: identical to what heightOfRow computes on
+            // a cache miss. (One measuredHeight per batched refresh — the
+            // original 100%-CPU bug was per-DELTA with no batching; this is
+            // throttled to `streamBatchInterval`, so the cost is bounded and
+            // the cell's already-rendered pixels are still reused.)
+            let measured = entry.measuredHeight(forWidth: width)
+
+            // A reused cell can still hold a stale (wider) frame after a
+            // window resize. Render AND measure at the real width: a stale
+            // frame would wrap the text wider (fewer lines), under-report the
+            // height, and the row would then render short — the taller text
+            // overflows upward and the message's top is clipped.
+            if abs(cell.frame.width - width) > 1 {
+                cell.frame.size.width = width
             }
+            // Resize height BEFORE layout: laying out inside a stale
+            // (too-short) frame is what produced the top-cut — the text view's
+            // content height could exceed the container, and only the bottom
+            // slice of it was ever visible.
+            if abs(cell.frame.height - measured) > 0.5 {
+                cell.frame.size.height = measured
+            }
+
+            configure(cell, with: entry, in: tableView)
+            cell.layoutSubtreeIfNeeded()
+
+            heights.store(entry.id, width: width, height: measured)
             return true
         }
-        // Tool cards: arguments/output grow in place while the call runs, so a
-        // height cached at insertion is stale after every content change —
-        // invalidate and let `heightOfRow` re-measure (expansion included).
+
+        // Tool cards: reconfigured in place (args/output stream into the card),
+        // but their heights are invalidated and re-measured by `heightOfRow` —
+        // the card's content changes shape too often to seed cheaply
+        // (expansion included).
+        configure(cell, with: entry, in: tableView)
+        cell.layoutSubtreeIfNeeded()
         heights.invalidate(entry.id)
-        return true // tool cells are reconfigured above; heights are re-measured
+        return true
     }
 
     /// Recomputes whether the window is on screen. When it transitions from
@@ -728,35 +738,51 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     // MARK: - Cells
 
     private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
+        let view: NSView
         switch entry.kind {
         case .userMessage(let text):
-            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
-            view.identifier = .textRow
-            view.configure(text: text, thinking: nil, role: .user, isStreaming: false)
-            return view
+            let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            v.identifier = .textRow
+            v.configure(text: text, thinking: nil, role: .user, isStreaming: false)
+            view = v
         case .assistantMessage(let text, let thinking, let isStreaming):
-            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
-            view.identifier = .textRow
-            view.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
-            return view
+            let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            v.identifier = .textRow
+            v.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
+            view = v
         case .errorMessage(let text):
-            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
-            view.identifier = .textRow
-            view.configure(text: text, thinking: nil, role: .error, isStreaming: false)
-            return view
+            let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            v.identifier = .textRow
+            v.configure(text: text, thinking: nil, role: .error, isStreaming: false)
+            view = v
         case .abortedMessage(let text):
-            let view = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
-            view.identifier = .textRow
-            view.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
-            return view
+            let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
+            v.identifier = .textRow
+            v.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
+            view = v
         case .toolCall(let card):
-            let view = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
-            view.identifier = .toolRow
-            view.configure(card: card) { [weak self] in
+            let v = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
+            v.identifier = .toolRow
+            v.configure(card: card) { [weak self] in
                 self?.toggleToolCard(card.id)
             }
-            return view
+            view = v
         }
+        // A recycled cell keeps the PREVIOUS row's frame. NSTableView does not
+        // reliably re-frame a cell whose height changed (the width follows via
+        // autoresizing, the height does not — "width applied, height not"), so
+        // a cell recycled from a SHORTER row into a taller one lays out its
+        // text view at the stale short height: the text overflows upward and
+        // the row's top is clipped ("cut off as if scrolled down"). Size the
+        // cell to THIS row's measured height right away — the same value
+        // `heightOfRow` returns, via the shared cache — so the first layout
+        // pass is correct even if the table never re-frames the cell.
+        let width = rowWidth(in: tableView)
+        let height = heights.height(for: entry.id, width: width) {
+            entry.measuredHeight(forWidth: width)
+        }
+        view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        return view
     }
 
     private func configure(_ cell: NSView, with entry: TranscriptEntry, in tableView: NSTableView) {
