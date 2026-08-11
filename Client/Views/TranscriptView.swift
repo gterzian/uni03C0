@@ -645,37 +645,60 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// Reconfigures the visible cell for `row` and seeds its cached height from
-    /// the cell's own layout (avoids a duplicate CoreText measure — that was
-    /// the 100%-CPU hot path). Returns false if the cell isn't currently
-    /// visible, in which case the caller should invalidate the height so it
-    /// falls back to a measurement.
+    /// the SAME function `heightOfRow` uses on a cache miss
+    /// (`entry.measuredHeight(forWidth:)`), so the fast path and the
+    /// authoritative path can never disagree about a row's height. The cell is
+    /// resized to that height BEFORE layout, so its text view never lays out
+    /// inside a stale (too-short) frame — the original source of the top-cut.
+    /// Returns false if the cell isn't currently visible, in which case the
+    /// caller should invalidate the height so it falls back to a measurement.
     @discardableResult
     private func updateVisibleCell(at row: Int, with entry: TranscriptEntry) -> Bool {
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
         let width = max(tableView.bounds.width, 320)
-        // A reused cell can still hold a stale (wider) frame after a window
-        // resize. Render AND measure at the real width: a stale frame would
-        // wrap the text wider (fewer lines), under-seed the cached height, and
-        // the row would then render short — the taller text overflows upward
-        // and the message's top is clipped.
-        if abs(cell.frame.width - width) > 1 {
-            cell.frame.size.width = width
-        }
-        configure(cell, with: entry, in: tableView)
-        cell.layoutSubtreeIfNeeded()
-        if let textRow = cell as? TextRowView {
-            let seeded = textRow.contentHeight(atWidth: width) + 2
-            heights.store(entry.id, width: width, height: seeded)
+
+        if cell is TextRowView {
+            // Single source of truth: identical to what heightOfRow computes on
+            // a cache miss. (One measuredHeight per batched refresh — the
+            // original 100%-CPU bug was per-DELTA with no batching; this is
+            // throttled to `streamBatchInterval`, so the cost is bounded and
+            // the cell's already-rendered pixels are still reused.)
+            let measured = entry.measuredHeight(forWidth: width)
+
+            // A reused cell can still hold a stale (wider) frame after a
+            // window resize. Render AND measure at the real width: a stale
+            // frame would wrap the text wider (fewer lines), under-report the
+            // height, and the row would then render short — the taller text
+            // overflows upward and the message's top is clipped.
+            if abs(cell.frame.width - width) > 1 {
+                cell.frame.size.width = width
+            }
+            // Resize height BEFORE layout: laying out inside a stale
+            // (too-short) frame is what produced the top-cut — the text view's
+            // content height could exceed the container, and only the bottom
+            // slice of it was ever visible.
+            if abs(cell.frame.height - measured) > 0.5 {
+                cell.frame.size.height = measured
+            }
+
+            configure(cell, with: entry, in: tableView)
+            cell.layoutSubtreeIfNeeded()
+
+            heights.store(entry.id, width: width, height: measured)
             if Self.topCutDebugEnabled {
-                Self.debugLog("STORE id=\(String(entry.id.prefix(8))) w=\(width) h=\(seeded)")
+                Self.debugLog("STORE id=\(String(entry.id.prefix(8))) w=\(width) h=\(measured)")
             }
             return true
         }
-        // Tool cards: arguments/output grow in place while the call runs, so a
-        // height cached at insertion is stale after every content change —
-        // invalidate and let `heightOfRow` re-measure (expansion included).
+
+        // Tool cards: reconfigured in place (args/output stream into the card),
+        // but their heights are invalidated and re-measured by `heightOfRow` —
+        // the card's content changes shape too often to seed cheaply
+        // (expansion included).
+        configure(cell, with: entry, in: tableView)
+        cell.layoutSubtreeIfNeeded()
         heights.invalidate(entry.id)
-        return true // tool cells are reconfigured above; heights are re-measured
+        return true
     }
 
     /// Recomputes whether the window is on screen. When it transitions from
