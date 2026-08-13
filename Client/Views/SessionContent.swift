@@ -50,6 +50,15 @@ struct SessionContent: View {
                     .padding(.top, 8)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
+                // Cmd+F toggles the find bar (hidden: just the shortcut). The
+                // bar itself lives in the window toolbar, left of the Stop
+                // button — never over the transcript, so it can't block
+                // content.
+                Button("") { vm.toggleSearch() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
             }
 
             Divider()
@@ -77,6 +86,7 @@ struct SessionContent: View {
 
             PromptInputView(
                 cwd: tab.cwd,
+                sessionID: tab.id,
                 isEnabled: inputEnabled(vm),
                 fontSize: FontSettings.shared.bodySize,
                 statusText: statusText(vm),

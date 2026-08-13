@@ -10,6 +10,13 @@ struct PromptInputView: NSViewRepresentable {
     typealias Coordinator = PromptCoordinator
 
     let cwd: URL
+    /// The id of the session this input represents. The representable's NSView
+    /// and coordinator are reused across tab switches (same structural
+    /// identity), so a changed id tells the coordinator to drop the previous
+    /// session's transient input state — a windowed paste must never leak
+    /// into another session's input (its `pasteActive` would disable it and
+    /// its store would submit on Enter).
+    let sessionID: UUID
     let isEnabled: Bool
     let fontSize: CGFloat
     /// Live status readout (context %, model, thinking level) shown in very
@@ -33,6 +40,7 @@ struct PromptInputView: NSViewRepresentable {
     func makeCoordinator() -> PromptCoordinator {
         PromptCoordinator(
             cwd: cwd,
+            sessionID: sessionID,
             onSubmit: onSubmit,
             onAbort: onAbort,
             onDraftChange: onDraftChange,
@@ -64,19 +72,33 @@ struct PromptInputView: NSViewRepresentable {
         if nsView.textView.font?.pointSize != fontSize {
             nsView.textView.font = .systemFont(ofSize: fontSize)
         }
-        // An external draft is applied only when it differs from the last
-        // mirrored value. `lastMirroredDraft` shares its buffer with
-        // `tab.promptDraft` (both hold the same String value), so the equality
-        // check is O(1) when in sync — never a per-frame O(document) compare
-        // (which jittered the resize drag on large prompts). While a paste is
-        // windowed the text view shows a slice of the full store — the draft
-        // (the full text) legitimately differs, so the sync is suppressed and
-        // the window is never clobbered.
-        if !context.coordinator.pasteActive, draft != context.coordinator.lastMirroredDraft {
-            context.coordinator.setText(draft, in: nsView)
-            // Re-seed with the draft's own value (same buffer as the owning
-            // view's copy) so the fast path holds across re-renders.
-            context.coordinator.lastMirroredDraft = draft
+        // A session switch re-targets the same coordinator: drop the previous
+        // session's transient input state (windowed paste, completion list)
+        // and force the new session's draft in. This must bypass the ordinary
+        // draft sync below — the reused text view keeps first responder across
+        // the switch, so the sync's first-responder branch would mirror the
+        // OLD session's text upward instead of applying the new draft.
+        if context.coordinator.sessionID != sessionID {
+            context.coordinator.sessionID = sessionID
+            context.coordinator.prepareForSessionSwitch(draft: draft, in: nsView)
+        } else if !context.coordinator.pasteActive, draft != context.coordinator.lastMirroredDraft {
+            if nsView.window?.firstResponder === nsView.textView {
+                // The user is actively editing: the text view is authoritative
+                // and must never be clobbered — a reset moves the caret to the
+                // end and re-applies the whole string, which reads as a flash
+                // of the text (and can happen on any desync, e.g. a state
+                // update racing a keystroke). Re-sync the mirror and the draft
+                // FROM the real text instead; the next keystroke keeps them in
+                // lockstep.
+                let actual = nsView.textView.string
+                context.coordinator.onDraftChange(actual)
+                context.coordinator.lastMirroredDraft = actual
+            } else {
+                context.coordinator.setText(draft, in: nsView)
+                // Re-seed with the draft's own value (same buffer as the owning
+                // view's copy) so the fast path holds across re-renders.
+                context.coordinator.lastMirroredDraft = draft
+            }
         }
         // One-shot restores: append the queued text at the end (push-back).
         // Guarded by the request id so a re-render never appends twice.
@@ -269,6 +291,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     private var completionItems: [String] = []
     private var completionSelected = 0
     private var tokenStart: Int?
+    /// The id of the session this input currently represents (see the
+    /// representable's `sessionID`). Changes when the user switches tabs, so
+    /// the shared coordinator can drop the previous session's transient state.
+    var sessionID: UUID?
     /// Local key monitor making Esc abort whenever the main window is front,
     /// not just when the prompt input has focus. Falls back to the text view's
     /// own Esc handling (completion dismiss → abort) when it is first
@@ -278,15 +304,23 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// and deinit runs only after the last reference is dropped — so the read
     /// from the nonisolated deinit never races the write.
     private nonisolated(unsafe) var escapeMonitor: Any?
+    /// Local key monitor making Ctrl+C discard a windowed paste from anywhere
+    /// in the window (not just when the prompt input has focus), like the Esc
+    /// monitor. Esc aborts the agent turn; Ctrl+C is the terminal-style
+    /// interrupt for the input itself. Deferred to the text view's own Ctrl+C
+    /// handling when it has focus, so nothing double-fires.
+    private nonisolated(unsafe) var pasteAbortMonitor: Any?
 
     init(
         cwd: URL,
+        sessionID: UUID,
         onSubmit: @escaping (String) -> Void,
         onAbort: @escaping () -> Void,
         onDraftChange: @escaping (String) -> Void,
         onContentHeightChange: @escaping (CGFloat) -> Void
     ) {
         self.cwd = cwd
+        self.sessionID = sessionID
         self.onSubmit = onSubmit
         self.onAbort = onAbort
         self.onDraftChange = onDraftChange
@@ -297,6 +331,9 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }
+        if let pasteAbortMonitor {
+            NSEvent.removeMonitor(pasteAbortMonitor)
+        }
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -306,6 +343,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         completionWindow = CompletionWindowController()
         completionWindow?.parentView = container
         installEscapeMonitor()
+        installPasteAbortMonitor()
         container.pasteClearButton.target = self
         container.pasteClearButton.action = #selector(clearPasteButtonClicked)
         // The paste-window slides and the spinner track the scroll position.
@@ -319,7 +357,53 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
 
     @objc private func streamScrollDidChange() {
         updateStreamingIndicator()
-        slidePasteWindow()
+        // Defer the slide out of the bounds-change notification: replacing the
+        // window's string here can land inside a layout pass (a window resize
+        // tiles the scroll view, changing the clip bounds mid-layout), mutating
+        // the text storage while the layout manager is laying out. The glyph
+        // store is left inconsistent and the next layout pass crashes in
+        // NSLayoutManager's `_replaceElements`. The next run-loop turn is
+        // imperceptibly later.
+        guard !slideScheduled else { return }
+        slideScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.slideScheduled = false
+            self?.slidePasteWindow()
+        }
+    }
+
+    /// Discards a windowed paste if one is active (the Ctrl+C / Esc abort
+    /// paths): empties the input and exits windowed mode. Returns true when a
+    /// paste was active and was cleared. Callers are event handlers and the
+    /// key monitors — never a text-system or layout callback, so the string
+    /// setter here cannot reenter a layout pass.
+    @discardableResult
+    private func abortWindowedPasteIfAny() -> Bool {
+        guard pasteActive, let textView = container?.textView else { return false }
+        textView.string = ""
+        clearPasteWindow()
+        onDraftChange("")
+        lastMirroredDraft = ""
+        onContentHeightChange(0)
+        return true
+    }
+
+    /// Called when the representable is re-targeted to a different session
+    /// (tab switch). The NSView and coordinator are reused, so the previous
+    /// session's transient input state must not leak: a windowed paste is
+    /// dropped (its `pasteActive` would disable the new session's input and
+    /// its store would submit on Enter), the completion list is dismissed, and
+    /// the new session's draft is applied deterministically — bypassing the
+    /// first-responder draft sync, which would mirror the OLD session's text
+    /// upward (the reused text view keeps first responder across the switch).
+    func prepareForSessionSwitch(draft: String, in container: PromptContainerView) {
+        dismissCompletion()
+        if pasteActive {
+            container.textView.string = ""
+            clearPasteWindow()
+        }
+        setText(draft, in: container)
+        lastMirroredDraft = draft
     }
 
     /// Esc aborts the in-flight turn (thinking + tools) whenever this window is
@@ -340,14 +424,56 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             // whole session and would otherwise swallow every Esc.
             guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
             // Prompt input has focus: its own Esc handling (completion → abort)
-            // runs; don't fire the abort twice.
-            if window.firstResponder === container.textView { return event }
+            // runs; don't fire the abort twice. Likewise any OTHER text field
+            // being edited (the session search bar) uses Esc for its own
+            // dismissal — the abort stays reserved for non-editing focus (the
+            // transcript, toolbar, empty window chrome). A field editor's
+            // delegate is its NSTextField; the transcript rows' text views are
+            // plain text views, so they fall through and Esc still aborts from
+            // there.
+            if let editor = window.firstResponder as? NSTextView {
+                if editor === container.textView { return event }
+                if editor.delegate is NSTextField { return event }
+            }
+            // Esc is the universal abort: discard a windowed paste (the input
+            // is itself the current "operation" while it is streaming in) and
+            // abort the agent turn.
+            self.abortWindowedPasteIfAny()
             self.onAbort()
             // After aborting, focus the prompt input so typing can start
             // immediately (the next Return sends, or queues as steering if the
             // turn hasn't fully settled yet).
             container.window?.makeFirstResponder(container.textView)
             return nil
+        }
+    }
+
+    /// Local key monitor making Ctrl+C discard a windowed paste from anywhere
+    /// in the window — the input keeps keyboard focus while it is disabled, so
+    /// the text view's own keyDown only sees Ctrl+C when the user happens to
+    /// be focused there. Esc aborts the agent turn; Ctrl+C is the
+    /// terminal-style interrupt for the input itself (clears the draft / drops
+    /// the paste), so from non-editing focus it only ever discards a windowed
+    /// paste — never aborts the turn and never clears a draft the user is not
+    /// looking at. Deferred to the text view's own Ctrl+C handling when the
+    /// prompt input has focus, so nothing double-fires.
+    private func installPasteAbortMonitor() {
+        pasteAbortMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 8, // C
+                  event.modifierFlags.contains(.control),
+                  !event.modifierFlags.contains(.command) else { return event }
+            guard let self, let container = self.container, let window = container.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle it.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A visible popup-menu-level window (a dropdown / the completion
+            // list) is tracking: don't steal the key from it.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            // Prompt input has focus: its own keyDown handles Ctrl+C.
+            if let editor = window.firstResponder as? NSTextView, editor === container.textView {
+                return event
+            }
+            let cleared = self.abortWindowedPasteIfAny()
+            return cleared ? nil : event
         }
     }
 
@@ -400,17 +526,26 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
                 dismissCompletion()
                 return true
             }
-            // Esc aborts the in-flight turn (thinking + tools); idle is a
-            // harmless no-op on the pi side. The text view already has focus.
+            // Esc aborts the in-flight turn (thinking + tools); a windowed
+            // paste is the current operation too, so discard it as well. Idle
+            // is a harmless no-op on the pi side. The text view already has
+            // focus.
+            abortWindowedPasteIfAny()
             onAbort()
             return true
 
         case 8: // C
             // Ctrl+C clears the draft (terminal-style interrupt); Cmd+C still
-            // copies via the default key binding.
+            // copies via the default key binding. During a windowed paste the
+            // draft is the FULL pasted document — clearing it must also exit
+            // windowed mode (spinner off, input editable again), or the
+            // spinner would keep running and Enter would still submit the
+            // discarded paste.
             if event.modifierFlags.contains(.control), !event.modifierFlags.contains(.command) {
-                textView.string = ""
-                onDraftChange("")
+                if !abortWindowedPasteIfAny() {
+                    textView.string = ""
+                    onDraftChange("")
+                }
                 return true
             }
             return false
@@ -592,17 +727,24 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// Cooldown so the re-anchor scroll (which can land at a window edge)
     /// never immediately re-triggers a slide in the opposite direction.
     private var lastSlideTime: TimeInterval = 0
+    /// True while a window slide is scheduled for the next run-loop turn. The
+    /// slide replaces the text view's string, which must never happen inside
+    /// the bounds-change notification itself (it can fire during a layout
+    /// pass) — see `streamScrollDidChange`.
+    private var slideScheduled = false
 
     /// Enters windowed mode for a very large paste: the full text (prefix +
     /// replacement + suffix) is stored, the text view shows only the last
     /// `pasteWindowBudget` units scrolled to the bottom, and the input is
     /// disabled. Scrolling slides the window; Enter submits the full store.
-    private func beginWindowedPaste(range: NSRange, replacement: String) {
-        guard let textView, let storage = textView.textStorage else { return }
+    ///
+    /// Runs on the NEXT run-loop turn, never from inside the text system's
+    /// edit callback or a layout pass: mutating the storage reentrantly there
+    /// desyncs NSTextView's edit bookkeeping / the layout manager, which
+    /// crashes later in NSLayoutManager's `_replaceElements`.
+    private func beginWindowedPaste(prefix: String, suffix: String, replacement: String, in textView: NSTextView) {
+        guard let storage = textView.textStorage else { return }
         dismissCompletion()
-        let current = textView.string as NSString
-        let prefix = current.substring(to: range.location)
-        let suffix = current.substring(from: range.location + range.length)
         let full = prefix + replacement + suffix
 
         let start = StreamedPaste.initialWindowStart(
@@ -787,14 +929,31 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
               (replacement as NSString).length > Self.pasteWindowBudget else {
             return true
         }
+        // Never mutate the storage inside this callback, and never return NO
+        // after mutating: both desync NSTextView's edit bookkeeping and can
+        // corrupt the layout manager (crashes later in `_replaceElements`).
+        // Capture the paste and apply it on the next run-loop turn instead.
+        let current = textView.string as NSString
+        let prefix = current.substring(to: affectedCharRange.location)
+        let suffix = current.substring(from: affectedCharRange.location + affectedCharRange.length)
+        DispatchQueue.main.async { [weak self] in
+            self?.applyHugePaste(prefix: prefix, suffix: suffix, replacement: replacement)
+        }
+        return false
+    }
+
+    /// Applies a huge paste captured by `shouldChangeTextIn`, on the next
+    /// run-loop turn (the text system's edit callback has fully unwound):
+    /// windows the paste, or appends it to an already-windowed store.
+    private func applyHugePaste(prefix: String, suffix: String, replacement: String) {
+        guard let textView = container?.textView else { return }
         if pasteActive {
             // A second huge paste while one is windowed: append to the store
             // and re-window to the new tail.
             appendToPasteStore(replacement)
-            return false
+        } else {
+            beginWindowedPaste(prefix: prefix, suffix: suffix, replacement: replacement, in: textView)
         }
-        beginWindowedPaste(range: affectedCharRange, replacement: replacement)
-        return false
     }
 
     func textDidChange(_ notification: Notification) {

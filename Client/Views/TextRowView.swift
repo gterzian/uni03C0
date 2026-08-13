@@ -178,6 +178,38 @@ extension TextRowView.Role {
     }
 }
 
+/// Yellow background color for the matched search term (in-session find,
+/// Cmd+F). Dynamic per appearance: a deep olive in dark mode (white label
+/// text stays readable), pale yellow in light mode, strengthened with
+/// Increase Contrast. Resolved per draw, so a mid-session appearance toggle
+/// applies without reconfiguring rows.
+enum SearchMatchHighlight {
+    static let match = NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if DisplayOptions.increaseContrast {
+            return dark
+                ? NSColor(calibratedRed: 0.42, green: 0.36, blue: 0.10, alpha: 1.0)
+                : NSColor(calibratedRed: 0.96, green: 0.86, blue: 0.35, alpha: 1.0)
+        }
+        return dark
+            ? NSColor(calibratedRed: 0.30, green: 0.26, blue: 0.11, alpha: 1.0)
+            : NSColor(calibratedRed: 0.99, green: 0.93, blue: 0.60, alpha: 1.0)
+    }
+    /// The current match gets a stronger shade so it reads at a glance among
+    /// the other highlighted terms.
+    static let current = NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if DisplayOptions.increaseContrast {
+            return dark
+                ? NSColor(calibratedRed: 0.55, green: 0.46, blue: 0.12, alpha: 1.0)
+                : NSColor(calibratedRed: 0.98, green: 0.80, blue: 0.20, alpha: 1.0)
+        }
+        return dark
+            ? NSColor(calibratedRed: 0.40, green: 0.33, blue: 0.12, alpha: 1.0)
+            : NSColor(calibratedRed: 0.99, green: 0.88, blue: 0.40, alpha: 1.0)
+    }
+}
+
 /// A read-only, selectable multi-line text cell for user/assistant messages.
 /// Backed by an `NSTextView` (selectable text, correct wrapping); the table
 /// supplies the row height via `TranscriptText.measuredHeight`, and `layout()`
@@ -304,7 +336,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
         }
     }
 
-    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool, cacheHitRate: Double? = nil, cacheMiss: Bool = false) {
+    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool, cacheHitRate: Double? = nil, cacheMiss: Bool = false, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false) {
         self.role = role
         isStreamingRow = isStreaming
         textView.setAccessibilityLabel(role.accessibilityLabel)
@@ -321,6 +353,9 @@ final class TextRowView: NSView, NSTextViewDelegate {
         // User rows get the light-blue backdrop (resolved per draw, so a
         // mid-session appearance/contrast change applies without reconfigure).
         highlightView.isHidden = role != .user
+        // Search term highlight: only the matched term (every occurrence in
+        // the rendered text) gets the yellow background — never the whole row.
+        applySearchHighlight(query: searchQuery, caseSensitive: searchCaseSensitive, isCurrent: isCurrentSearchMatch)
         rebuildCodeBlockChrome()
         if isStreaming, role == .assistant, !DisplayOptions.reduceMotion {
             if DisplayOptions.increaseContrast {
@@ -419,6 +454,27 @@ final class TextRowView: NSView, NSTextViewDelegate {
         }
     }
 
+    /// Applies the yellow background to every occurrence of `query` in the
+    /// row's rendered text (find-in-page style), not to the row as a whole.
+    /// The rendered string is searched directly — the visible occurrence is
+    /// what gets painted, matching what the user sees.
+    private func applySearchHighlight(query: String?, caseSensitive: Bool, isCurrent: Bool) {
+        guard let query, let storage = textView.textStorage else { return }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        let color: NSColor = isCurrent ? SearchMatchHighlight.current : SearchMatchHighlight.match
+        let full = storage.string as NSString
+        var searchRange = NSRange(location: 0, length: full.length)
+        while searchRange.length > 0 {
+            let found = full.range(of: q, options: options, range: searchRange)
+            guard found.location != NSNotFound else { break }
+            storage.addAttribute(.backgroundColor, value: color, range: found)
+            let next = found.location + found.length
+            searchRange = NSRange(location: next, length: full.length - next)
+        }
+    }
+
     private func startCaretPulse() {
         guard caretTimer == nil else { return }
         caretTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
@@ -496,6 +552,18 @@ final class TextRowView: NSView, NSTextViewDelegate {
 
     /// Number of code-card backgrounds currently placed (one per fenced block).
     var renderedCodeBlockCount: Int { codeCardViews.count }
+    /// The ranges in the current string that carry the search-match background
+    /// (internal test hook).
+    var searchHighlightRangesForTesting: [NSRange] {
+        guard let storage = textView.textStorage else { return [] }
+        var ranges: [NSRange] = []
+        storage.enumerateAttribute(.backgroundColor, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+            if let color = value as? NSColor, color === SearchMatchHighlight.match || color === SearchMatchHighlight.current {
+                ranges.append(range)
+            }
+        }
+        return ranges
+    }
     /// Number of corner copy buttons currently placed (final assistant rows only).
     var renderedCopyButtonCount: Int { copyButtons.count }
     /// The frame (in row coordinates) of the nth code card, for layout tests.

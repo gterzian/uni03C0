@@ -107,6 +107,41 @@ TUI. The thinking-level menu offers exactly the levels pi reports via
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
 
+## Stable session data (provider prompt cache)
+
+The provider caches the session's prompt prefix, so the request bytes must
+stay identical whether the session is driven from the app or the TUI. pi owns
+the session data; the app is a read-only mirror. **No future code change may
+alter what pi records or what it sends to the provider.** The rules that keep
+this true:
+
+- **The app never writes session data.** pi writes `~/.pi/agent/sessions/…`;
+the app only reads it, and only through pi's read-only RPCs (`get_state`,
+`get_messages`, `get_session_stats`, `get_available_models`,
+`get_available_thinking_levels`). `TranscriptStore` is a local mirror of the
+event stream: it folds frames and rebuilds from `get_messages`, and it must
+never send, reorder, or rewrite anything.
+- **Only the commands pi's TUI sends, for the same user actions.** A new
+state-changing RPC (`prompt`, `set_model`, `set_thinking_level`, `abort`,
+`switch_session`) needs the same justification the TUI has for it. The model
+and thinking level are never forced or auto-changed; a session starts exactly
+as pi's own defaults would.
+- **A prompt is the user's text, verbatim.** The only transformation is
+whitespace trimming (pi's TUI trims identically). No re-sends, no retries, no
+duplicates — `ProcessController.send` writes each request exactly once. The
+full pasted text is what is submitted; windowed pastes are a view-only
+optimization.
+- **Rendering caches are pure UI.** `HeightCache`, tool-card expansion, text
+measurement, fonts, diffs — in-memory layout data, never serialized, sent, or
+written, and nothing derived from them may feed back into what pi records.
+- **The one deliberate deviation stays deterministic and append-only.**
+Queued steering is flushed as ONE combined prompt (the TUI records each
+queued message separately). Each flush appends exactly one new user message
+in order — never re-sends, never splits, never reorders.
+
+When adding a feature, ask: does this change what pi would record or send for
+the same user actions? If yes, it breaks the stable prefix — find another way.
+
 ## Sandbox
 
 Every pi subprocess runs inside a **Seatbelt sandbox** (default-deny), built
@@ -411,6 +446,30 @@ concurrency.
   stays bounded regardless of paste size — a multi-megabyte paste never
   blocks the main thread and the conversation keeps scrolling. Enter submits
   the full store.
+
+  **Windowed-paste safety rules** (each one is a past or latent crash):
+  - **No storage mutation inside the text system or a layout pass.** A huge
+    paste is captured in `shouldChangeTextIn` and applied on the next
+    run-loop turn (`applyHugePaste`); the scroll-driven window slide is
+    deferred out of the `boundsDidChangeNotification` observer the same way
+    (`slideScheduled`). Mutating `NSTextStorage` reentrantly inside those
+    callbacks desyncs the layout manager, which crashes later in
+    NSLayoutManager's `_replaceElements` during an unrelated layout pass
+    (a window resize / bar shrink) — the crash signature seen in the field.
+  - **A windowed paste is per-session state.** The representable's NSView and
+    coordinator are reused across tab switches; `sessionID` detects a switch
+    and `prepareForSessionSwitch` drops the previous session's paste (its
+    `pasteActive` would disable the new session's input and its store would
+    submit on Enter) and forces the new draft in, bypassing the
+    first-responder draft sync (which would mirror the old text upward).
+  - **Aborting the paste works from anywhere.** Ctrl+C is handled by a
+    global key monitor (like Esc), not just the text view's keyDown — the
+    input keeps focus while disabled, so the old path missed Ctrl+C whenever
+    focus was elsewhere. Esc (turn abort) also discards an active windowed
+    paste; Ctrl+C discards it without touching the agent turn. Both go
+    through `abortWindowedPasteIfAny`, which empties the input, exits
+    windowed mode, and reports the height reset — a paste that stays
+    windowed silently keeps its store and submits on Enter.
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
   read it; the transcript coordinator observes the change, clears its height
@@ -478,13 +537,17 @@ Behavior details that matter:
   preflight failures (auth, rejected prompts) and a dead agent process surface
   as an error banner above the prompt bar instead of being silently swallowed.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
-  views). Streaming text is **batched** — the tail row updates at most every
-  0.25s or once ~20 new characters accumulate (a few words), never per
-  character-delta — and each batched chunk **crossfades in**, so the text
+  views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
+  tail row updates at most every 0.25s (a hard cap, never per character-delta),
+  plus immediately on a new message's first chunk and on the streaming→final
+  flag flip — and each batched chunk **crossfades in**, so the text
   materializes in word groups instead of popping character by character. The
-  streaming row's height is re-measured on each batched refresh via the same
-  `measuredHeight` function the authoritative path uses (the fast path and the
-  fallback can never disagree). The height change and the follow-scroll are
+  streaming row's height comes from the cell's own layout manager
+  (`TextRowView.contentHeight`), which lays out **incrementally** — only the
+  newly-appended characters are typeset — never from a fresh CoreText
+  `measuredHeight` of the whole growing text (a full re-typeset of a
+  newline-heavy message costs hundreds of ms and saturates the main thread at
+  the batch rate). The height change and the follow-scroll are
   applied in one atomic `CATransaction` so AppKit renders only the final
   state — content flows off the top instead of bouncing. Tool cards stream
   output with the same batching (their cached height is invalidated on every
@@ -497,10 +560,21 @@ Behavior details that matter:
   `entry.measuredHeight(forWidth:)` — feeds both `heightOfRow` (on cache
   miss) and the visible-cell refresh (`updateVisibleCell`), so the two paths
   agree by construction; the fast path stores that measured value rather than
-  seeding from the cell's own layout. Tool-card heights are invalidated on
-  every content update (they grow in place); text rows are invalidated on
-  genuine change, and `resetToTail` clears the whole cache on session switch
-  (ids are only unique within a session).
+  seeding from the cell's own layout. Streaming rows carry a **content tag**
+  (text/thinking/streaming-flag fingerprint): `heightOfRow` serves whatever
+  the renderer seeded (the table must match the cell, not the store's newer
+  unrendered content) and `updateVisibleCell`/`makeCell` re-measure only on a
+  genuine content change. Streaming rows are seeded from the cell's
+  incremental layout (`contentHeight` + the 2pt slack, so the settled-row
+  `measuredHeight` lands on the same height — no jump at settle); the full
+  CoreText measure runs once per message (on the settle refresh, then cached).
+  The re-measure-per-`heightOfRow` path from `rowHeight` and the full
+  re-typeset per batch both pegged the main thread at 100% in samples (a
+  DeepSeek "high" thinking stream and a newline-heavy markdown stream both
+  reproduced it). Tool-card heights are
+  invalidated on every content update (they grow in place); text rows are
+  invalidated on genuine change, and `resetToTail` clears the whole cache on
+  session switch (ids are only unique within a session).
 - **Cells are pre-sized at creation.** `makeCell` frames every cell to its
   row's measured height before returning it — NSTableView does not reliably
   re-frame a cell whose height changed (the width follows via autoresizing,
@@ -605,7 +679,10 @@ Two unit-test bundles, both deterministic (no pi process, no network, no
 live model):
 
 - **ClientTests** — Core-only logic: framing, request encoding, response
-  decoding, store folding, diff, sandbox policy. Links Core only.
+  decoding, store folding, diff, sandbox policy, and the streaming-refresh
+  regression (`StreamingRefreshGateTests` replays a realistic delta stream
+  through the real store + gate and asserts the refresh count is bounded by
+  the batch interval — never per delta). Links Core only.
 - **RenderingTests** — the AppKit renderer. Compiles the renderer sources
   (Client/Views/MarkdownText.swift, TextRowView.swift, CodeCopyButton.swift,
   Client/Accessibility/DisplayOptions.swift, Client/Support/FontSettings.swift)
