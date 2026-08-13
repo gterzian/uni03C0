@@ -54,6 +54,46 @@ final class TextRowViewTests: XCTestCase {
         XCTAssertEqual(row.renderedCopyButtonCount, 0)
     }
 
+    // MARK: - Search-term highlight
+
+    func testSearchTermIsHighlightedNotTheRow() {
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: "proxy windowproxy Proxy", thinking: nil, role: .assistant, isStreaming: false,
+                      searchQuery: "proxy", searchCaseSensitive: false)
+        row.layoutSubtreeIfNeeded()
+        let ranges = row.searchHighlightRangesForTesting
+        XCTAssertEqual(ranges.count, 3, "every occurrence is highlighted, not the row")
+        XCTAssertEqual(ranges.map(\.location), [0, 6, 18], "ranges sit exactly on each occurrence")
+        XCTAssertEqual(ranges.map(\.length), [5, 5, 5])
+    }
+
+    func testNoHighlightWithoutAQuery() {
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: "proxy windowproxy", thinking: nil, role: .assistant, isStreaming: false)
+        row.layoutSubtreeIfNeeded()
+        XCTAssertTrue(row.searchHighlightRangesForTesting.isEmpty, "no query → no highlight")
+    }
+
+    func testSearchHighlightRespectsCaseSensitivity() {
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: "Proxy proxy", thinking: nil, role: .assistant, isStreaming: false,
+                      searchQuery: "Proxy", searchCaseSensitive: true)
+        row.layoutSubtreeIfNeeded()
+        let ranges = row.searchHighlightRangesForTesting
+        XCTAssertEqual(ranges.count, 1, "case-sensitive: only the exact-cased occurrence")
+        XCTAssertEqual(ranges.first?.location, 0)
+    }
+
+    func testCurrentMatchUsesTheStrongerShade() {
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: "proxy", thinking: nil, role: .assistant, isStreaming: false,
+                      searchQuery: "proxy", searchCaseSensitive: false, isCurrentSearchMatch: true)
+        row.layoutSubtreeIfNeeded()
+        let color = textView(of: row).textStorage?.attribute(.backgroundColor, at: 0, effectiveRange: nil) as? NSColor
+        XCTAssertTrue(color === SearchMatchHighlight.current, "current match uses the stronger shade")
+        XCTAssertFalse(color === SearchMatchHighlight.match)
+    }
+
     // MARK: - Card geometry
 
     func testCardCoversExactlyTheCodeLines() {

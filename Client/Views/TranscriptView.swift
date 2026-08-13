@@ -127,6 +127,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Last viewport bottom edge (document y), for detecting scroll direction.
     private var lastVisibleMaxY: CGFloat = 0
 
+    /// The store row ids that currently contain a search match, and the id of
+    /// the current match — drive the yellow term backdrops. Rebuilt whenever
+    /// the view model's match list changes (`onSearchResultsChanged`). The
+    /// query itself is tracked too, so a query change that leaves the match
+    /// set identical (same rows) still re-renders the highlighted ranges.
+    private var searchMatchRowIDs: Set<String> = []
+    private var currentSearchRowID: String?
+    private var lastSearchQuery: String?
+
     /// How many rows currently fit in the viewport (or a sane default).
     private func viewportRows() -> Int {
         guard let tableView else { return 20 }
@@ -226,6 +235,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel.onSearchJump = { [weak self] storeIndex in
             self?.scrollToStoreIndex(storeIndex)
         }
+        viewModel.onSearchResultsChanged = { [weak self] in
+            self?.refreshSearchHighlight()
+        }
         let store = viewModel.store
         lastGeneration = store.currentGeneration
         windowStart = max(0, store.count - initialChunkRows())
@@ -243,12 +255,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func rebind(viewModel: SessionViewModel) {
         self.viewModel?.onTranscriptChange = nil
         self.viewModel?.onSearchJump = nil
+        self.viewModel?.onSearchResultsChanged = nil
         self.viewModel = viewModel
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
         }
         viewModel.onSearchJump = { [weak self] storeIndex in
             self?.scrollToStoreIndex(storeIndex)
+        }
+        viewModel.onSearchResultsChanged = { [weak self] in
+            self?.refreshSearchHighlight()
         }
         resetToTail(viewModel.store)
     }
@@ -642,6 +658,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // session; a session switch must never serve the previous session's
         // cached heights for same-width rows.
         heights.clear()
+        // The same applies to search-match rows: ids from the previous session
+        // would paint stale yellow backdrops on the new one. The view model's
+        // match list still holds the old session's row ids (the session
+        // switched underneath it), so drop the coordinator's copy rather than
+        // re-derive it.
+        searchMatchRowIDs = []
+        currentSearchRowID = nil
+        lastSearchQuery = nil
         tableView.reloadData()
         scheduleScrollToBottom()
     }
@@ -800,35 +824,61 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         lastVisibleMaxY = scrollView.documentVisibleRect.maxY
     }
 
+    /// Re-renders the yellow search-term highlights after the match list, the
+    /// current match, or the query changed. Term backgrounds don't change
+    /// heights, so a plain reload of the materialized window suffices (heights
+    /// stay cached and the scroll position is preserved).
+    private func refreshSearchHighlight() {
+        guard let viewModel else { return }
+        let ids = Set(viewModel.searchMatches.map(\.rowID))
+        let current = viewModel.searchMatches.indices.contains(viewModel.searchCurrentIndex)
+            ? viewModel.searchMatches[viewModel.searchCurrentIndex].rowID
+            : nil
+        let query = viewModel.searchQuery
+        guard ids != searchMatchRowIDs || current != currentSearchRowID || query != lastSearchQuery else { return }
+        searchMatchRowIDs = ids
+        currentSearchRowID = current
+        lastSearchQuery = query
+        tableView.reloadData()
+    }
+
     // MARK: - Cells
 
     private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
+        // Search state for this row: the live query (nil when the find bar is
+        // closed or this row has no match) drives the yellow term highlight;
+        // the current match uses a stronger shade. Matches are tracked by row
+        // id so the flag is stable across streaming mutations of the same
+        // entry.
+        let query = searchMatchRowIDs.contains(entry.id) ? viewModel?.searchQuery : nil
+        let isCurrent = currentSearchRowID == entry.id
+        let caseSensitive = viewModel?.isCaseSensitive ?? false
         let view: NSView
         switch entry.kind {
         case .userMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .user, isStreaming: false)
+            v.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
             view = v
         case .assistantMessage(let text, let thinking, let isStreaming):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
+            v.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
             view = v
         case .errorMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .error, isStreaming: false)
+            v.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
             view = v
         case .abortedMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
+            v.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
             view = v
         case .toolCall(let card):
             let v = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
             v.identifier = .toolRow
-            v.configure(card: card) { [weak self] in
+            v.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent) { [weak self] in
                 self?.toggleToolCard(card.id)
             }
             view = v
@@ -849,17 +899,20 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     private func configure(_ cell: NSView, with entry: TranscriptEntry, in tableView: NSTableView) {
+        let query = searchMatchRowIDs.contains(entry.id) ? viewModel?.searchQuery : nil
+        let isCurrent = currentSearchRowID == entry.id
+        let caseSensitive = viewModel?.isCaseSensitive ?? false
         switch entry.kind {
         case .userMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
         case .assistantMessage(let text, let thinking, let isStreaming):
-            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss)
+            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
         case .errorMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
         case .abortedMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
         case .toolCall(let card):
-            (cell as? ToolCallHostView)?.configure(card: card) { [weak self] in
+            (cell as? ToolCallHostView)?.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent) { [weak self] in
                 self?.toggleToolCard(card.id)
             }
         }

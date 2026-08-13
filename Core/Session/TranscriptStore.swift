@@ -112,18 +112,20 @@ public final class TranscriptStore: @unchecked Sendable {
     }
 
     /// Searches the FULL conversation — every folded row, including history
-    /// the view has not materialized — for `query`, case-insensitive, in each
-    /// row's `searchableText`. Returns matches in store order.
-    public func search(_ query: String) -> [SearchMatch] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    /// the view has not materialized — for `query`, case-insensitive by
+    /// default (`caseSensitive: true` matches exactly), in each row's
+    /// `searchableText`. Returns matches in store order.
+    public func search(_ query: String, caseSensitive: Bool = false) -> [SearchMatch] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
+        let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
         lock.lock()
         defer { lock.unlock() }
         var matches: [SearchMatch] = []
         for (index, entry) in _entries.enumerated() {
             let haystack = entry.searchableText
             guard !haystack.isEmpty else { continue }
-            guard let range = haystack.range(of: q, options: [.caseInsensitive]) else { continue }
+            guard let range = haystack.range(of: q, options: options) else { continue }
             matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: range)))
         }
         return matches

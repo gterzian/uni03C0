@@ -429,10 +429,22 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
 
         case 8: // C
             // Ctrl+C clears the draft (terminal-style interrupt); Cmd+C still
-            // copies via the default key binding.
+            // copies via the default key binding. During a windowed paste the
+            // draft is the FULL pasted document — clearing it must also exit
+            // windowed mode (spinner off, input editable again), or the
+            // spinner would keep running and Enter would still submit the
+            // discarded paste.
             if event.modifierFlags.contains(.control), !event.modifierFlags.contains(.command) {
-                textView.string = ""
-                onDraftChange("")
+                if pasteActive {
+                    textView.string = ""
+                    clearPasteWindow()
+                    onDraftChange("")
+                    lastMirroredDraft = ""
+                    onContentHeightChange(0)
+                } else {
+                    textView.string = ""
+                    onDraftChange("")
+                }
                 return true
             }
             return false

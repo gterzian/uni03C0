@@ -73,14 +73,31 @@ public final class SessionViewModel {
     public private(set) var searchMatches: [TranscriptStore.SearchMatch] = []
     /// Index into `searchMatches` of the current match; -1 when there are none.
     public private(set) var searchCurrentIndex = -1
+    /// Case-sensitive matching for the find bar (off by default, matching
+    /// most find-in-page defaults).
+    public var isCaseSensitive = false
     /// AppKit-side hook: called with the store index of the current match so
     /// the coordinator can materialize history and scroll the row into view.
     public var onSearchJump: ((Int) -> Void)?
 
+    /// AppKit-side hook: called whenever the match set or the current match
+    /// changed (a query ran, Enter cycled, or search closed) so the
+    /// coordinator can re-render the yellow row highlights.
+    public var onSearchResultsChanged: (() -> Void)?
+
     private var searchTask: Task<Void, Never>?
     /// The query the current match list was computed for (Enter re-runs the
-    /// search when the text has changed since the last debounce).
+    /// search when the text has changed since the last run).
     private var lastSearchedQuery = ""
+    /// Whether the current match list was computed case-sensitively — a
+    /// sensitivity toggle must re-run even when the text is unchanged.
+    private var lastSearchedCaseSensitive = false
+
+    /// How long typing must pause before a live search runs. The keys need to
+    /// SETTLE: a search that fires mid-word jumps the transcript around while
+    /// the query is still being refined. 500ms reads as a real pause without
+    /// feeling laggy (250ms fired per keystroke, 800ms waited too long).
+    private static let searchSettleDelay: Duration = .milliseconds(500)
 
     /// Toggles the find bar. Closing it clears the match state and returns the
     /// transcript to the user's own position.
@@ -89,66 +106,125 @@ public final class SessionViewModel {
             closeSearch()
         } else {
             isSearchVisible = true
+            // Reopening with the previous query still in the field re-runs it,
+            // so Cmd+F brings the results (and highlight) straight back instead
+            // of an empty match list until the query is edited again.
+            if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                runSearch(searchQuery)
+            }
         }
     }
 
     public func closeSearch() {
         isSearchVisible = false
+        clearSearchResults()
+    }
+
+    /// Clears the match state (closing the bar, or a session switch that made
+    /// the old row ids meaningless) and tells the view to drop the highlights.
+    private func clearSearchResults() {
         searchTask?.cancel()
         searchTask = nil
         searchMatches = []
         searchCurrentIndex = -1
+        lastSearchedQuery = ""
+        lastSearchedCaseSensitive = false
+        onSearchResultsChanged?()
     }
 
-    /// Live search as the query is typed, debounced (a keystroke must not
-    /// lock the store per character on a large session).
+    /// Live search as the query is typed, debounced: the query only runs once
+    /// the keys have SETTLED — every keystroke cancels the pending run and
+    /// restarts the settle timer, so a burst of typing launches a single
+    /// search instead of one per character.
     public func updateSearchQuery(_ query: String) {
-        searchQuery = query
+        performSearch(query: query, debounce: Self.searchSettleDelay, advanceBy: nil)
+    }
+
+    /// Runs the search now (Enter / Cmd+F reopen / sensitivity toggle).
+    public func runSearch(_ query: String) {
+        performSearch(query: query, debounce: .zero, advanceBy: nil)
+    }
+
+    /// Searches the FULL store on a background executor, then applies the
+    /// results on the main actor. The store is lock-guarded and thread-safe,
+    /// so searching a huge conversation never blocks the UI — only the result
+    /// application (match list, jump, notification) touches the main thread.
+    private func performSearch(query: String, debounce: Duration, advanceBy: Int?) {
         searchTask?.cancel()
+        searchQuery = query
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
+            guard let self else { return }
+            if debounce > .zero {
+                try? await Task.sleep(for: debounce)
+                guard !Task.isCancelled else { return }
+            }
+            let caseSensitive = self.isCaseSensitive
+            let store = self.store
+            let matches: [TranscriptStore.SearchMatch]
+            if trimmed.isEmpty {
+                matches = []
+            } else {
+                matches = await Task.detached(priority: .userInitiated) {
+                    store.search(trimmed, caseSensitive: caseSensitive)
+                }.value
+            }
             guard !Task.isCancelled else { return }
-            self?.runSearch(query)
+            self.applySearchResults(matches, trimmed: trimmed, advanceBy: advanceBy)
         }
     }
 
-    /// Runs the search now (Enter / debounce). Keeps the current match index
-    /// when it is still valid, otherwise restarts at the first match.
-    public func runSearch(_ query: String) {
-        searchTask?.cancel()
-        searchTask = nil
-        searchQuery = query
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let matches = trimmed.isEmpty ? [] : store.search(trimmed)
+    /// Applies a finished search on the main actor: publishes the match list,
+    /// keeps the current index when it is still valid (or advances it when the
+    /// user pressed Enter before the search settled), then jumps and notifies
+    /// the view that new results are ready.
+    private func applySearchResults(_ matches: [TranscriptStore.SearchMatch], trimmed: String, advanceBy: Int?) {
         searchMatches = matches
         if matches.isEmpty {
             searchCurrentIndex = -1
+        } else if let advanceBy {
+            searchCurrentIndex = (searchCurrentIndex + advanceBy + matches.count) % matches.count
         } else if !matches.indices.contains(searchCurrentIndex) {
             searchCurrentIndex = 0
         }
         lastSearchedQuery = trimmed
+        lastSearchedCaseSensitive = isCaseSensitive
         jumpToCurrentMatch()
+        onSearchResultsChanged?()
     }
 
-    /// Enter: cycle to the next match, wrapping. Re-runs the search first when
-    /// the query changed since the last run (e.g. Enter before the debounce
-    /// fired).
+    /// Toggles case-sensitive matching and re-runs the current query so the
+    /// match list (and highlight) reflects the new sensitivity immediately.
+    public func setCaseSensitive(_ enabled: Bool) {
+        guard isCaseSensitive != enabled else { return }
+        isCaseSensitive = enabled
+        if isSearchVisible, !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            runSearch(searchQuery)
+        }
+    }
+
+    /// Enter / ↓: cycle to the next match, wrapping.
     public func nextSearchMatch() {
         advanceSearchMatch(by: 1)
     }
 
-    /// Shift+Enter: cycle to the previous match, wrapping.
+    /// Shift+Enter / ↑: cycle to the previous match, wrapping.
     public func previousSearchMatch() {
         advanceSearchMatch(by: -1)
     }
 
     private func advanceSearchMatch(by delta: Int) {
-        if lastSearchedQuery != searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) {
-            runSearch(searchQuery)
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, lastSearchedQuery == trimmed, lastSearchedCaseSensitive == isCaseSensitive, !searchMatches.isEmpty {
+            // The visible matches are current for this query — advance now.
+            searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+            jumpToCurrentMatch()
+            onSearchResultsChanged?()
+        } else if !trimmed.isEmpty {
+            // The matches are stale (typing since the last run) or a search is
+            // in flight — re-run and advance once the fresh results land.
+            performSearch(query: searchQuery, debounce: .zero, advanceBy: delta)
         }
-        guard !searchMatches.isEmpty else { return }
-        searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
-        jumpToCurrentMatch()
     }
 
     private func jumpToCurrentMatch() {
@@ -480,6 +556,11 @@ public final class SessionViewModel {
             store.rebuild(from: messages)
         }.value
         isReloading = false
+        // The store was rebuilt — any live search matches reference the OLD
+        // session's row ids and must not paint highlights on the new one.
+        if isSearchVisible || !searchMatches.isEmpty {
+            clearSearchResults()
+        }
         if changed {
             onTranscriptChange?()
         }

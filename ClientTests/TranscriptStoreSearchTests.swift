@@ -49,6 +49,24 @@ final class TranscriptStoreSearchTests: XCTestCase {
         XCTAssertEqual(store.search("proxy list").count, 1)
     }
 
+    func testSearchCaseSensitiveMatchesExactly() {
+        let store = makeStore()
+        // Default is case-insensitive: the user's capitalized "WindowProxy"
+        // and the assistant's lowercase "windowproxy.rs" both hit.
+        XCTAssertEqual(store.search("windowproxy").count, 2)
+        // Case-sensitive: only the exact casing matches.
+        let lower = store.search("windowproxy", caseSensitive: true)
+        XCTAssertEqual(lower.count, 1, "lowercase query matches only the assistant's lowercase text")
+        XCTAssertEqual(lower[0].storeIndex, 1)
+        let upper = store.search("WindowProxy", caseSensitive: true)
+        XCTAssertEqual(upper.count, 1, "capitalized query matches only the user's 'WindowProxy'")
+        XCTAssertEqual(upper[0].storeIndex, 0)
+        // A differently-cased word is a miss when sensitive.
+        XCTAssertTrue(store.search("THE", caseSensitive: true).isEmpty, "'The' in the thinking is not 'THE'")
+        // Whitespace is still trimmed either way.
+        XCTAssertEqual(store.search("  windowproxy  ", caseSensitive: true).count, 1)
+    }
+
     func testSearchFindsToolNameArgsAndOutput() {
         let store = makeStore()
         XCTAssertEqual(store.search("git status").count, 1, "hit in the tool arguments")
