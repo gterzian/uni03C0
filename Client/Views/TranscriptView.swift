@@ -61,23 +61,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     weak var viewModel: SessionViewModel?
     private var isApplying = false
     /// Streaming batching: the tail row is refreshed at most every
-    /// `streamBatchInterval` seconds (a few words for a typical stream), and
-    /// the new chunk crossfades in. The interval is a HARD cap — a per-delta
-    /// word gate made fast streams re-layout the whole (possibly huge)
-    /// streaming row on nearly every delta, which is the 100%-CPU path in
-    /// samples.
-    private let streamBatchInterval: TimeInterval = 0.25
-    private var lastStreamedAt: TimeInterval = 0
-    /// The tail entry (by id) whose streaming content was last rendered, and
-    /// that content. Thinking streams on its own (empty text), so BOTH text
-    /// and thinking are compared when deciding whether a new chunk is big
-    /// enough to show — otherwise thinking deltas never trigger a refresh.
-    private var lastStreamedID: String?
-    private var lastStreamedContent: (text: String, thinking: String)?
-    /// Whether the last render was a streaming one — the flag flip to final
-    /// must re-render the cell even when the text is unchanged (otherwise the
-    /// old streaming version, caret included, blinks forever).
-    private var lastStreamedWasStreaming = false
+    /// `batchInterval` seconds (a few words for a typical stream), and the new
+    /// chunk crossfades in. The interval is a HARD cap — a per-delta word gate
+    /// made fast streams re-layout the whole (possibly huge) streaming row on
+    /// nearly every delta, which is the 100%-CPU path in samples. The decision
+    /// itself lives in `StreamingRefreshGate` (Core) so it is unit-testable
+    /// with the same code the app runs.
+    private var streamGate = StreamingRefreshGate(batchInterval: 0.25)
     /// Coalesced async scroll-to-bottom (tile + scroll happen once per run-loop
     /// turn at most, after the table has laid out).
     private var scrollToBottomPending = false
@@ -289,23 +279,50 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// The height the table should use for a row. Settled rows go through the
-    /// (id, width) height cache; STREAMING rows never trust it — their cached
-    /// height lags the content between the 0.25s stream-batch refreshes, and
-    /// serving the stale height renders the row short while the text has
-    /// already wrapped taller: the text view overflows the row UPWARD and the
-    /// message's top is clipped (the top-cut). A streaming row is measured
-    /// fresh and the cache re-seeded, so the row and every cell made from it
-    /// agree on the CURRENT content. Cost is bounded: the table asks heights
-    /// on layout/scroll (not per delta), and the only streaming row is the
-    /// turn's tail.
+    /// (id, width, content) height cache. STREAMING rows also go through the
+    /// cache — but seeded by the renderer, not measured here on every query:
+    /// the table asks `heightOfRow` on every tile/scroll/`noteHeightOfRows`,
+    /// and each query used to re-measure the whole (possibly huge) streaming
+    /// text from scratch — the 100%-CPU path in samples. The table's height
+    /// must match what the CELL renders (the last batched refresh), so the
+    /// cached height the renderer seeded is authoritative even while the store
+    /// has newer, not-yet-rendered content; serving the store's newest would
+    /// pad the row above a shorter cell. A miss happens only before a row's
+    /// first render (or after eviction) — measure and seed then.
     private func rowHeight(for entry: TranscriptEntry, width: CGFloat) -> CGFloat {
         if entry.kind.isStreaming {
+            if let cached = heights.heightIfPresent(for: entry.id, width: width) {
+                return cached
+            }
             let height = entry.measuredHeight(forWidth: width)
-            heights.store(entry.id, width: width, height: height)
+            heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
             return height
         }
-        return heights.height(for: entry.id, width: width) {
+        return heights.height(for: entry.id, width: width, tag: Self.contentTag(for: entry)) {
             entry.measuredHeight(forWidth: width)
+        }
+    }
+
+    /// The content fingerprint a text row's height was measured for. The cache
+    /// is (id, width)-keyed, but a streaming row's content changes every delta
+    /// while its height is only re-seeded on the 0.25s batched refresh — the
+    /// tag lets the renderer reuse a height that is still valid (same content)
+    /// and re-measure only on genuine change. Includes the cache-line fields
+    /// (they render under the final message, so they affect the height) and the
+    /// streaming flag (the caret adds a line's worth of width pressure).
+    private static func contentTag(for entry: TranscriptEntry) -> String? {
+        switch entry.kind {
+        case .userMessage(let text):
+            return "u\u{1F}\(text)"
+        case .assistantMessage(let text, let thinking, let isStreaming):
+            let rate = entry.cacheHitRate.map { String($0) } ?? "-"
+            return "a\(isStreaming ? 1 : 0)\u{1F}\(text)\u{1F}\(thinking)\u{1F}\(rate)\u{1F}\(entry.cacheMiss ? 1 : 0)"
+        case .errorMessage(let text):
+            return "e\u{1F}\(text)"
+        case .abortedMessage(let text):
+            return "b\u{1F}\(text)"
+        case .toolCall:
+            return nil // tool cards invalidate instead (output/expansion shape)
         }
     }
 
@@ -395,7 +412,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         var streamingRow = -1
         var streamingEntry: TranscriptEntry?
         for i in (windowStart..<windowEnd).reversed() {
-            if let e = store.entry(at: i), e.kind.isStreaming || e.id == lastStreamedID {
+            if let e = store.entry(at: i), e.kind.isStreaming || e.id == streamGate.lastStreamedID {
                 streamingRow = i - windowStart
                 streamingEntry = e
                 break
@@ -403,26 +420,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
         if let streamingEntry, streamingRow >= 0,
            case .assistantMessage(let text, let thinking, let isStreaming) = streamingEntry.kind {
-            var shouldRefresh = false
-            if lastStreamedID != streamingEntry.id {
-                // A new streaming message: show its first chunk immediately.
-                lastStreamedID = streamingEntry.id
-                lastStreamedContent = (text, thinking)
-                lastStreamedWasStreaming = isStreaming
-                shouldRefresh = true
-            } else if let last = lastStreamedContent,
-                      last.text != text || last.thinking != thinking || lastStreamedWasStreaming != isStreaming {
-                // The flag flip (streaming → final) MUST re-render even when
-                // the text is unchanged — otherwise the cell keeps the old
-                // streaming version with its blinking caret forever. Live
-                // content batches at the hard interval; final content renders
-                // immediately.
-                shouldRefresh = !isStreaming || now - lastStreamedAt >= streamBatchInterval
-            }
-            if shouldRefresh {
-                lastStreamedAt = now
-                lastStreamedContent = (text, thinking)
-                lastStreamedWasStreaming = isStreaming
+            // Batched by `StreamingRefreshGate` (a hard 0.25s cap, plus the
+            // first chunk of a new message and the streaming→final flag flip)
+            // — re-rendering per delta is the 100%-CPU path.
+            if streamGate.shouldRefresh(entryID: streamingEntry.id, text: text, thinking: thinking, isStreaming: isStreaming, now: now) {
                 rowsToRefresh.insert(streamingRow)
             }
         }
@@ -440,7 +441,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 } else {
                     // Running tool cards stream output like text; batch at the
                     // same interval so bash output doesn't repaint per delta.
-                    shouldRefresh = now - lastStreamedAt >= streamBatchInterval
+                    shouldRefresh = streamGate.shouldRefreshRunningToolCard(now: now)
                 }
             }
             if shouldRefresh {
@@ -699,12 +700,47 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let width = rowWidth(in: tableView)
 
         if cell is TextRowView {
-            // Single source of truth: identical to what heightOfRow computes on
-            // a cache miss. (One measuredHeight per batched refresh — the
-            // original 100%-CPU bug was per-DELTA with no batching; this is
-            // throttled to `streamBatchInterval`, so the cost is bounded and
-            // the cell's already-rendered pixels are still reused.)
-            let measured = entry.measuredHeight(forWidth: width)
+            let tag = Self.contentTag(for: entry)
+
+            if entry.kind.isStreaming, let textRow = cell as? TextRowView {
+                // STREAMING rows: the height comes from the cell's own layout
+                // manager, never from a full CoreText measure. The layout
+                // manager lays out incrementally (only the newly-appended
+                // characters are typeset — ~10ms per batch), whereas
+                // `measuredHeight` re-typesets the WHOLE growing text from
+                // scratch via `boundingRect`, which is pathologically slow on
+                // newline-heavy text (~400ms for 13k chars): at the 0.25s
+                // batch rate that saturated the main thread at 100% in
+                // samples. The layout-manager height IS what renders, so the
+                // table and the cell agree by construction (the measured/
+                // rendered invariant holds within the 2pt slack).
+                // Configure + lay out FIRST (the row frame is resized after;
+                // layout computes the full usedRect regardless of the frame),
+                // then read the authoritative height and re-seed the cache.
+                if heights.cached(for: entry.id, width: width)?.tag != tag {
+                    if abs(cell.frame.width - width) > 1 {
+                        cell.frame.size.width = width
+                    }
+                    configure(cell, with: entry, in: tableView)
+                    cell.layoutSubtreeIfNeeded()
+                    // +2 to match `TranscriptText.measuredHeight`'s slack so
+                    // the settled-row re-measure (boundingRect, once per
+                    // message) lands on the same height — no jump at settle.
+                    let measured = textRow.contentHeight + 2
+                    if abs(cell.frame.height - measured) > 0.5 {
+                        cell.frame.size.height = measured
+                    }
+                    heights.store(entry.id, width: width, height: measured, tag: tag)
+                }
+                return true
+            }
+
+            // Settled rows: the exact height from the authoritative measure,
+            // content-aware (cached once per content — re-measured only on
+            // genuine change, never per table query).
+            let measured = heights.height(for: entry.id, width: width, tag: tag) {
+                entry.measuredHeight(forWidth: width)
+            }
 
             // A reused cell can still hold a stale (wider) frame after a
             // window resize. Render AND measure at the real width: a stale
@@ -725,7 +761,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             configure(cell, with: entry, in: tableView)
             cell.layoutSubtreeIfNeeded()
 
-            heights.store(entry.id, width: width, height: measured)
             return true
         }
 
@@ -891,9 +926,35 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // the row's top is clipped ("cut off as if scrolled down"). Size the
         // cell to THIS row's measured height right away — the same value
         // `heightOfRow` returns — so the first layout pass is correct even if
-        // the table never re-frames the cell.
+        // the table never re-frames the cell. For a streaming row the cell is
+        // configured with the store's CURRENT content, so its height must be
+        // measured for that content (the content-tagged cache re-measures when
+        // the store has outgrown the last rendered refresh) — a plain (id,
+        // width) hit could serve the shorter height of older, already-rendered
+        // text and re-introduce the top-cut.
         let width = rowWidth(in: tableView)
-        let height = rowHeight(for: entry, width: width)
+        let height: CGFloat
+        if entry.kind.isStreaming {
+            // Streaming rows are measured from the cell's incremental layout
+            // (never a full CoreText measure — see updateVisibleCell). If the
+            // cache already holds a height for this exact content, reuse it;
+            // otherwise lay the cell out (cheap: only the new characters are
+            // typeset) and read the layout-manager height.
+            if heights.cached(for: entry.id, width: width)?.tag == Self.contentTag(for: entry),
+               let cached = heights.heightIfPresent(for: entry.id, width: width) {
+                height = cached
+            } else if let textRow = view as? TextRowView {
+                // Already configured above; lay out (incremental) and read the
+                // layout-manager height.
+                textRow.layoutSubtreeIfNeeded()
+                height = textRow.contentHeight + 2
+                heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
+            } else {
+                height = entry.measuredHeight(forWidth: width)
+            }
+        } else {
+            height = rowHeight(for: entry, width: width)
+        }
         view.frame = NSRect(x: 0, y: 0, width: width, height: height)
         return view
     }

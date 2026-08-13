@@ -513,13 +513,17 @@ Behavior details that matter:
   preflight failures (auth, rejected prompts) and a dead agent process surface
   as an error banner above the prompt bar instead of being silently swallowed.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
-  views). Streaming text is **batched** — the tail row updates at most every
-  0.25s or once ~20 new characters accumulate (a few words), never per
-  character-delta — and each batched chunk **crossfades in**, so the text
+  views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
+  tail row updates at most every 0.25s (a hard cap, never per character-delta),
+  plus immediately on a new message's first chunk and on the streaming→final
+  flag flip — and each batched chunk **crossfades in**, so the text
   materializes in word groups instead of popping character by character. The
-  streaming row's height is re-measured on each batched refresh via the same
-  `measuredHeight` function the authoritative path uses (the fast path and the
-  fallback can never disagree). The height change and the follow-scroll are
+  streaming row's height comes from the cell's own layout manager
+  (`TextRowView.contentHeight`), which lays out **incrementally** — only the
+  newly-appended characters are typeset — never from a fresh CoreText
+  `measuredHeight` of the whole growing text (a full re-typeset of a
+  newline-heavy message costs hundreds of ms and saturates the main thread at
+  the batch rate). The height change and the follow-scroll are
   applied in one atomic `CATransaction` so AppKit renders only the final
   state — content flows off the top instead of bouncing. Tool cards stream
   output with the same batching (their cached height is invalidated on every
@@ -532,10 +536,21 @@ Behavior details that matter:
   `entry.measuredHeight(forWidth:)` — feeds both `heightOfRow` (on cache
   miss) and the visible-cell refresh (`updateVisibleCell`), so the two paths
   agree by construction; the fast path stores that measured value rather than
-  seeding from the cell's own layout. Tool-card heights are invalidated on
-  every content update (they grow in place); text rows are invalidated on
-  genuine change, and `resetToTail` clears the whole cache on session switch
-  (ids are only unique within a session).
+  seeding from the cell's own layout. Streaming rows carry a **content tag**
+  (text/thinking/streaming-flag fingerprint): `heightOfRow` serves whatever
+  the renderer seeded (the table must match the cell, not the store's newer
+  unrendered content) and `updateVisibleCell`/`makeCell` re-measure only on a
+  genuine content change. Streaming rows are seeded from the cell's
+  incremental layout (`contentHeight` + the 2pt slack, so the settled-row
+  `measuredHeight` lands on the same height — no jump at settle); the full
+  CoreText measure runs once per message (on the settle refresh, then cached).
+  The re-measure-per-`heightOfRow` path from `rowHeight` and the full
+  re-typeset per batch both pegged the main thread at 100% in samples (a
+  DeepSeek "high" thinking stream and a newline-heavy markdown stream both
+  reproduced it). Tool-card heights are
+  invalidated on every content update (they grow in place); text rows are
+  invalidated on genuine change, and `resetToTail` clears the whole cache on
+  session switch (ids are only unique within a session).
 - **Cells are pre-sized at creation.** `makeCell` frames every cell to its
   row's measured height before returning it — NSTableView does not reliably
   re-frame a cell whose height changed (the width follows via autoresizing,
@@ -640,7 +655,10 @@ Two unit-test bundles, both deterministic (no pi process, no network, no
 live model):
 
 - **ClientTests** — Core-only logic: framing, request encoding, response
-  decoding, store folding, diff, sandbox policy. Links Core only.
+  decoding, store folding, diff, sandbox policy, and the streaming-refresh
+  regression (`StreamingRefreshGateTests` replays a realistic delta stream
+  through the real store + gate and asserts the refresh count is bounded by
+  the batch interval — never per delta). Links Core only.
 - **RenderingTests** — the AppKit renderer. Compiles the renderer sources
   (Client/Views/MarkdownText.swift, TextRowView.swift, CodeCopyButton.swift,
   Client/Accessibility/DisplayOptions.swift, Client/Support/FontSettings.swift)
