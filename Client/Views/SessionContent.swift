@@ -86,6 +86,7 @@ struct SessionContent: View {
 
             PromptInputView(
                 cwd: tab.cwd,
+                sessionID: tab.id,
                 isEnabled: inputEnabled(vm),
                 fontSize: FontSettings.shared.bodySize,
                 statusText: statusText(vm),

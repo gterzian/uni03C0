@@ -357,7 +357,53 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
 
     @objc private func streamScrollDidChange() {
         updateStreamingIndicator()
-        slidePasteWindow()
+        // Defer the slide out of the bounds-change notification: replacing the
+        // window's string here can land inside a layout pass (a window resize
+        // tiles the scroll view, changing the clip bounds mid-layout), mutating
+        // the text storage while the layout manager is laying out. The glyph
+        // store is left inconsistent and the next layout pass crashes in
+        // NSLayoutManager's `_replaceElements`. The next run-loop turn is
+        // imperceptibly later.
+        guard !slideScheduled else { return }
+        slideScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.slideScheduled = false
+            self?.slidePasteWindow()
+        }
+    }
+
+    /// Discards a windowed paste if one is active (the Ctrl+C / Esc abort
+    /// paths): empties the input and exits windowed mode. Returns true when a
+    /// paste was active and was cleared. Callers are event handlers and the
+    /// key monitors — never a text-system or layout callback, so the string
+    /// setter here cannot reenter a layout pass.
+    @discardableResult
+    private func abortWindowedPasteIfAny() -> Bool {
+        guard pasteActive, let textView = container?.textView else { return false }
+        textView.string = ""
+        clearPasteWindow()
+        onDraftChange("")
+        lastMirroredDraft = ""
+        onContentHeightChange(0)
+        return true
+    }
+
+    /// Called when the representable is re-targeted to a different session
+    /// (tab switch). The NSView and coordinator are reused, so the previous
+    /// session's transient input state must not leak: a windowed paste is
+    /// dropped (its `pasteActive` would disable the new session's input and
+    /// its store would submit on Enter), the completion list is dismissed, and
+    /// the new session's draft is applied deterministically — bypassing the
+    /// first-responder draft sync, which would mirror the OLD session's text
+    /// upward (the reused text view keeps first responder across the switch).
+    func prepareForSessionSwitch(draft: String, in container: PromptContainerView) {
+        dismissCompletion()
+        if pasteActive {
+            container.textView.string = ""
+            clearPasteWindow()
+        }
+        setText(draft, in: container)
+        lastMirroredDraft = draft
     }
 
     /// Esc aborts the in-flight turn (thinking + tools) whenever this window is
@@ -681,17 +727,24 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// Cooldown so the re-anchor scroll (which can land at a window edge)
     /// never immediately re-triggers a slide in the opposite direction.
     private var lastSlideTime: TimeInterval = 0
+    /// True while a window slide is scheduled for the next run-loop turn. The
+    /// slide replaces the text view's string, which must never happen inside
+    /// the bounds-change notification itself (it can fire during a layout
+    /// pass) — see `streamScrollDidChange`.
+    private var slideScheduled = false
 
     /// Enters windowed mode for a very large paste: the full text (prefix +
     /// replacement + suffix) is stored, the text view shows only the last
     /// `pasteWindowBudget` units scrolled to the bottom, and the input is
     /// disabled. Scrolling slides the window; Enter submits the full store.
-    private func beginWindowedPaste(range: NSRange, replacement: String) {
-        guard let textView, let storage = textView.textStorage else { return }
+    ///
+    /// Runs on the NEXT run-loop turn, never from inside the text system's
+    /// edit callback or a layout pass: mutating the storage reentrantly there
+    /// desyncs NSTextView's edit bookkeeping / the layout manager, which
+    /// crashes later in NSLayoutManager's `_replaceElements`.
+    private func beginWindowedPaste(prefix: String, suffix: String, replacement: String, in textView: NSTextView) {
+        guard let storage = textView.textStorage else { return }
         dismissCompletion()
-        let current = textView.string as NSString
-        let prefix = current.substring(to: range.location)
-        let suffix = current.substring(from: range.location + range.length)
         let full = prefix + replacement + suffix
 
         let start = StreamedPaste.initialWindowStart(
@@ -876,14 +929,31 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
               (replacement as NSString).length > Self.pasteWindowBudget else {
             return true
         }
+        // Never mutate the storage inside this callback, and never return NO
+        // after mutating: both desync NSTextView's edit bookkeeping and can
+        // corrupt the layout manager (crashes later in `_replaceElements`).
+        // Capture the paste and apply it on the next run-loop turn instead.
+        let current = textView.string as NSString
+        let prefix = current.substring(to: affectedCharRange.location)
+        let suffix = current.substring(from: affectedCharRange.location + affectedCharRange.length)
+        DispatchQueue.main.async { [weak self] in
+            self?.applyHugePaste(prefix: prefix, suffix: suffix, replacement: replacement)
+        }
+        return false
+    }
+
+    /// Applies a huge paste captured by `shouldChangeTextIn`, on the next
+    /// run-loop turn (the text system's edit callback has fully unwound):
+    /// windows the paste, or appends it to an already-windowed store.
+    private func applyHugePaste(prefix: String, suffix: String, replacement: String) {
+        guard let textView = container?.textView else { return }
         if pasteActive {
             // A second huge paste while one is windowed: append to the store
             // and re-window to the new tail.
             appendToPasteStore(replacement)
-            return false
+        } else {
+            beginWindowedPaste(prefix: prefix, suffix: suffix, replacement: replacement, in: textView)
         }
-        beginWindowedPaste(range: affectedCharRange, replacement: replacement)
-        return false
     }
 
     func textDidChange(_ notification: Notification) {

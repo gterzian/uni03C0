@@ -446,6 +446,30 @@ concurrency.
   stays bounded regardless of paste size — a multi-megabyte paste never
   blocks the main thread and the conversation keeps scrolling. Enter submits
   the full store.
+
+  **Windowed-paste safety rules** (each one is a past or latent crash):
+  - **No storage mutation inside the text system or a layout pass.** A huge
+    paste is captured in `shouldChangeTextIn` and applied on the next
+    run-loop turn (`applyHugePaste`); the scroll-driven window slide is
+    deferred out of the `boundsDidChangeNotification` observer the same way
+    (`slideScheduled`). Mutating `NSTextStorage` reentrantly inside those
+    callbacks desyncs the layout manager, which crashes later in
+    NSLayoutManager's `_replaceElements` during an unrelated layout pass
+    (a window resize / bar shrink) — the crash signature seen in the field.
+  - **A windowed paste is per-session state.** The representable's NSView and
+    coordinator are reused across tab switches; `sessionID` detects a switch
+    and `prepareForSessionSwitch` drops the previous session's paste (its
+    `pasteActive` would disable the new session's input and its store would
+    submit on Enter) and forces the new draft in, bypassing the
+    first-responder draft sync (which would mirror the old text upward).
+  - **Aborting the paste works from anywhere.** Ctrl+C is handled by a
+    global key monitor (like Esc), not just the text view's keyDown — the
+    input keeps focus while disabled, so the old path missed Ctrl+C whenever
+    focus was elsewhere. Esc (turn abort) also discards an active windowed
+    paste; Ctrl+C discards it without touching the agent turn. Both go
+    through `abortWindowedPasteIfAny`, which empties the input, exits
+    windowed mode, and reports the height reset — a paste that stays
+    windowed silently keeps its store and submits on Enter.
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
   read it; the transcript coordinator observes the change, clears its height
