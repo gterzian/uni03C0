@@ -105,13 +105,16 @@ struct ToolCallCardView: View {
                     .lineLimit(isExpanded ? nil : 30)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-            } else if card.state == .running {
-                // Static indicator — deliberately no ProgressView: an animated
-                // spinner inside an NSHostingView keeps its (child) SwiftUI
-                // graph invalidating every frame for the whole tool run.
+            }
+            // Running spinner: visible for the whole call, even while output
+            // streams in. An NSProgressIndicator (AppKit-driven animation),
+            // deliberately not SwiftUI's ProgressView — an animated SwiftUI
+            // spinner inside an NSHostingView keeps its (child) graph
+            // invalidating every frame for the whole tool run.
+            if card.state == .running {
                 HStack(spacing: 6) {
-                    Image(systemName: "circle.dotted")
-                        .font(.system(size: 10))
+                    SpinnerView()
+                        .frame(width: 12, height: 12)
                     Text("running…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -240,6 +243,33 @@ struct EditDiffView: View {
     /// Line budget (headers + diff lines) for the collapsed preview.
     private static let collapsedLineBudget = 14
 
+    init(operations: [EditOperation], isExpanded: Bool) {
+        self.operations = operations
+        self.isExpanded = isExpanded
+    }
+
+    /// The full diff as plain text — what the corner copy button delivers. One
+    /// block per operation, path header then unified-diff lines, so the whole
+    /// edit can be pasted back (e.g. into the prompt as steering).
+    static func diffText(_ operations: [EditOperation]) -> String {
+        operations.map { op in
+            var lines = ["--- \(op.path)"]
+            for line in TextDiff.diff(old: op.oldText, new: op.newText) {
+                switch line.kind {
+                case .removed: lines.append("-" + line.text)
+                case .added: lines.append("+" + line.text)
+                case .same: lines.append(" " + line.text)
+                }
+            }
+            return lines.joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    @State private var copied = false
+    /// Bumped on every copy so a stale reset (superseded by a newer copy)
+    /// never flips the icon back early.
+    @State private var copyGeneration = 0
+
     private enum DiffRow: Hashable {
         case path(String)
         case line(DiffLine)
@@ -249,6 +279,20 @@ struct EditDiffView: View {
         let rows = buildRows()
         let shown = isExpanded ? rows : Array(rows.prefix(Self.collapsedLineBudget))
         VStack(alignment: .leading, spacing: 0) {
+            // Header row: the corner copy button (copies the FULL diff — the
+            // whole block, not just the visible preview). High-priority so it
+            // never toggles the card's expand/collapse.
+            HStack {
+                Spacer()
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                    .help(copied ? "Copied" : "Copy diff")
+                    .highPriorityGesture(TapGesture().onEnded { copyDiff() })
+            }
             ForEach(Array(shown.enumerated()), id: \.offset) { _, row in
                 rowView(row)
             }
@@ -258,6 +302,21 @@ struct EditDiffView: View {
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 2)
             }
+        }
+    }
+
+    private func copyDiff() {
+        let text = Self.diffText(operations)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        copied = true
+        let generation = copyGeneration + 1
+        copyGeneration = generation
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.2))
+            guard copyGeneration == generation else { return }
+            copied = false
         }
     }
 
@@ -307,4 +366,22 @@ struct EditDiffView: View {
         .padding(.vertical, 0.5)
         .background(background)
     }
+}
+
+/// An animated spinner for the running-tool indicator. Deliberately NOT
+/// SwiftUI's `ProgressView`: an animated SwiftUI spinner inside an
+/// `NSHostingView` keeps its (child) SwiftUI graph invalidating every frame
+/// for the whole tool run (and the row's `sizeThatFits` measurement with it).
+/// `NSProgressIndicator` animates on its own AppKit timer and never touches
+/// the SwiftUI graph.
+struct SpinnerView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSProgressIndicator {
+        let indicator = NSProgressIndicator()
+        indicator.style = .spinning
+        indicator.controlSize = .small
+        indicator.startAnimation(nil)
+        return indicator
+    }
+
+    func updateNSView(_ nsView: NSProgressIndicator, context: Context) {}
 }

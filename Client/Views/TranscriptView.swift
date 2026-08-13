@@ -193,6 +193,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         sv.onUserScroll = { [weak self] in
             guard let self, let window = self.tableView.window,
                   window.firstResponder !== self.tableView else { return }
+            // Don't steal focus while the find bar is up: typing in the search
+            // field must keep working even as the transcript scrolls under it.
+            if self.viewModel?.isSearchVisible == true { return }
             window.makeFirstResponder(self.tableView)
         }
 
@@ -220,6 +223,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
         }
+        viewModel.onSearchJump = { [weak self] storeIndex in
+            self?.scrollToStoreIndex(storeIndex)
+        }
         let store = viewModel.store
         lastGeneration = store.currentGeneration
         windowStart = max(0, store.count - initialChunkRows())
@@ -236,9 +242,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     func rebind(viewModel: SessionViewModel) {
         self.viewModel?.onTranscriptChange = nil
+        self.viewModel?.onSearchJump = nil
         self.viewModel = viewModel
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
+        }
+        viewModel.onSearchJump = { [weak self] storeIndex in
+            self?.scrollToStoreIndex(storeIndex)
         }
         resetToTail(viewModel.store)
     }
@@ -259,11 +269,28 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let store = viewModel?.store else { return 24 }
         let storeIndex = windowStart + row
         guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
-        let width = rowWidth(in: tableView)
-        let height = heights.height(for: entry.id, width: width) {
+        return rowHeight(for: entry, width: rowWidth(in: tableView))
+    }
+
+    /// The height the table should use for a row. Settled rows go through the
+    /// (id, width) height cache; STREAMING rows never trust it — their cached
+    /// height lags the content between the 0.25s stream-batch refreshes, and
+    /// serving the stale height renders the row short while the text has
+    /// already wrapped taller: the text view overflows the row UPWARD and the
+    /// message's top is clipped (the top-cut). A streaming row is measured
+    /// fresh and the cache re-seeded, so the row and every cell made from it
+    /// agree on the CURRENT content. Cost is bounded: the table asks heights
+    /// on layout/scroll (not per delta), and the only streaming row is the
+    /// turn's tail.
+    private func rowHeight(for entry: TranscriptEntry, width: CGFloat) -> CGFloat {
+        if entry.kind.isStreaming {
+            let height = entry.measuredHeight(forWidth: width)
+            heights.store(entry.id, width: width, height: height)
+            return height
+        }
+        return heights.height(for: entry.id, width: width) {
             entry.measuredHeight(forWidth: width)
         }
-        return height
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
@@ -735,6 +762,44 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
+    /// Jumps the transcript to a store index (a search match). The store holds
+    /// the FULL conversation, so a match above the materialized window just
+    /// needs rows materialized — no RPC round trip. Fetches history so the
+    /// match lands below a buffer (fluid scrolling up from it), keeps the
+    /// streaming tail (the full bottom) in the window, then scrolls the row
+    /// into the middle of the viewport.
+    func scrollToStoreIndex(_ storeIndex: Int) {
+        guard let store = viewModel?.store, store.count > 0 else { return }
+        let clamped = min(max(0, storeIndex), store.count - 1)
+        if clamped < windowStart {
+            // The match is above the materialized window: prepend history in
+            // one go so the match sits `buffer` rows below the new top (the
+            // same re-anchor-free prepend as the compounding fetch, but
+            // targeted — the destination is the match row, not the old
+            // viewport).
+            let buffer = max(viewportRows() * 2, 40)
+            let targetStart = max(0, clamped - buffer)
+            let fetched = windowStart - targetStart
+            guard fetched > 0 else { return }
+            windowStart = targetStart
+            tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
+            tableView.tile()
+            // The compounding block restarts small: this fetch covered the gap.
+            fetchBlock = max(initialChunkRows() / 2, 20)
+        }
+        let row = clamped - windowStart
+        guard row >= 0, row < (windowEnd - windowStart) else { return }
+        // A search jump is a deliberate position — stop following; the user
+        // returning to the bottom re-engages it.
+        isFollowing = false
+        tableView.tile()
+        let rowRect = tableView.rect(ofRow: row)
+        let targetY = rowRect.midY - scrollView.contentView.bounds.height / 2
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        lastVisibleMaxY = scrollView.documentVisibleRect.maxY
+    }
+
     // MARK: - Cells
 
     private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
@@ -775,12 +840,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // text view at the stale short height: the text overflows upward and
         // the row's top is clipped ("cut off as if scrolled down"). Size the
         // cell to THIS row's measured height right away — the same value
-        // `heightOfRow` returns, via the shared cache — so the first layout
-        // pass is correct even if the table never re-frames the cell.
+        // `heightOfRow` returns — so the first layout pass is correct even if
+        // the table never re-frames the cell.
         let width = rowWidth(in: tableView)
-        let height = heights.height(for: entry.id, width: width) {
-            entry.measuredHeight(forWidth: width)
-        }
+        let height = rowHeight(for: entry, width: width)
         view.frame = NSRect(x: 0, y: 0, width: width, height: height)
         return view
     }

@@ -50,6 +50,21 @@ struct SessionContent: View {
                     .padding(.top, 8)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
+                if vm.isSearchVisible {
+                    VStack {
+                        SessionSearchBar(vm: vm)
+                        Spacer()
+                    }
+                    .padding(.top, 8)
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                }
+                // Cmd+F toggles the find bar (hidden: just the shortcut).
+                Button("") { vm.toggleSearch() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
             }
 
             Divider()
@@ -109,6 +124,73 @@ struct SessionContent: View {
             if case .disconnected(let message) = state {
                 AccessibilityNotification.Announcement(Announcements.disconnected(message)).post()
             }
+        }
+    }
+
+    /// The find bar over the transcript: searches the SESSION's store data
+    /// (every folded row, materialized or not), Enter cycles forward,
+    /// Shift+Enter backward, Esc closes. The transcript scrolls to each match,
+    /// pulling older history into the window as needed.
+    private struct SessionSearchBar: View {
+        @Bindable var vm: SessionViewModel
+        @FocusState private var focused: Bool
+
+        var body: some View {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                TextField("Search this session…", text: $vm.searchQuery)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($focused)
+                    .onSubmit { vm.nextSearchMatch() }
+                    .onExitCommand { vm.closeSearch() }
+                    .onChange(of: vm.searchQuery) { _, q in vm.updateSearchQuery(q) }
+                let trimmed = vm.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    EmptyView()
+                } else if vm.searchMatches.isEmpty {
+                    Text("no matches")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(vm.searchCurrentIndex + 1)/\(vm.searchMatches.count)")
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .help(LocalizedStringKey(vm.searchMatches.indices.contains(vm.searchCurrentIndex)
+                            ? vm.searchMatches[vm.searchCurrentIndex].snippet
+                            : ""))
+                }
+                Button { vm.previousSearchMatch() } label: {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(vm.searchMatches.isEmpty)
+                .help("Previous match (⇧↩)")
+                Button { vm.nextSearchMatch() } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(vm.searchMatches.isEmpty)
+                .help("Next match (↩)")
+                Button { vm.closeSearch() } label: {
+                    Image(systemName: "xmark.circle")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Close (esc)")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .onAppear { focused = true }
         }
     }
 

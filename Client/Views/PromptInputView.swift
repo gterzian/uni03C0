@@ -73,10 +73,23 @@ struct PromptInputView: NSViewRepresentable {
         // (the full text) legitimately differs, so the sync is suppressed and
         // the window is never clobbered.
         if !context.coordinator.pasteActive, draft != context.coordinator.lastMirroredDraft {
-            context.coordinator.setText(draft, in: nsView)
-            // Re-seed with the draft's own value (same buffer as the owning
-            // view's copy) so the fast path holds across re-renders.
-            context.coordinator.lastMirroredDraft = draft
+            if nsView.window?.firstResponder === nsView.textView {
+                // The user is actively editing: the text view is authoritative
+                // and must never be clobbered — a reset moves the caret to the
+                // end and re-applies the whole string, which reads as a flash
+                // of the text (and can happen on any desync, e.g. a state
+                // update racing a keystroke). Re-sync the mirror and the draft
+                // FROM the real text instead; the next keystroke keeps them in
+                // lockstep.
+                let actual = nsView.textView.string
+                context.coordinator.onDraftChange(actual)
+                context.coordinator.lastMirroredDraft = actual
+            } else {
+                context.coordinator.setText(draft, in: nsView)
+                // Re-seed with the draft's own value (same buffer as the owning
+                // view's copy) so the fast path holds across re-renders.
+                context.coordinator.lastMirroredDraft = draft
+            }
         }
         // One-shot restores: append the queued text at the end (push-back).
         // Guarded by the request id so a re-render never appends twice.
@@ -340,8 +353,17 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             // whole session and would otherwise swallow every Esc.
             guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
             // Prompt input has focus: its own Esc handling (completion → abort)
-            // runs; don't fire the abort twice.
-            if window.firstResponder === container.textView { return event }
+            // runs; don't fire the abort twice. Likewise any OTHER text field
+            // being edited (the session search bar) uses Esc for its own
+            // dismissal — the abort stays reserved for non-editing focus (the
+            // transcript, toolbar, empty window chrome). A field editor's
+            // delegate is its NSTextField; the transcript rows' text views are
+            // plain text views, so they fall through and Esc still aborts from
+            // there.
+            if let editor = window.firstResponder as? NSTextView {
+                if editor === container.textView { return event }
+                if editor.delegate is NSTextField { return event }
+            }
             self.onAbort()
             // After aborting, focus the prompt input so typing can start
             // immediately (the next Return sends, or queues as steering if the

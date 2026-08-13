@@ -93,6 +93,52 @@ public final class TranscriptStore: @unchecked Sendable {
         return Array(_entries[clamped])
     }
 
+    // MARK: - Search (full conversation, not the view window)
+
+    /// One search hit: the store index of the matching row plus a short
+    /// context snippet. `storeIndex` is what the coordinator scrolls to (and
+    /// materializes history for); it is stable while the session doesn't
+    /// change, which is fine for a find-style interaction.
+    public struct SearchMatch: Sendable, Equatable {
+        public let storeIndex: Int
+        public let rowID: String
+        public let snippet: String
+
+        public init(storeIndex: Int, rowID: String, snippet: String) {
+            self.storeIndex = storeIndex
+            self.rowID = rowID
+            self.snippet = snippet
+        }
+    }
+
+    /// Searches the FULL conversation — every folded row, including history
+    /// the view has not materialized — for `query`, case-insensitive, in each
+    /// row's `searchableText`. Returns matches in store order.
+    public func search(_ query: String) -> [SearchMatch] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        var matches: [SearchMatch] = []
+        for (index, entry) in _entries.enumerated() {
+            let haystack = entry.searchableText
+            guard !haystack.isEmpty else { continue }
+            guard let range = haystack.range(of: q, options: [.caseInsensitive]) else { continue }
+            matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: range)))
+        }
+        return matches
+    }
+
+    /// A short single-line context snippet around the first hit in `text`.
+    private static func snippet(of text: String, around range: Range<String.Index>, radius: Int = 48) -> String {
+        let start = text.index(range.lowerBound, offsetBy: -radius, limitedBy: text.startIndex) ?? text.startIndex
+        let end = text.index(range.upperBound, offsetBy: radius, limitedBy: text.endIndex) ?? text.endIndex
+        var result = String(text[start..<end]).replacingOccurrences(of: "\n", with: " ")
+        if start > text.startIndex { result = "…" + result }
+        if end < text.endIndex { result += "…" }
+        return result
+    }
+
     // MARK: - Off-main entry points
 
     /// Folds one RPC frame into the transcript. Returns true if it mutated the

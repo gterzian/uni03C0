@@ -62,6 +62,100 @@ public final class SessionViewModel {
     /// directly.
     public var onTranscriptChange: (() -> Void)?
 
+    // MARK: - Per-session search
+
+    /// True while the find bar is shown over the transcript (Cmd+F toggles).
+    public var isSearchVisible = false
+    /// The current query (the find bar's text, kept per session).
+    public var searchQuery = ""
+    /// The live match list, in store order — always the FULL conversation
+    /// (`TranscriptStore.search` scans the store, never the view window).
+    public private(set) var searchMatches: [TranscriptStore.SearchMatch] = []
+    /// Index into `searchMatches` of the current match; -1 when there are none.
+    public private(set) var searchCurrentIndex = -1
+    /// AppKit-side hook: called with the store index of the current match so
+    /// the coordinator can materialize history and scroll the row into view.
+    public var onSearchJump: ((Int) -> Void)?
+
+    private var searchTask: Task<Void, Never>?
+    /// The query the current match list was computed for (Enter re-runs the
+    /// search when the text has changed since the last debounce).
+    private var lastSearchedQuery = ""
+
+    /// Toggles the find bar. Closing it clears the match state and returns the
+    /// transcript to the user's own position.
+    public func toggleSearch() {
+        if isSearchVisible {
+            closeSearch()
+        } else {
+            isSearchVisible = true
+        }
+    }
+
+    public func closeSearch() {
+        isSearchVisible = false
+        searchTask?.cancel()
+        searchTask = nil
+        searchMatches = []
+        searchCurrentIndex = -1
+    }
+
+    /// Live search as the query is typed, debounced (a keystroke must not
+    /// lock the store per character on a large session).
+    public func updateSearchQuery(_ query: String) {
+        searchQuery = query
+        searchTask?.cancel()
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            self?.runSearch(query)
+        }
+    }
+
+    /// Runs the search now (Enter / debounce). Keeps the current match index
+    /// when it is still valid, otherwise restarts at the first match.
+    public func runSearch(_ query: String) {
+        searchTask?.cancel()
+        searchTask = nil
+        searchQuery = query
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches = trimmed.isEmpty ? [] : store.search(trimmed)
+        searchMatches = matches
+        if matches.isEmpty {
+            searchCurrentIndex = -1
+        } else if !matches.indices.contains(searchCurrentIndex) {
+            searchCurrentIndex = 0
+        }
+        lastSearchedQuery = trimmed
+        jumpToCurrentMatch()
+    }
+
+    /// Enter: cycle to the next match, wrapping. Re-runs the search first when
+    /// the query changed since the last run (e.g. Enter before the debounce
+    /// fired).
+    public func nextSearchMatch() {
+        advanceSearchMatch(by: 1)
+    }
+
+    /// Shift+Enter: cycle to the previous match, wrapping.
+    public func previousSearchMatch() {
+        advanceSearchMatch(by: -1)
+    }
+
+    private func advanceSearchMatch(by delta: Int) {
+        if lastSearchedQuery != searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) {
+            runSearch(searchQuery)
+        }
+        guard !searchMatches.isEmpty else { return }
+        searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+        jumpToCurrentMatch()
+    }
+
+    private func jumpToCurrentMatch() {
+        guard searchMatches.indices.contains(searchCurrentIndex) else { return }
+        onSearchJump?(searchMatches[searchCurrentIndex].storeIndex)
+    }
+
     /// Accessibility hook: called when an agent run settles (the whole turn,
     /// including tool rounds, finished). The view layer posts an announcement
     /// so a VoiceOver user knows the work is done.

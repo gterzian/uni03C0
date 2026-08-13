@@ -29,6 +29,7 @@
 		5BACCC46FC1BAAEF0BA94ED7 /* ProjectPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81F56B6989F31097F8D54DDB /* ProjectPickerView.swift */; };
 		5D3E9224FDD0BD9BE3FB4E11 /* FontSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = C06D3D3454A4ACFE68639AB6 /* FontSettings.swift */; };
 		5E3DEC8754978C64E4608DFC /* Core.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BC124C9BC1141DC93680F43A /* Core.framework */; };
+		5EF6522FA3124DA0B1335D9D /* TranscriptStoreSearchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FE264AAF525D70A48444631 /* TranscriptStoreSearchTests.swift */; };
 		5FDF8CAC28794577193FE2DE /* Core.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BC124C9BC1141DC93680F43A /* Core.framework */; };
 		633FAF49AA6FD9865E697FDE /* Core.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = BC124C9BC1141DC93680F43A /* Core.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		66176EC70739B1A43E661F2A /* Subprocess in Frameworks */ = {isa = PBXBuildFile; productRef = 8A007F55DA2258B2239A6F73 /* Subprocess */; };
@@ -168,6 +169,7 @@
 		172077ABDC48B8EB203CD688 /* TranscriptStoreEditToolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptStoreEditToolTests.swift; sourceTree = "<group>"; };
 		1CA955A11D2F9C71C7EA073D /* ToolCardExpansion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolCardExpansion.swift; sourceTree = "<group>"; };
 		1CF13D5F4168FEFAEC3BC714 /* TextDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextDiffTests.swift; sourceTree = "<group>"; };
+		1FE264AAF525D70A48444631 /* TranscriptStoreSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptStoreSearchTests.swift; sourceTree = "<group>"; };
 		20703B000533DDF356FD05B7 /* TranscriptTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptTextTests.swift; sourceTree = "<group>"; };
 		20A9063F40259227694025E1 /* SandboxLauncher */ = {isa = PBXFileReference; includeInIndex = 0; path = SandboxLauncher; sourceTree = BUILT_PRODUCTS_DIR; };
 		22B4EE74B2D2D1EE59089DD3 /* MarkdownTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextTests.swift; sourceTree = "<group>"; };
@@ -284,6 +286,7 @@
 				382EA95199A6AB2ACEFF09CB /* ToolCardExpansionTests.swift */,
 				172077ABDC48B8EB203CD688 /* TranscriptStoreEditToolTests.swift */,
 				81CF7561CE9F8864034D30A2 /* TranscriptStoreErrorTests.swift */,
+				1FE264AAF525D70A48444631 /* TranscriptStoreSearchTests.swift */,
 				03D7099A391CB01B85999932 /* TranscriptStoreTests.swift */,
 				F5FA89EAE0CA9AF56B66185D /* WhitelistTests.swift */,
 			);
@@ -667,6 +670,7 @@
 				377B63879619BEE7C5FB74D5 /* ToolCardExpansionTests.swift in Sources */,
 				E742424526B8EF7BB0E36F1B /* TranscriptStoreEditToolTests.swift in Sources */,
 				9987C6BF3BC795FEA682EA95 /* TranscriptStoreErrorTests.swift in Sources */,
+				5EF6522FA3124DA0B1335D9D /* TranscriptStoreSearchTests.swift in Sources */,
 				B6FC1CD1020277747D0781A2 /* TranscriptStoreTests.swift in Sources */,
 				A3621F899A4A6B1FC498AA10 /* WhitelistTests.swift in Sources */,
 			);

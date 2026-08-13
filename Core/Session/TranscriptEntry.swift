@@ -77,6 +77,23 @@ public struct ToolCallCard: Hashable, Sendable, Identifiable {
 }
 
 public extension TranscriptEntry {
+    /// The searchable text of the row — everything a user could want to find:
+    /// message text, thinking, tool name/args/output, error text. Joined with
+    /// newlines so a query spanning fields still matches. Purely data (never
+    /// rendered); the per-session search scans this, not the view window.
+    var searchableText: String {
+        switch kind {
+        case .userMessage(let text):
+            return text
+        case .assistantMessage(let text, let thinking, _):
+            return [thinking, text].filter { !$0.isEmpty }.joined(separator: "\n")
+        case .toolCall(let card):
+            return [card.toolName, card.arguments, card.output].filter { !$0.isEmpty }.joined(separator: "\n")
+        case .errorMessage(let text), .abortedMessage(let text):
+            return text
+        }
+    }
+
     /// Attaches tool-result output to a tool-call card (used when rebuilding
     /// history from `get_messages`, where tool results arrive as later
     /// user/toolResult messages).

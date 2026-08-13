@@ -107,6 +107,41 @@ TUI. The thinking-level menu offers exactly the levels pi reports via
 The RPC wire protocol is the single source of truth — the app holds nothing in
 parallel that it doesn't derive from the event stream.
 
+## Stable session data (provider prompt cache)
+
+The provider caches the session's prompt prefix, so the request bytes must
+stay identical whether the session is driven from the app or the TUI. pi owns
+the session data; the app is a read-only mirror. **No future code change may
+alter what pi records or what it sends to the provider.** The rules that keep
+this true:
+
+- **The app never writes session data.** pi writes `~/.pi/agent/sessions/…`;
+the app only reads it, and only through pi's read-only RPCs (`get_state`,
+`get_messages`, `get_session_stats`, `get_available_models`,
+`get_available_thinking_levels`). `TranscriptStore` is a local mirror of the
+event stream: it folds frames and rebuilds from `get_messages`, and it must
+never send, reorder, or rewrite anything.
+- **Only the commands pi's TUI sends, for the same user actions.** A new
+state-changing RPC (`prompt`, `set_model`, `set_thinking_level`, `abort`,
+`switch_session`) needs the same justification the TUI has for it. The model
+and thinking level are never forced or auto-changed; a session starts exactly
+as pi's own defaults would.
+- **A prompt is the user's text, verbatim.** The only transformation is
+whitespace trimming (pi's TUI trims identically). No re-sends, no retries, no
+duplicates — `ProcessController.send` writes each request exactly once. The
+full pasted text is what is submitted; windowed pastes are a view-only
+optimization.
+- **Rendering caches are pure UI.** `HeightCache`, tool-card expansion, text
+measurement, fonts, diffs — in-memory layout data, never serialized, sent, or
+written, and nothing derived from them may feed back into what pi records.
+- **The one deliberate deviation stays deterministic and append-only.**
+Queued steering is flushed as ONE combined prompt (the TUI records each
+queued message separately). Each flush appends exactly one new user message
+in order — never re-sends, never splits, never reorders.
+
+When adding a feature, ask: does this change what pi would record or send for
+the same user actions? If yes, it breaks the stable prefix — find another way.
+
 ## Sandbox
 
 Every pi subprocess runs inside a **Seatbelt sandbox** (default-deny), built
