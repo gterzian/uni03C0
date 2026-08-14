@@ -24,11 +24,17 @@ final class SandboxSettingsModel {
     var current: SandboxSettings {
         SandboxSettings(
             readOnlyPaths: SandboxSettings.parse(readOnlyPathsText),
-            allowedHosts: SandboxSettings.parse(allowedHostsText)
+            allowedHosts: SandboxSettings.parseHosts(allowedHostsText)
         )
     }
 
     func save() {
-        current.save()
+        let settings = current
+        settings.save()
+        // Reflect the normalized hosts back into the editor, so a pasted URL
+        // (https://example.com/path) visibly becomes the stored bare domain
+        // (example.com) after saving — immediate confirmation it was read
+        // correctly. Paths are left untouched (parse only trims them).
+        allowedHostsText = SandboxSettings.serialize(settings.allowedHosts)
     }
 }

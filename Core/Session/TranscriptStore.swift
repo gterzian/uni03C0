@@ -424,20 +424,24 @@ public final class TranscriptStore: @unchecked Sendable {
     }
 
     private func finalizeAssistant(_ message: AgentMessage) {
+        let blocks = message.content ?? []
         // An aborted/error/truncated turn leaves any in-flight tool card
         // `.running` — pi sends no `tool_execution_end` for an interrupted
         // tool, so the card's spinner would animate forever. Settle
-        // interrupted cards here. NOT at a tool-use step's `message_end`
-        // (stopReason "tool_use"): its card is legitimately running, created
-        // at `toolcall_end` before `tool_execution_start` starts it.
-        if message.stopReason != "tool_use" {
+        // interrupted cards here. NOT at a tool-use step's `message_end`: the
+        // card is legitimately running, created at `toolcall_end` before
+        // `tool_execution_start` starts it. The test is "does the message
+        // carry tool calls" — NOT the stopReason string, which providers
+        // spell differently ("tool_use" vs openai-completions' "toolUse"); a
+        // string check that misses the provider's spelling flashes every
+        // running card as `.failed` at the start of a tool round.
+        if !blocks.contains(where: { $0.isToolCall }) {
             settleInterruptedToolCalls()
         }
         guard let id = streamingEntryID,
               let index = _entries.lastIndex(where: { $0.id == id }) else { return }
         var entry = _entries[index]
         guard case .assistantMessage(_, _, _) = entry.kind else { return }
-        let blocks = message.content ?? []
         let text = blocks.filter { $0.type == "text" }.compactMap { $0.text }.joined(separator: "\n\n")
         let thinking = blocks.filter { $0.type == "thinking" }.compactMap { $0.thinking }.joined(separator: "\n")
         entry.kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)

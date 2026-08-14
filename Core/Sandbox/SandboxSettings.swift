@@ -90,6 +90,7 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             // there, not under github.com.
             "github.com",
             "githubusercontent.com",
+            "github.io",                  // GitHub Pages (docs sites, project pages)
             "crates.io",                 // cargo registry
             "npmjs.org",                 // npm registry
             "pypi.org",                  // pip
@@ -117,6 +118,18 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
         let hosts = defaults.stringArray(forKey: hostsKey) ?? []
         if paths.isEmpty && hosts.isEmpty { return Self.defaults }
         var settings = SandboxSettings(readOnlyPaths: paths, allowedHosts: hosts)
+        // Normalize stored host entries: a URL pasted into the domains field
+        // (https://example.com/path) must be enforced as its bare host
+        // (example.com). Any raw entries written by an earlier app version are
+        // cleaned here once, so they take effect without waiting for a re-save.
+        let normalizedHosts = Self.dedupe(settings.allowedHosts.compactMap { host in
+            let normalized = Self.normalizeHost(host)
+            return normalized.isEmpty ? nil : normalized
+        })
+        if normalizedHosts != settings.allowedHosts {
+            settings.allowedHosts = normalizedHosts
+            settings.save()
+        }
         // One-shot migration: saved lists written by an older app version may
         // predate default entries added since (e.g. ~/Library/Developer for
         // Xcode builds — without it xcodebuild cannot write DerivedData inside
@@ -150,6 +163,59 @@ public struct SandboxSettings: Sendable, Equatable, Codable {
             if trimmed.isEmpty || trimmed.hasPrefix("#") { return nil }
             return trimmed
         }
+    }
+
+    /// Parses one host per line for the allowed-domains field. Accepts bare
+    /// domains, `host:port`, and full URLs — whatever the user pastes — and
+    /// reduces each line to its bare lowercase host (scheme, userinfo, port,
+    /// path, query and fragment stripped). Blank lines and `#` comments are
+    /// dropped, as are lines that yield no host.
+    public static func parseHosts(_ text: String) -> [String] {
+        dedupe(text.split(separator: "\n").compactMap { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { return nil }
+            let host = normalizeHost(trimmed)
+            return host.isEmpty ? nil : host
+        })
+    }
+
+    /// Reduces a pasted entry — full URL, bare domain, `host:port`, or
+    /// `[v6]:port` — to its bare lowercase hostname. Returns "" when nothing
+    /// host-like remains (so the line is dropped by `parseHosts`).
+    public static func normalizeHost(_ entry: String) -> String {
+        var s = entry.trimmingCharacters(in: .whitespaces).lowercased()
+        // Strip the scheme: "https://example.com/path" → "example.com/path".
+        if let scheme = s.range(of: "://") {
+            s = String(s[scheme.upperBound...])
+        }
+        // Strip userinfo: "user:pass@example.com" → "example.com".
+        if let at = s.lastIndex(of: "@") {
+            s = String(s[s.index(after: at)...])
+        }
+        // Cut path / query / fragment.
+        for marker in ["/", "?", "#"] {
+            if let idx = s.firstIndex(of: Character(marker)) {
+                s = String(s[..<idx])
+            }
+        }
+        // Strip a ":port" (or "[v6]:port") suffix.
+        if s.hasPrefix("[") {
+            if let end = s.firstIndex(of: "]") {
+                s = String(s[s.index(after: s.startIndex)..<end])
+            }
+        } else if s.filter({ $0 == ":" }).count == 1, let colon = s.lastIndex(of: ":") {
+            let after = s[s.index(after: colon)...]
+            if !after.isEmpty && after.allSatisfy(\.isNumber) {
+                s = String(s[..<colon])
+            }
+        }
+        return s
+    }
+
+    /// Ordered-unique: keeps first occurrences, drops later duplicates.
+    private static func dedupe(_ entries: [String]) -> [String] {
+        var seen = Set<String>()
+        return entries.filter { seen.insert($0).inserted }
     }
 
     public static func serialize(_ entries: [String]) -> String {
