@@ -25,11 +25,16 @@ public actor WhitelistProxy {
     }
 
     /// Host whitelist: exact match or any subdomain, case-insensitive.
+    /// Entries are normalized to bare lowercase hosts (scheme, port and path
+    /// stripped) so a pasted URL like `https://example.com/path` is enforced
+    /// as `example.com` — regardless of whether it was cleaned at save time.
     public struct Whitelist: Sendable, Equatable {
         public var hosts: [String]
 
         public init(hosts: [String]) {
-            self.hosts = hosts.map(Self.normalizeHost)
+            self.hosts = hosts
+                .map(SandboxSettings.normalizeHost)
+                .filter { !$0.isEmpty }
         }
 
         public func allows(_ rawHost: String) -> Bool {
