@@ -32,8 +32,11 @@ import SwiftUI
 ///   larger (compounding), so sustained scrolling eventually pulls the entire
 ///   conversation into memory.
 ///
-/// Session switch / reload is a store `generation` bump → full reload
-/// positioned at the tail.
+/// Tab switch to a visited session restores its materialized window and
+/// viewport position (each session's position is captured on the way out and
+/// restored on return — see `saveCurrentSessionState`/`restoreScrollState`); a
+/// first visit or a same-session reload (`store` `generation` bump) is a full
+/// reload positioned at the tail.
 struct TranscriptView: NSViewRepresentable {
     let viewModel: SessionViewModel
 
@@ -50,6 +53,20 @@ struct TranscriptView: NSViewRepresentable {
             context.coordinator.rebind(viewModel: viewModel)
         }
     }
+}
+
+/// One session's transcript position, captured when the user switches away and
+/// restored when they switch back. The window is the coordinator's
+/// materialized `[windowStart, windowEnd)` of store indices; the viewport is
+/// anchored by the first visible store index plus its pixel offset from the
+/// viewport's top edge, so the restoration is robust to anything that
+/// streamed or re-measured while the session was in the background.
+private struct SessionScrollState {
+    var windowStart: Int
+    var isFollowing: Bool
+    var anchorStoreIndex: Int?
+    var anchorPixelOffset: CGFloat
+    var fetchBlock: Int
 }
 
 // MARK: - Coordinator
@@ -80,9 +97,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// itself lives in `StreamingRefreshGate` (Core) so it is unit-testable
     /// with the same code the app runs.
     private var streamGate = StreamingRefreshGate(batchInterval: 0.25)
-    /// Coalesced async scroll-to-bottom (tile + scroll happen once per run-loop
-    /// turn at most, after the table has laid out).
-    private var scrollToBottomPending = false
+    /// Coalesced async scroll-to-bottom / scroll-to-anchor (tile + scroll
+    /// happen once per run-loop turn at most, after the table has laid out).
+    private var positionPending = false
+
+    /// Each visited session's transcript position, keyed like `heightsBySession`
+    /// (by `ObjectIdentifier`). Captured on rebind when the user switches away;
+    /// restored when they switch back — a tab switch never dumps a visited
+    /// session at the tail. Bounded by the same LRU as `heightsBySession`
+    /// (pruned in `activateSessionCache`).
+    private var scrollStateBySession: [ObjectIdentifier: SessionScrollState] = [:]
 
     /// The materialized window over store indices: table row `r` displays
     /// `store.entry(at: windowStart + r)`. `windowEnd` only ever increases —
@@ -256,6 +280,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func rebind(viewModel: SessionViewModel) {
+        // Capture the session we're leaving BEFORE swapping it out: switching
+        // back to it must land on the same window + viewport, not the tail.
+        saveCurrentSessionState()
         self.viewModel?.onTranscriptChange = nil
         self.viewModel?.onSearchJump = nil
         self.viewModel?.onSearchResultsChanged = nil
@@ -270,7 +297,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel.onSearchResultsChanged = { [weak self] in
             self?.refreshSearchHighlight()
         }
-        resetToTail(viewModel.store)
+        if let saved = scrollStateBySession[ObjectIdentifier(viewModel)] {
+            restoreScrollState(saved, store: viewModel.store)
+        } else {
+            // First visit (or a session whose state was pruned/cleared): start
+            // at the tail, exactly as before.
+            resetToTail(viewModel.store)
+        }
     }
 
     /// Points `heights` at the cache for `session`, creating it on first
@@ -292,6 +325,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         while sessionLRU.count > maxCachedSessions {
             let evicted = sessionLRU.removeFirst()
             heightsBySession.removeValue(forKey: evicted)
+            scrollStateBySession.removeValue(forKey: evicted)
         }
     }
 
@@ -421,6 +455,30 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             }
             tableView.insertRows(at: IndexSet(integersIn: tableRange), withAnimation: [])
             didAppend = true
+        }
+
+        // Turn-end tool-card settles (abort/error/truncation): the store
+        // flips any in-flight tool card from `.running` to `.failed` in place
+        // (pi sends no `tool_execution_end` for an interrupted tool). The card
+        // may not be the tail — a notice row can follow it — so refresh every
+        // VISIBLE card whose rendered state no longer matches the store
+        // (off-screen rows re-render with the new state when scrolled into
+        // view). This must run even when NOT following: the user may be
+        // reading history while a command runs and aborts it.
+        let visibleRows = tableView.rows(in: tableView.visibleRect)
+        if visibleRows.length > 0 {
+            let visibleRange = visibleRows.location..<(visibleRows.location + visibleRows.length)
+            for row in visibleRange {
+                let storeIndex = windowStart + row
+                guard let entry = store.entry(at: storeIndex),
+                      case .toolCall(let card) = entry.kind,
+                      card.state != .running,
+                      let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ToolCallHostView,
+                      cell.renderedCardID == card.id,
+                      cell.renderedCardState != card.state else { continue }
+                updateVisibleCell(at: row, with: entry)
+                tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
+            }
         }
 
         // Deliberately NO jump-to-bottom on send: the scroll stays exactly
@@ -680,6 +738,90 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
+    // MARK: - Per-session scroll position
+
+    /// Captures the current session's window and viewport position so a later
+    /// tab switch back to it restores exactly where the user left off. Called
+    /// on every rebind BEFORE the view model is swapped. The viewport is
+    /// anchored by the first visible store index plus its pixel offset from
+    /// the viewport's top edge, so restoration is robust to height changes
+    /// (streaming rows, re-measures) that happened while the session was away.
+    private func saveCurrentSessionState() {
+        guard let viewModel else { return }
+        let key = ObjectIdentifier(viewModel)
+        let visible = tableView.rows(in: tableView.visibleRect)
+        var anchorStoreIndex: Int?
+        var anchorPixelOffset: CGFloat = 0
+        if visible.length > 0 {
+            let row = visible.location
+            anchorStoreIndex = windowStart + row
+            anchorPixelOffset = tableView.rect(ofRow: row).origin.y - tableView.visibleRect.origin.y
+        }
+        scrollStateBySession[key] = SessionScrollState(
+            windowStart: windowStart,
+            isFollowing: isFollowing,
+            anchorStoreIndex: anchorStoreIndex,
+            anchorPixelOffset: anchorPixelOffset,
+            fetchBlock: fetchBlock
+        )
+    }
+
+    /// Restores a previously-visited session's materialized window and
+    /// viewport position instead of dumping it at the tail. The store kept
+    /// folding while the session was in the background, so only the window END
+    /// is extended to include the rows that streamed since — the restored
+    /// viewport stays put and the new tail sits below it. Heights are not
+    /// cleared: `activateSessionCache` already swapped in this session's cache
+    /// on rebind, so `reloadData` re-measures only rows whose content changed.
+    private func restoreScrollState(_ saved: SessionScrollState, store: TranscriptStore) {
+        let count = store.count
+        windowStart = min(max(0, saved.windowStart), count)
+        windowEnd = max(windowStart, count)
+        fetchBlock = saved.fetchBlock
+        lastGeneration = store.currentGeneration
+        isFollowing = saved.isFollowing
+        isFetchingOlder = false
+        isEvictingOlder = false
+        viewModel?.isFetchingOlder = false
+        searchMatchRowIDs = []
+        currentSearchRowID = nil
+        lastSearchQuery = nil
+        tableView.reloadData()
+        if saved.isFollowing {
+            scheduleScrollToBottom()
+        } else {
+            scheduleScrollToAnchor(storeIndex: saved.anchorStoreIndex, pixelOffset: saved.anchorPixelOffset)
+        }
+    }
+
+    /// Defers a scroll to the anchored store index (a restored viewport) to
+    /// the next run-loop turn, once `reloadData` has laid the table out. Falls
+    /// back to the tail when the anchor is missing or no longer in the window
+    /// (e.g. the store shrank under it).
+    private func scheduleScrollToAnchor(storeIndex: Int?, pixelOffset: CGFloat) {
+        guard !positionPending else { return }
+        positionPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.positionPending = false
+            self.tableView.tile()
+            guard let storeIndex else {
+                self.scrollView.scrollToBottom()
+                return
+            }
+            let row = storeIndex - self.windowStart
+            guard row >= 0, row < (self.windowEnd - self.windowStart) else {
+                self.scrollView.scrollToBottom()
+                return
+            }
+            let rowY = self.tableView.rect(ofRow: row).origin.y
+            let targetY = max(0, rowY - pixelOffset)
+            self.scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            self.scrollView.reflectScrolledClipView(self.scrollView.contentView)
+            self.lastVisibleMaxY = self.scrollView.documentVisibleRect.maxY
+        }
+    }
+
     private func resetToTail(_ store: TranscriptStore) {
         let count = store.count
         let chunk = initialChunkRows()
@@ -691,6 +833,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         isEvictingOlder = false
         isFollowing = true
         viewModel?.isFetchingOlder = false
+        // A reload rebuilds the whole history: any previously-saved position is
+        // meaningless, so the next visit to this session starts at the tail.
+        if let vm = viewModel {
+            scrollStateBySession.removeValue(forKey: ObjectIdentifier(vm))
+        }
         // Heights are NOT cleared here: they live per-session (`heights` was
         // already swapped to this session's cache by `activateSessionCache` on
         // rebind, and a same-session reload keeps its cache — the content tag
@@ -710,13 +857,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     private func scheduleScrollToBottom() {
-        guard !scrollToBottomPending else { return }
-        scrollToBottomPending = true
+        guard !positionPending else { return }
+        positionPending = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.scrollToBottomPending = false
+            self.positionPending = false
             self.tableView.tile()
             self.scrollView.scrollToBottom()
+            // Re-seed the direction detector: the first user scroll after a
+            // restore must be compared against the restored position, not a
+            // stale one from the previous session.
+            self.lastVisibleMaxY = self.scrollView.documentVisibleRect.maxY
         }
     }
 

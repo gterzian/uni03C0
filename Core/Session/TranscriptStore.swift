@@ -424,6 +424,15 @@ public final class TranscriptStore: @unchecked Sendable {
     }
 
     private func finalizeAssistant(_ message: AgentMessage) {
+        // An aborted/error/truncated turn leaves any in-flight tool card
+        // `.running` — pi sends no `tool_execution_end` for an interrupted
+        // tool, so the card's spinner would animate forever. Settle
+        // interrupted cards here. NOT at a tool-use step's `message_end`
+        // (stopReason "tool_use"): its card is legitimately running, created
+        // at `toolcall_end` before `tool_execution_start` starts it.
+        if message.stopReason != "tool_use" {
+            settleInterruptedToolCalls()
+        }
         guard let id = streamingEntryID,
               let index = _entries.lastIndex(where: { $0.id == id }) else { return }
         var entry = _entries[index]
@@ -542,6 +551,9 @@ public final class TranscriptStore: @unchecked Sendable {
     /// `message_start`, extension command), drop it; otherwise finalize any
     /// assistant entry still marked streaming (abort mid-thinking).
     private func endTurnPlaceholderOrFinalize() -> Bool {
+        // A turn end (agent_end / turn_end) may arrive without a final
+        // `message_end` (abort) — settle any in-flight tool card then too.
+        let settled = settleInterruptedToolCalls()
         if let placeholder = turnStartPlaceholderID,
            let index = _entries.lastIndex(where: { $0.id == placeholder }) {
             _entries.remove(at: index)
@@ -549,7 +561,7 @@ public final class TranscriptStore: @unchecked Sendable {
             return true
         }
         guard let index = _entries.lastIndex(where: { $0.kind.isStreaming }),
-              case .assistantMessage(let text, let thinking, _) = _entries[index].kind else { return false }
+              case .assistantMessage(let text, let thinking, _) = _entries[index].kind else { return settled }
         _entries[index].kind = .assistantMessage(text: text, thinking: thinking, isStreaming: false)
         turnStartPlaceholderID = nil
         return true
@@ -637,6 +649,28 @@ public final class TranscriptStore: @unchecked Sendable {
         card.state = (end.isError ?? false) ? .failed : .done
         entry.kind = .toolCall(card: card)
         _entries[index] = entry
+    }
+
+    /// Marks every tool-call card still `.running` as `.failed` — an
+    /// interrupted tool (abort/error/truncation) never gets a
+    /// `tool_execution_end`, so without this its card would stay in the
+    /// running state forever (spinner animating). Called only at turn end: a
+    /// tool-use step's card is legitimately running between `toolcall_end` and
+    /// `tool_execution_start`, so this must never run mid-step. The partial
+    /// output is kept; a late `tool_execution_end` still wins (`endToolCall`
+    /// overwrites the state with the real outcome).
+    @discardableResult
+    private func settleInterruptedToolCalls() -> Bool {
+        var changed = false
+        for (index, entry) in _entries.enumerated() {
+            guard case .toolCall(var card) = entry.kind, card.state == .running else { continue }
+            card.state = .failed
+            var settled = entry
+            settled.kind = .toolCall(card: card)
+            _entries[index] = settled
+            changed = true
+        }
+        return changed
     }
 
     private func attachToolResult(id: String?, name: String?, text: String, failed: Bool) {

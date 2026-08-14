@@ -7,8 +7,17 @@ import SwiftUI
 /// not scraped terminal output.
 final class ToolCallHostView: NSView {
     private var host: NSHostingView<AnyView>?
+    /// The card this cell currently renders. The transcript coordinator reads
+    /// these to spot VISIBLE cells still showing a stale state after a
+    /// turn-end settle (a running card the store just flipped to `.failed`
+    /// on abort — see `settleInterruptedToolCalls`): such cells must be
+    /// reconfigured even when their row isn't the tail.
+    private(set) var renderedCardID: String?
+    private(set) var renderedCardState: ToolCallState?
 
     func configure(card: ToolCallCard, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, onToggleExpand: @escaping () -> Void) {
+        renderedCardID = card.id
+        renderedCardState = card.state
         // `.id(card.id)` keeps the card's own expansion state alive across
         // output updates for the same call, but resets it when a recycled cell
         // is reused for a different call.
