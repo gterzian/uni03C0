@@ -57,7 +57,19 @@ struct TranscriptView: NSViewRepresentable {
 final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
-    private let heights = HeightCache()
+    /// The ACTIVE session's height cache (an element of `heightsBySession`).
+    private var heights = HeightCache()
+    /// Per-session height caches. Row ids are only unique WITHIN a session, so
+    /// a session switch must never serve the previous session's cached heights
+    /// — but it must also NOT discard the measurements: clearing the cache on
+    /// switch and letting `reloadData()` re-measure every row synchronously on
+    /// the main thread (full CoreText glyph encode per row) was the
+    /// session-switch beachball in samples. Each session keeps its own cache,
+    /// so switching BACK to a visited session reuses its heights; an LRU over
+    /// the most recently used sessions bounds memory.
+    private var heightsBySession: [ObjectIdentifier: HeightCache] = [:]
+    private var sessionLRU: [ObjectIdentifier] = []
+    private let maxCachedSessions = 6
     weak var viewModel: SessionViewModel?
     private var isApplying = false
     /// Streaming batching: the tail row is refreshed at most every
@@ -149,6 +161,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     func makeScrollView(viewModel: SessionViewModel) -> NSScrollView {
         self.viewModel = viewModel
+        activateSessionCache(viewModel)
 
         let tv = TranscriptTableView()
         tv.headerView = nil
@@ -247,6 +260,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         self.viewModel?.onSearchJump = nil
         self.viewModel?.onSearchResultsChanged = nil
         self.viewModel = viewModel
+        activateSessionCache(viewModel)
         viewModel.onTranscriptChange = { [weak self] in
             self?.applyModelChanges()
         }
@@ -257,6 +271,28 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             self?.refreshSearchHighlight()
         }
         resetToTail(viewModel.store)
+    }
+
+    /// Points `heights` at the cache for `session`, creating it on first
+    /// visit, and prunes the least-recently-used caches beyond the cap. Called
+    /// on every session bind/rebind (tab switch), so switching back to a
+    /// previously-visited session reuses the heights it was measured at — the
+    /// reload that follows never re-measures a row whose content is unchanged.
+    private func activateSessionCache(_ session: SessionViewModel) {
+        let key = ObjectIdentifier(session)
+        sessionLRU.removeAll { $0 == key }
+        sessionLRU.append(key)
+        if let cached = heightsBySession[key] {
+            heights = cached
+        } else {
+            let fresh = HeightCache()
+            heightsBySession[key] = fresh
+            heights = fresh
+        }
+        while sessionLRU.count > maxCachedSessions {
+            let evicted = sessionLRU.removeFirst()
+            heightsBySession.removeValue(forKey: evicted)
+        }
     }
 
     // MARK: - NSTableViewDataSource / Delegate
@@ -655,10 +691,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         isEvictingOlder = false
         isFollowing = true
         viewModel?.isFetchingOlder = false
-        // Heights are keyed by (id, width) and ids are only unique WITHIN a
-        // session; a session switch must never serve the previous session's
-        // cached heights for same-width rows.
-        heights.clear()
+        // Heights are NOT cleared here: they live per-session (`heights` was
+        // already swapped to this session's cache by `activateSessionCache` on
+        // rebind, and a same-session reload keeps its cache — the content tag
+        // re-measures only rows whose text actually changed). Clearing on
+        // switch re-measured every row synchronously on the main thread — the
+        // session-switch beachball in samples.
         // The same applies to search-match rows: ids from the previous session
         // would paint stale yellow backdrops on the new one. The view model's
         // match list still holds the old session's row ids (the session
@@ -704,16 +742,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
             if entry.kind.isStreaming, let textRow = cell as? TextRowView {
                 // STREAMING rows: the height comes from the cell's own layout
-                // manager, never from a full CoreText measure. The layout
-                // manager lays out incrementally (only the newly-appended
-                // characters are typeset — ~10ms per batch), whereas
-                // `measuredHeight` re-typesets the WHOLE growing text from
-                // scratch via `boundingRect`, which is pathologically slow on
-                // newline-heavy text (~400ms for 13k chars): at the 0.25s
-                // batch rate that saturated the main thread at 100% in
-                // samples. The layout-manager height IS what renders, so the
-                // table and the cell agree by construction (the measured/
-                // rendered invariant holds within the 2pt slack).
+                // manager, never from a full CoreText measure. `configure`
+                // replaces only the appended tail of the text storage
+                // (see `TextRowView.applyAttributedString`), so the layout
+                // manager lays out incrementally — only the newly-appended
+                // characters are typeset — whereas `measuredHeight` re-typesets
+                // the WHOLE growing text from scratch via `boundingRect`, which
+                // is pathologically slow on newline-heavy text (~400ms for 13k
+                // chars): at the 0.25s batch rate that saturated the main
+                // thread at 100% in samples. The layout-manager height IS what
+                // renders, so the table and the cell agree by construction (the
+                // measured/rendered invariant holds within the 2pt slack).
                 // Configure + lay out FIRST (the row frame is resized after;
                 // layout computes the full usedRect regardless of the frame),
                 // then read the authoritative height and re-seed the cache.
@@ -803,7 +842,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// materialized rows; heights and cells both read `TranscriptText`, so
     /// measured and rendered sizes stay in sync.
     @objc private func fontSizeDidChange() {
-        heights.clear()
+        // Font size is app-wide: every session's cached heights were measured
+        // at the old size, so every cache must go.
+        for cache in heightsBySession.values {
+            cache.clear()
+        }
         tableView.reloadData()
     }
 

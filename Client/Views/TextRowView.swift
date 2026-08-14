@@ -343,7 +343,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
         let oldString = textView.string
         let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
         codeBlocks = result.codeBlocks
-        textView.textStorage?.setAttributedString(result.string)
+        applyAttributedString(result.string, previous: oldString)
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read
         // as a constant flicker while streaming.)
@@ -369,6 +369,83 @@ final class TextRowView: NSView, NSTextViewDelegate {
             stopCaretPulse()
         }
         needsLayout = true
+    }
+
+    /// Applies the freshly-built attributed string to the text storage without
+    /// replacing the whole thing when the change is a pure tail append.
+    ///
+    /// The streaming hot spot was `setAttributedString` on every 0.25s batch:
+    /// replacing the ENTIRE storage invalidates every character, so the layout
+    /// manager re-typesets the whole (possibly huge) paragraph from scratch —
+    /// a fresh CTTypesetter plus a full GPOS kerning pass over every glyph —
+    /// on every batch (the main thread saturated at ~100% in samples).
+    /// Replacing only the appended tail keeps the layout manager's incremental
+    /// state: existing line fragments stay put and only the new characters are
+    /// typeset, so the per-batch cost tracks the delta, not the message.
+    ///
+    /// The incremental path is taken only when the shared prefix's TEXT and
+    /// its attributes (excluding foreground/background — the streaming fade and
+    /// the search highlight legitimately differ on those) are identical. Any
+    /// genuine change — a code fence closing mid-stream re-styles the prefix
+    /// as code, a font-size change re-styles everything — falls back to a full
+    /// replace.
+    private func applyAttributedString(_ newString: NSAttributedString, previous oldString: String) {
+        guard let storage = textView.textStorage else { return }
+        let old = oldString as NSString
+        let new = newString.string as NSString
+        var prefix = 0
+        let maxLen = min(old.length, new.length)
+        while prefix < maxLen, old.character(at: prefix) == new.character(at: prefix) {
+            prefix += 1
+        }
+        // Identical content (a scroll re-entry re-rendering the same row):
+        // touch nothing — even a no-op edit would broadcast textDidChange and
+        // dirty the layout for no reason.
+        if prefix == old.length, prefix == new.length {
+            return
+        }
+        guard prefix > 0, prefixAttributesMatch(storage, newString, upTo: prefix) else {
+            storage.setAttributedString(newString)
+            return
+        }
+        let oldDelta = NSRange(location: prefix, length: old.length - prefix)
+        let newDelta = NSRange(location: prefix, length: new.length - prefix)
+        storage.replaceCharacters(in: oldDelta, with: newString.attributedSubstring(from: newDelta))
+    }
+
+    /// True when `storage` and `newString` carry the same attributes over the
+    /// shared prefix. `.foregroundColor` is excluded because the streaming
+    /// fade mid-fades the tail (which becomes the next batch's prefix) in the
+    /// storage while the freshly-built string holds final colors, and the
+    /// caret pulse edits the caret's color the same way; `.backgroundColor` is
+    /// excluded because the search highlight is painted over the string after
+    /// configure. Every other attribute — font, paragraph style, links — must
+    /// match or the prefix genuinely differs and the row is rebuilt.
+    private func prefixAttributesMatch(_ storage: NSTextStorage, _ newString: NSAttributedString, upTo length: Int) -> Bool {
+        var idx = 0
+        while idx < length {
+            var oldRange = NSRange(location: 0, length: 0)
+            var newRange = NSRange(location: 0, length: 0)
+            let oldAttrs = storage.attributes(at: idx, effectiveRange: &oldRange)
+            let newAttrs = newString.attributes(at: idx, effectiveRange: &newRange)
+            guard attributeDictionariesEqualIgnoringDynamic(oldAttrs, newAttrs) else { return false }
+            idx = min(oldRange.upperBound, newRange.upperBound)
+            guard idx > 0 else { return false } // must make progress
+        }
+        return true
+    }
+
+    private func attributeDictionariesEqualIgnoringDynamic(
+        _ a: [NSAttributedString.Key: Any],
+        _ b: [NSAttributedString.Key: Any]
+    ) -> Bool {
+        var aa = a
+        aa.removeValue(forKey: .foregroundColor)
+        aa.removeValue(forKey: .backgroundColor)
+        var bb = b
+        bb.removeValue(forKey: .foregroundColor)
+        bb.removeValue(forKey: .backgroundColor)
+        return NSDictionary(dictionary: aa).isEqual(to: bb)
     }
 
     /// Rebuilds the code-block card backgrounds and corner copy buttons for
@@ -459,7 +536,13 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// The rendered string is searched directly — the visible occurrence is
     /// what gets painted, matching what the user sees.
     private func applySearchHighlight(query: String?, caseSensitive: Bool, isCurrent: Bool) {
-        guard let query, let storage = textView.textStorage else { return }
+        guard let storage = textView.textStorage else { return }
+        // Drop the previous query's backdrops first. The incremental storage
+        // path keeps the prefix's attributes, so without this a stale query's
+        // highlights would persist on text that no longer matches (inline-code
+        // backgrounds use a different color and are left untouched).
+        dropSearchHighlights(in: storage)
+        guard let query else { return }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
@@ -472,6 +555,22 @@ final class TextRowView: NSView, NSTextViewDelegate {
             storage.addAttribute(.backgroundColor, value: color, range: found)
             let next = found.location + found.length
             searchRange = NSRange(location: next, length: full.length - next)
+        }
+    }
+
+    /// Removes every search-match backdrop from the storage (the search
+    /// highlight colors only — inline-code backgrounds are a different color).
+    private func dropSearchHighlights(in storage: NSTextStorage) {
+        let full = NSRange(location: 0, length: storage.length)
+        var ranges: [NSRange] = []
+        storage.enumerateAttribute(.backgroundColor, in: full) { value, range, _ in
+            if let color = value as? NSColor,
+               color === SearchMatchHighlight.match || color === SearchMatchHighlight.current {
+                ranges.append(range)
+            }
+        }
+        for range in ranges {
+            storage.removeAttribute(.backgroundColor, range: range)
         }
     }
 

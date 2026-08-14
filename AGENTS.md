@@ -57,6 +57,24 @@ mechanism.
 
 # Project design
 
+## The two non-negotiable properties
+
+Every change must preserve both; the rest of this document details the
+invariants that keep them true.
+
+1. **Fast, responsive, non-blocking UI.** Rendering cost scales with the
+   *visible* rows, never with the context size or message size; the main
+   thread never does full-CoreText work on the streaming or session-switch hot
+   paths, and no interaction waits on a synchronous re-measure of off-screen
+   content. The load-bearing invariants live in *The transcript design* below
+   (append-only streaming text storage, per-session height cache, batched
+   refresh, off-main folding, windowed/evictable view).
+2. **Sandbox.** Every agent subprocess runs under a default-deny Seatbelt
+   policy; the loopback whitelist proxy is the agent's *only* internet egress,
+   and denials fail closed — never silently bypassed. Nothing may loosen the
+   policy, add an egress path, or hide a denial. The policy scaffold and its
+   failure modes live in the *Sandbox* section.
+
 ## What this is
 
 **uni03C0 (Client)** is a native macOS client for the [`pi` coding
@@ -248,11 +266,12 @@ Saved settings lists from an older app version automatically gain any new
 default entries once (one-shot migration in `SandboxSettings.load()`); after
 that, user edits win wholesale.
 
-### Empirical notes (verified on macOS 26, 2026-08)
+### Empirical notes (macOS 26)
 
-Everything above was confirmed by real failures during this session's work
-(building the app, running xcodebuild/SPM, and running the formal-web
-end-of-task verification — WPT, TLA+ traces — inside the sandbox).
+Confirmed by real failures while building the app, running xcodebuild/SPM, and
+running the formal-web end-of-task verification (WPT, TLA+ traces) inside the
+sandbox. These are the sandbox's failed fixes — the policy rules above exist
+because of them.
 
 - **Diagnosing a denial**: the sandbox logs denials only to the unified log,
   and `log show`/`log stream`, `dtruss`, and `lldb` attach are all blocked
@@ -333,10 +352,11 @@ Three targets (see `project.yml`):
   ClientTests cannot link — it links Core only), this target compiles the
   renderer sources directly alongside the tests. Covers inline/block styling,
   code-block ranges and cards/copy buttons, block spacing, soft/hard line
-  breaks, and the load-bearing measurement invariant (rendered height ==
-  measured height). Run via `xcodebuild -scheme RenderingTests test`; can also
-  be run with plain `swiftc` + a tiny XCTest shim when the sandbox blocks
-  package resolution.
+  breaks, the load-bearing measurement invariant (rendered height ==
+  measured height), and the append-only streaming storage regressions
+  (`StreamingStorageTests`). Run via `xcodebuild -scheme RenderingTests
+  test`; can also be run with plain `swiftc` + a tiny XCTest shim when the
+  sandbox blocks package resolution.
 
 Concurrency defaults are set per target in `project.yml`:
 `Core = nonisolated`, `Client = MainActor`, both Swift 6 strict
@@ -388,8 +408,8 @@ concurrency.
 
 ### Client
 
-- `MainWindowView` / `SessionTabsView` — the app's **single window**, now
-  tabbed: one live session per tab, all sharing the same sandbox settings
+- `MainWindowView` / `SessionTabsView` — the app's single window, tabbed:
+  one live session per tab, all sharing the same sandbox settings
   (each session snapshots them at spawn). The window opens on the **last
   selected project folder** (`AppState.shared.lastProject`, persisted to
   UserDefaults) as the first tab, or the picker if no projects folder has
@@ -412,10 +432,6 @@ concurrency.
   whichever session owns them.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
-- `SessionStatusBar` — removed. The model + thinking-level pickers live in
-  the window toolbar (top edge); the live status readout (context %, model,
-  thinking level) sits in very light gray at the bottom-right inside the
-  prompt input.
 - `TextRowView` / `ToolCallCardView` — cells.
 - `TranscriptText` — the single source of truth for styling **and**
   measurement, so measured height exactly matches rendered height.
@@ -464,16 +480,18 @@ concurrency.
     first-responder draft sync (which would mirror the old text upward).
   - **Aborting the paste works from anywhere.** Ctrl+C is handled by a
     global key monitor (like Esc), not just the text view's keyDown — the
-    input keeps focus while disabled, so the old path missed Ctrl+C whenever
-    focus was elsewhere. Esc (turn abort) also discards an active windowed
+    input keeps focus while disabled, so a text-view-only keyDown would miss
+    Ctrl+C whenever focus is elsewhere. Esc (turn abort) also discards an
+    active windowed
     paste; Ctrl+C discards it without touching the agent turn. Both go
     through `abortWindowedPasteIfAny`, which empties the input, exits
     windowed mode, and reports the height reset — a paste that stays
     windowed silently keeps its store and submits on Enter.
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
-  read it; the transcript coordinator observes the change, clears its height
-  cache, and re-measures, so heights always match the rendered font.
+  read it; the transcript coordinator observes the change, clears every
+  session's cached heights, and re-measures, so heights always match the
+  rendered font.
 - `SessionHistorySheet` — unbounded session list.
 - `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
   and subprocess cleanup on termination (every live child gets EOF on quit).
@@ -547,8 +565,13 @@ Behavior details that matter:
   newly-appended characters are typeset — never from a fresh CoreText
   `measuredHeight` of the whole growing text (a full re-typeset of a
   newline-heavy message costs hundreds of ms and saturates the main thread at
-  the batch rate). The height change and the follow-scroll are
-  applied in one atomic `CATransaction` so AppKit renders only the final
+  the batch rate). The incremental layout depends on `configure`'s
+  **append-only text storage** (`TextRowView.applyAttributedString`): each
+  batch replaces only the appended tail, so the layout manager's existing line
+  fragments survive. Replacing the whole storage per batch, or re-measuring
+  the whole message per batch, re-introduces the hot spot — see *Failed fixes*
+  below. The height change and the follow-scroll are applied in one atomic
+  `CATransaction` so AppKit renders only the final
   state — content flows off the top instead of bouncing. Tool cards stream
   output with the same batching (their cached height is invalidated on every
   update — content grows in place — so the card actually grows as output
@@ -556,25 +579,27 @@ Behavior details that matter:
 - **Arrow-Down jumps to the tail.** The transcript table overrides Down-arrow
   to scroll to the bottom in one step and re-engage following.
 - **Height cache.** Keyed by `(id, width)` where `width` is the row's render
-  width (`rowWidth`). ONE measurement function —
-  `entry.measuredHeight(forWidth:)` — feeds both `heightOfRow` (on cache
-  miss) and the visible-cell refresh (`updateVisibleCell`), so the two paths
-  agree by construction; the fast path stores that measured value rather than
-  seeding from the cell's own layout. Streaming rows carry a **content tag**
-  (text/thinking/streaming-flag fingerprint): `heightOfRow` serves whatever
-  the renderer seeded (the table must match the cell, not the store's newer
-  unrendered content) and `updateVisibleCell`/`makeCell` re-measure only on a
-  genuine content change. Streaming rows are seeded from the cell's
-  incremental layout (`contentHeight` + the 2pt slack, so the settled-row
-  `measuredHeight` lands on the same height — no jump at settle); the full
-  CoreText measure runs once per message (on the settle refresh, then cached).
-  The re-measure-per-`heightOfRow` path from `rowHeight` and the full
-  re-typeset per batch both pegged the main thread at 100% in samples (a
-  DeepSeek "high" thinking stream and a newline-heavy markdown stream both
-  reproduced it). Tool-card heights are
+  width (`rowWidth`), and **scoped per session**: the coordinator keeps one
+  `HeightCache` per `SessionViewModel` (`heightsBySession`, LRU-capped) and
+  activates the right one on bind/rebind (`activateSessionCache`). A session
+  switch never clears or re-measures — switching back to a visited session
+  reuses its cached heights; only rows whose content genuinely changed
+  re-measure (the content tag catches that). Same-session reloads reuse the
+  cache too; a font-size change is app-wide and clears every session's cache.
+  ONE measurement function — `entry.measuredHeight(forWidth:)` — feeds both
+  `heightOfRow` (on cache miss) and the visible-cell refresh
+  (`updateVisibleCell`), so the two paths agree by construction. Streaming
+  rows carry a **content tag** (text/thinking/streaming-flag fingerprint):
+  `heightOfRow` serves whatever the renderer seeded (the table must match the
+  cell, not the store's newer unrendered content) and
+  `updateVisibleCell`/`makeCell` re-measure only on a genuine content change.
+  Streaming rows are seeded from the cell's incremental layout
+  (`contentHeight` + the 2pt slack, so the settled-row `measuredHeight` lands
+  on the same height — no jump at settle); the full CoreText measure runs once
+  per message (on the settle refresh, then cached). Tool-card heights are
   invalidated on every content update (they grow in place); text rows are
-  invalidated on genuine change, and `resetToTail` clears the whole cache on
-  session switch (ids are only unique within a session).
+  invalidated on genuine change and when their rows are evicted from the
+  window (so the cache tracks the window, not the conversation).
 - **Cells are pre-sized at creation.** `makeCell` frames every cell to its
   row's measured height before returning it — NSTableView does not reliably
   re-frame a cell whose height changed (the width follows via autoresizing,
@@ -619,15 +644,48 @@ Behavior details that matter:
 - **Session switch** is a `generation` bump → full `reloadData()` positioned at
   the tail, behind an in-app `isReloading` spinner (never the system beach-ball).
 
+### Failed fixes (do not re-introduce)
+
+Each of these saturated the main thread in `sample` profiles; the current code
+works around them, and reintroducing any of them breaks the fast-UI property.
+
+- **Replacing the whole text storage on every streaming batch.**
+  `TextRowView.configure` used to call `setAttributedString` on every 0.25s
+  batch: the layout manager treated every character as a hole and re-typeset
+  the entire (single-paragraph) thinking block from scratch — a fresh
+  CTTypesetter plus a full GPOS kerning pass — per batch (~80% of the main
+  thread in a `sample` of a streaming thinking block). The fix is the
+  append-only `applyAttributedString`: replace only the delta (guarded by a
+  shared-prefix text + attribute check), full-replace only when the prefix
+  genuinely re-styles (a code fence or `**` closing mid-stream, a font-size
+  change). Search highlights are re-applied from scratch every configure (the
+  previous query's backdrops are dropped first — search colors only, leaving
+  inline-code backgrounds alone) because the incremental path preserves the
+  prefix's attributes.
+- **Clearing the height cache on session switch.** `resetToTail` used to
+  `heights.clear()` on every rebind, so `reloadData()` re-measured every row
+  synchronously on the main thread — full markdown parse + `boundingRect`
+  glyph encode per row, 100% of the main thread for ~2s (the tab-switch
+  beachball in `sample`). The fix is the per-session `heightsBySession`.
+  Nothing on a tab switch may re-measure the window synchronously on the main
+  thread.
+- **Re-measuring streaming rows on every `heightOfRow` / re-typesetting per
+  delta.** The table queries `heightOfRow` on every tile and scroll; serving
+  each query with a fresh full measure of the (possibly huge) growing text
+  pegged the main thread at 100% (a DeepSeek "high" thinking stream and a
+  newline-heavy markdown stream both reproduced it). Streaming heights come
+  from the cell's own incremental layout, seeded into the cache, and the
+  refresh is batched at 0.25s — see the Smooth streaming bullet.
+
 Validation notes: a `sample` during a long streaming turn should show the main
 thread mostly idle in the event loop (the per-tick work is confined to the
 streaming row); a large-context session should scroll smoothly and open
 instantly; streaming while the window is occluded should do no render work.
 
-## Rendering lessons (verified on macOS 26, 2026-08)
+## Rendering lessons (macOS 26)
 
-These cost real debugging time this session; check them before touching the
-markdown renderer or the transcript rows.
+Failed fixes / hard-won behavior of the AppKit renderer. Check these before
+touching the markdown renderer or the transcript rows.
 
 - **`paragraphSpacingBefore`/`paragraphSpacing` inflate EVERY line fragment**
   of a multi-line paragraph on this SDK — a 16pt line becomes 30pt with 8/6
@@ -747,9 +805,12 @@ the whole `RenderingTests` directory, so `xcodegen generate` picks it up
   `codeBlocksForTesting`, `copyButtonsForTesting`) for the chrome/layout
   tests; add more if a new test needs them.
 - Prefer asserting **rendered geometry and attributes** (fonts, traits,
-  ranges, rects) over internals, and keep the two historical regressions
-  covered: no paragraphSpacingBefore/After on blocks (per-line inflation),
-  and soft breaks preserved (newline collapse).
+  ranges, rects) over internals, and keep the regressions covered: no
+  paragraphSpacingBefore/After on blocks (per-line inflation), soft breaks
+  preserved (newline collapse), and the streaming-storage behavior
+  (`StreamingStorageTests`: a pure append keeps the prefix's text and
+  attributes, closing markdown / a font-size change re-styles the prefix,
+  a changed search query drops stale highlights).
 
 ## Conventions
 
@@ -767,8 +828,3 @@ the whole `RenderingTests` directory, so `xcodegen generate` picks it up
 - `scratchpad/transcript-architecture.md` — the architecture write-up.
 - `scratchpad/transcript-overview.md` — a plain-terms overview.
 
-## TODO
-
-_Empty — the copy-button TODO (fenced code blocks in assistant messages) is
-implemented via the corner `CodeCopyButton` + card overlay in `TextRowView`
-(driven by `MarkdownText`'s reported code-block ranges)._
