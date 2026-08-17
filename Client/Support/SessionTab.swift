@@ -38,7 +38,8 @@ final class SessionTab: Identifiable {
     /// One-shot restore requests (queued steering back into the input). The
     /// restore APPENDS to whatever is already in the input — a quick push
     /// back — and never disturbs an in-flight streamed paste (which keeps
-    /// pushing to the front).
+    /// pushing to the front). Cleared on application (see
+    /// `PromptInputView.onRestoreConsumed`), so it can never re-apply.
     var restoreRequest: RestoreRequest?
     /// Height of the prompt input. Auto-grows with content until the user
     /// drags the resize handle, which pins it (`promptHeightIsCustom`).

@@ -30,6 +30,14 @@ struct PromptInputView: NSViewRepresentable {
     /// unique `id`; appends at the end and never disturbs an in-flight
     /// streamed paste.
     let restoreRequest: RestoreRequest?
+    /// Consumes the one-shot restore request once the coordinator has applied
+    /// it (the owner clears `tab.restoreRequest`). Without this the request
+    /// stays pending on the tab forever, and because the coordinator (and its
+    /// apply-guard) are shared across tab switches, a restore applied in one
+    /// session re-arms another session's stale request — which re-appends old
+    /// text into the input on every switch back, accumulating the whole
+    /// history of previously entered prompts.
+    let onRestoreConsumed: () -> Void
     let onDraftChange: (String) -> Void
     let onSubmit: (String) -> Void
     let onAbort: () -> Void
@@ -101,10 +109,14 @@ struct PromptInputView: NSViewRepresentable {
             }
         }
         // One-shot restores: append the queued text at the end (push-back).
-        // Guarded by the request id so a re-render never appends twice.
-        if let restore = restoreRequest, restore.id != context.coordinator.lastRestoreID {
-            context.coordinator.lastRestoreID = restore.id
+        // Guarded PER SESSION by the request id so a re-render never appends
+        // twice, and consumed on apply (the owner clears the request), so a
+        // stale request can never be re-armed by another session's restore
+        // and re-append old text on every switch back.
+        if let restore = restoreRequest, restore.id != context.coordinator.lastRestoreID(for: sessionID) {
+            context.coordinator.recordRestoreApplied(restore.id, for: sessionID)
             context.coordinator.appendText(restore.text, in: nsView)
+            onRestoreConsumed()
         }
     }
 }
@@ -633,8 +645,20 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         completionItems = []
     }
 
-    /// The id of the last applied restore request (one-shot append).
-    var lastRestoreID: UUID?
+    /// The ids of the last applied restore requests, per session (one-shot
+    /// append). Scoped per session because the coordinator and its NSView are
+    /// shared across tab switches: a single shared id let a restore applied
+    /// in one session re-arm another session's stale request, re-appending
+    /// old text into the input on every switch back.
+    private var lastRestoreIDs: [UUID: UUID] = [:]
+
+    func lastRestoreID(for sessionID: UUID) -> UUID? {
+        lastRestoreIDs[sessionID]
+    }
+
+    func recordRestoreApplied(_ id: UUID, for sessionID: UUID) {
+        lastRestoreIDs[sessionID] = id
+    }
 
     // MARK: - Text replacement (e.g. restoring queued steering for editing)
 
