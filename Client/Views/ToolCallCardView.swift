@@ -166,6 +166,22 @@ struct ToolCallCardView: View {
                     Text("running…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Spacer()
+                    // Per-second elapsed timer for a RUNNING BASH call, pinned
+                    // to the bottom-right of the card (the only tool with a
+                    // timer). TimelineView ticks on its own 1s cadence and is
+                    // scoped to this one line, so the rest of the card's graph
+                    // stays quiet between output refreshes. `startedAt` is
+                    // stamped at tool_execution_start, so the count measures
+                    // actual execution time.
+                    if card.toolName == "bash", let started = card.startedAt {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            Text("⏱ \(Self.formatElapsed(context.date.timeIntervalSince(started)))")
+                                .font(.caption)
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
         }
@@ -205,6 +221,16 @@ struct ToolCallCardView: View {
     /// visual state readout.
     private var cardAccessibilityLabel: String {
         "Tool \(card.toolName), \(card.state.label)"
+    }
+
+    /// "23s" under a minute, "1:23" (m:ss) above — the per-second elapsed
+    /// readout on a running bash card.
+    private static func formatElapsed(_ elapsed: TimeInterval) -> String {
+        let total = max(0, Int(elapsed.rounded(.down)))
+        if total >= 60 {
+            return String(format: "%d:%02d", total / 60, total % 60)
+        }
+        return "\(total)s"
     }
 
     private var header: some View {

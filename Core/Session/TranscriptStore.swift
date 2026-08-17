@@ -621,6 +621,9 @@ public final class TranscriptStore: @unchecked Sendable {
             card.argumentsValue = start.args ?? card.argumentsValue
             card.toolName = start.toolName ?? card.toolName
             card.state = .running
+            // Execution really starts now (the card was created earlier at
+            // toolcall_end, before execution): stamp the elapsed timer's zero.
+            card.startedAt = Date()
             _entries[index].kind = .toolCall(card: card)
             return
         }
@@ -629,7 +632,8 @@ public final class TranscriptStore: @unchecked Sendable {
             toolName: start.toolName ?? "tool",
             arguments: start.args?.prettyPrinted() ?? "",
             argumentsValue: start.args,
-            state: .running
+            state: .running,
+            startedAt: Date()
         )
         _entries.append(TranscriptEntry(id: id, kind: .toolCall(card: card)))
     }

@@ -75,12 +75,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
     /// Local key monitor making Cmd+Down jump to the tail from anywhere in the
-    /// window. Plain Arrow-Down only works while the TABLE has key focus,
-    /// which happens only on scroll — selecting a row puts key focus on the
-    /// row's (non-editable) text view, where Down does nothing. Cmd+Down is
-    /// the always-works escape hatch, regardless of focus/selection.
-    /// Deferred to EDITABLE text views (the prompt input, the find field),
-    /// which use Cmd+Down to move to the end of their own text.
+    /// window. Plain Arrow-Down deliberately does NOT jump — it keeps the
+    /// default table/text behavior; Cmd+Down is the always-works jump,
+    /// regardless of focus/selection. Deferred to EDITABLE text views (the
+    /// prompt input, the find field), which use Cmd+Down to move to the end of
+    /// their own text.
     ///
     /// `nonisolated(unsafe)`: installed only on the main thread (from
     /// `makeScrollView`), and deinit runs only after the last reference is
@@ -219,7 +218,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.setAccessibilityElement(true)
         tv.setAccessibilityRole(.table)
         tv.setAccessibilityLabel("Conversation")
-        tv.setAccessibilityHelp("The conversation with the agent. Arrow-Down jumps to the latest message; Cmd+Down does it from anywhere in the window.")
+        tv.setAccessibilityHelp("The conversation with the agent. Cmd+Down jumps to the latest message.")
 
         let sv = TranscriptScrollView()
         sv.documentView = tv
@@ -232,13 +231,6 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.dataSource = self
         tv.delegate = self
 
-        // Arrow-Down jumps to the bottom of the conversation in one step (and
-        // re-engages following). Scrolling the transcript takes key focus so
-        // Down works right after a trackpad scroll — focus otherwise stays on
-        // the prompt bar.
-        tv.onArrowDown = { [weak self] in
-            self?.jumpToBottom()
-        }
         sv.onUserScroll = { [weak self] in
             guard let self, let window = self.tableView.window,
                   window.firstResponder !== self.tableView else { return }
@@ -247,13 +239,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if self.viewModel?.isSearchVisible == true { return }
             window.makeFirstResponder(self.tableView)
         }
-        // Cmd+Down jumps to the tail from anywhere in the window — not just
-        // when the table has key focus (which only happens on scroll). A row
-        // selection puts key focus on the row's non-editable text view, where
-        // plain Arrow-Down does nothing; Cmd+Down always works. Deferred to
-        // EDITABLE text views (the prompt input, the find field), which use
-        // Cmd+Down to move to the end of their own text, and to open
-        // dropdowns/sheets, like the prompt's Esc handling.
+        // Cmd+Down jumps to the tail from anywhere in the window — the one
+        // key that always does it. Plain Arrow-Down keeps the default table
+        // behavior (no jump). Deferred to EDITABLE text views (the prompt
+        // input, the find field), which use Cmd+Down to move to the end of
+        // their own text, and to open dropdowns/sheets, like the prompt's Esc
+        // handling.
         cmdDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 125, // Down
                   event.modifierFlags.contains(.command),
@@ -1214,9 +1205,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
-    // MARK: - Streaming fade, arrow-down, tool-card expansion
+    // MARK: - Streaming fade, jump-to-tail, tool-card expansion
 
-    /// Arrow-Down: jump to the tail in one step and re-engage following. The
+    /// Cmd+Down: jump to the tail in one step and re-engage following. The
     /// tail row is refreshed first so content that grew while scrolled up
     /// renders at its true height before the jump.
     private func jumpToBottom() {
@@ -1249,26 +1240,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
 // MARK: - Transcript table
 
-/// The transcript table. Arrow-Down jumps to the bottom of the conversation in
-/// one step (rather than the default line-by-line key navigation), so a
-/// scrolled-up user gets back to the live tail with one keypress.
+/// The transcript table. Accepts key focus so a scroll (which makes the table
+/// first responder) enables keyboard navigation; the jump to the tail is
+/// Cmd+Down, handled window-level in the coordinator.
 final class TranscriptTableView: NSTableView {
-    var onArrowDown: (() -> Void)?
-
     override var acceptsFirstResponder: Bool { true }
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 125 { // Down arrow
-            onArrowDown?()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
 
 /// The transcript scroll view. `onUserScroll` fires only for real wheel
 /// events (never for programmatic follow-scrolls), so scrolling the transcript
-/// can take key focus for Arrow-Down without fighting the prompt bar.
+/// can take key focus without fighting the prompt bar.
 final class TranscriptScrollView: NSScrollView {
     var onUserScroll: (() -> Void)?
 

@@ -218,19 +218,12 @@ struct SessionContent: View {
     }
 
     /// The live status readout shown in very light gray at the bottom-right of
-    /// the prompt input: the elapsed time while a run is in flight, the
-    /// context-window usage, the current model, and the current thinking
-    /// level. Composed here from the session's observable state (SwiftUI
-    /// re-evaluates on change), so the AppKit prompt bar just displays the
-    /// string.
+    /// the prompt input: context-window usage, the current model, and the
+    /// current thinking level. Composed here from the session's observable
+    /// state (SwiftUI re-evaluates on change), so the AppKit prompt bar just
+    /// displays the string.
     private func statusText(_ vm: SessionViewModel) -> String {
         var parts: [String] = []
-        // Per-second elapsed timer while a command is running (the run spans
-        // from the first turn start to settle; `streamingElapsed` ticks every
-        // second).
-        if vm.streamingStartDate != nil {
-            parts.append("⏱ \(Self.formatElapsed(vm.streamingElapsed))")
-        }
         if let percent = vm.contextUsage?.percent {
             parts.append("ctx \(Int(percent.rounded()))%")
         }
@@ -241,15 +234,5 @@ struct SessionContent: View {
             parts.append(level)
         }
         return parts.joined(separator: " · ")
-    }
-
-    /// "23s" under a minute, "1:23" (m:ss) above — the per-second elapsed
-    /// readout.
-    private static func formatElapsed(_ elapsed: TimeInterval) -> String {
-        let total = max(0, Int(elapsed.rounded(.down)))
-        if total >= 60 {
-            return String(format: "%d:%02d", total / 60, total % 60)
-        }
-        return "\(total)s"
     }
 }

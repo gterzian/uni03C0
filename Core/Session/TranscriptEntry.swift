@@ -65,14 +65,20 @@ public struct ToolCallCard: Hashable, Sendable, Identifiable {
     public var argumentsValue: JSONValue?
     public var output: String
     public var state: ToolCallState
+    /// When tool EXECUTION started (`tool_execution_start`), for the elapsed
+    /// timer shown at the bottom of a running bash card. Nil before execution
+    /// begins (the card is created at `toolcall_end`) and for history rebuilt
+    /// from `get_messages` — the timer only appears for live running calls.
+    public var startedAt: Date?
 
-    public init(id: String, toolName: String, arguments: String, argumentsValue: JSONValue? = nil, output: String = "", state: ToolCallState = .running) {
+    public init(id: String, toolName: String, arguments: String, argumentsValue: JSONValue? = nil, output: String = "", state: ToolCallState = .running, startedAt: Date? = nil) {
         self.id = id
         self.toolName = toolName
         self.arguments = arguments
         self.argumentsValue = argumentsValue
         self.output = output
         self.state = state
+        self.startedAt = startedAt
     }
 }
 
