@@ -25,6 +25,15 @@ public final class SessionViewModel {
     /// successful send. Set by the view layer (SessionContent's dismiss button).
     public var lastError: String?
     public private(set) var isStreaming = false
+    /// When the current agent run started streaming (nil while idle). Spans
+    /// the WHOLE run — set on the first turn start and cleared on settle — so
+    /// `turn_end` between tool rounds does not reset it. Gates the ⏱ elapsed
+    /// readout in the prompt bar.
+    public private(set) var streamingStartDate: Date?
+    /// Elapsed seconds of the current agent run, ticked once per second while
+    /// the run is in flight (drives the ⏱ readout; re-renders via @Observable,
+    /// exactly like the context-usage poller).
+    public private(set) var streamingElapsed: TimeInterval = 0
     public private(set) var model: ModelInfo?
     public private(set) var availableModels: [ModelInfo] = []
     public private(set) var thinkingLevel: String?
@@ -247,6 +256,12 @@ public final class SessionViewModel {
     /// tool rounds).
     private static let contextPollInterval: Duration = .seconds(2)
     private var contextPollTask: Task<Void, Never>?
+    /// Per-second ticker for the elapsed-time readout. Started on the first
+    /// turn start and stopped on settle (the true end of work — not
+    /// `agent_end`/`turn_end`, which also fire between tool rounds); each tick
+    /// publishes `streamingElapsed`. Idempotent start keeps the run's first
+    /// start date across tool rounds and steering flushes.
+    @ObservationIgnored private var streamingElapsedTask: Task<Void, Never>?
 
     public init(cwd: URL, executable: String? = nil, projectsRoot: URL? = nil) {
         self.cwd = cwd
@@ -302,6 +317,7 @@ public final class SessionViewModel {
         eventTask?.cancel()
         eventTask = nil
         stopContextPolling()
+        stopStreamingElapsedTicker()
         await controller.terminate()
         await proxy.stop()
     }
@@ -328,6 +344,7 @@ public final class SessionViewModel {
         case "agent_start", "turn_start":
             isStreaming = true
             startContextPolling()
+            startStreamingElapsedTicker()
         case "agent_end", "turn_end":
             // turn_end also fires BETWEEN tool rounds inside one agent run —
             // that is not the end of the work, so nothing is flushed here
@@ -340,6 +357,7 @@ public final class SessionViewModel {
             // after an abort, return it to the input for editing instead.
             isStreaming = false
             stopContextPolling()
+            stopStreamingElapsedTicker()
             if abortReturnsQueuedSteering {
                 // The user aborted: don't flush queued steering as a new
                 // prompt — return it to the input for editing instead.
@@ -519,6 +537,33 @@ public final class SessionViewModel {
         contextPollTask = nil
     }
 
+    /// Starts the per-second elapsed ticker (idempotent: the first start of a
+    /// run sets `streamingStartDate`, later turn-starts keep it). Each tick
+    /// publishes `streamingElapsed` so the ⏱ readout re-renders. Runs until
+    /// `stopStreamingElapsedTicker()` — on `agent_settled` or teardown.
+    private func startStreamingElapsedTicker() {
+        guard streamingElapsedTask == nil else { return }
+        streamingStartDate = Date()
+        streamingElapsedTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return // cancelled — the loop is done
+                }
+                guard let self, let start = self.streamingStartDate else { return }
+                self.streamingElapsed = Date().timeIntervalSince(start)
+            }
+        }
+    }
+
+    private func stopStreamingElapsedTicker() {
+        streamingElapsedTask?.cancel()
+        streamingElapsedTask = nil
+        streamingStartDate = nil
+        streamingElapsed = 0
+    }
+
     private func refreshState() async {
         guard let payload = try? await controller.send(.getState()).dataPayload(SessionStatePayload.self) else {
             connectionState = .disconnected("no response from the agent")
@@ -529,6 +574,13 @@ public final class SessionViewModel {
         if let file = payload.sessionFile { sessionFile = URL(fileURLWithPath: file) }
         sessionName = payload.sessionName
         isStreaming = payload.isStreaming ?? false
+        if isStreaming {
+            // A resumed/reloaded session may already have a turn in flight
+            // with no fresh agent_start event: start the elapsed ticker so the
+            // ⏱ readout reflects it (idempotent — a live stream's own start
+            // is already ticking).
+            startStreamingElapsedTicker()
+        }
         connectionState = .connected
         await refreshRuntimeOptions()
     }

@@ -74,6 +74,19 @@ private struct SessionScrollState {
 final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
+    /// Local key monitor making Cmd+Down jump to the tail from anywhere in the
+    /// window. Plain Arrow-Down only works while the TABLE has key focus,
+    /// which happens only on scroll — selecting a row puts key focus on the
+    /// row's (non-editable) text view, where Down does nothing. Cmd+Down is
+    /// the always-works escape hatch, regardless of focus/selection.
+    /// Deferred to EDITABLE text views (the prompt input, the find field),
+    /// which use Cmd+Down to move to the end of their own text.
+    ///
+    /// `nonisolated(unsafe)`: installed only on the main thread (from
+    /// `makeScrollView`), and deinit runs only after the last reference is
+    /// dropped — so the read from the nonisolated deinit never races the
+    /// write.
+    private nonisolated(unsafe) var cmdDownMonitor: Any?
     /// The ACTIVE session's height cache (an element of `heightsBySession`).
     private var heights = HeightCache()
     /// Per-session height caches. Row ids are only unique WITHIN a session, so
@@ -206,7 +219,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.setAccessibilityElement(true)
         tv.setAccessibilityRole(.table)
         tv.setAccessibilityLabel("Conversation")
-        tv.setAccessibilityHelp("The conversation with the agent. Arrow-Down jumps to the latest message.")
+        tv.setAccessibilityHelp("The conversation with the agent. Arrow-Down jumps to the latest message; Cmd+Down does it from anywhere in the window.")
 
         let sv = TranscriptScrollView()
         sv.documentView = tv
@@ -233,6 +246,31 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             // field must keep working even as the transcript scrolls under it.
             if self.viewModel?.isSearchVisible == true { return }
             window.makeFirstResponder(self.tableView)
+        }
+        // Cmd+Down jumps to the tail from anywhere in the window — not just
+        // when the table has key focus (which only happens on scroll). A row
+        // selection puts key focus on the row's non-editable text view, where
+        // plain Arrow-Down does nothing; Cmd+Down always works. Deferred to
+        // EDITABLE text views (the prompt input, the find field), which use
+        // Cmd+Down to move to the end of their own text, and to open
+        // dropdowns/sheets, like the prompt's Esc handling.
+        cmdDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 125, // Down
+                  event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.option),
+                  !event.modifierFlags.contains(.control),
+                  !event.modifierFlags.contains(.shift) else { return event }
+            guard let self, let window = self.tableView?.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle it.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A visible popup-menu-level window (a dropdown / the completion
+            // list) is tracking: don't steal the key from it.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            if let editor = window.firstResponder as? NSTextView, editor.isEditable {
+                return event
+            }
+            self.jumpToBottom()
+            return nil
         }
 
         // Fetch older history (and refresh the tail) on scroll.
@@ -276,6 +314,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     deinit {
+        if let cmdDownMonitor {
+            NSEvent.removeMonitor(cmdDownMonitor)
+        }
         NotificationCenter.default.removeObserver(self)
     }
 
