@@ -74,19 +74,30 @@ private struct SessionScrollState {
 final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var tableView: NSTableView!
     private var scrollView: NSScrollView!
-    /// Local key monitor making Cmd+Down jump to the tail from anywhere in the
-    /// window. Plain Arrow-Down only works while the TABLE has key focus,
-    /// which happens only on scroll — selecting a row puts key focus on the
-    /// row's (non-editable) text view, where Down does nothing. Cmd+Down is
-    /// the always-works escape hatch, regardless of focus/selection.
-    /// Deferred to EDITABLE text views (the prompt input, the find field),
-    /// which use Cmd+Down to move to the end of their own text.
+    /// Local key monitor making Cmd+Down / Cmd+Up jump to the tail / the top
+    /// of the conversation from anywhere in the window — the always-works
+    /// jump, regardless of focus/selection. Plain Arrow-Up/Down deliberately
+    /// do NOT jump: they scroll the transcript like the wheel (see
+    /// `arrowScrollMonitor`). Deferred to EDITABLE text views (the prompt
+    /// input, the find field), which use Cmd+Up/Down to move the insertion
+    /// point to the beginning/end of their own text.
     ///
     /// `nonisolated(unsafe)`: installed only on the main thread (from
     /// `makeScrollView`), and deinit runs only after the last reference is
     /// dropped — so the read from the nonisolated deinit never races the
     /// write.
-    private nonisolated(unsafe) var cmdDownMonitor: Any?
+    private nonisolated(unsafe) var cmdJumpMonitor: Any?
+    /// Local key monitor making the arrow/Home/End/Page keys scroll the
+    /// transcript — plain Up/Down a few rows (the wheel feel), Fn+Up/Down and
+    /// Page Up/Down a full page, Fn+Left/Home to the beginning, Fn+Right/End
+    /// to the tail — from anywhere in the window, NOT a jump. The table only
+    /// has key focus right after a scroll, and the rows' non-editable text
+    /// views swallow arrows, so a window-level monitor is the only place the
+    /// keys always reach the conversation. Deferred to EDITABLE text views
+    /// (the prompt input, the find field), which use the arrows for their own
+    /// caret/page navigation, and to open dropdowns/sheets, like the Cmd+Down
+    /// handling. Same lifecycle rules as `cmdJumpMonitor`.
+    private nonisolated(unsafe) var arrowScrollMonitor: Any?
     /// The ACTIVE session's height cache (an element of `heightsBySession`).
     private var heights = HeightCache()
     /// Per-session height caches. Row ids are only unique WITHIN a session, so
@@ -137,6 +148,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// rows are evicted from the window and their heights dropped.
     private let bufferViewports = 3
     private let minBufferRows = 30
+    /// How far one plain Arrow keypress scrolls the transcript — a few rows,
+    /// "like scrolling", not a page jump. Scales with the viewport (`scrollByArrow`).
+    private let arrowScrollStep: CGFloat = 80
     /// True while a deferred eviction is pending (drives mutual exclusion with
     /// the compounding history fetch).
     private var isEvictingOlder = false
@@ -219,7 +233,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.setAccessibilityElement(true)
         tv.setAccessibilityRole(.table)
         tv.setAccessibilityLabel("Conversation")
-        tv.setAccessibilityHelp("The conversation with the agent. Arrow-Down jumps to the latest message; Cmd+Down does it from anywhere in the window.")
+        tv.setAccessibilityHelp("The conversation with the agent. Arrow keys scroll; Fn+Arrows/Page keys page; Home/End go to the start/end; Cmd+Up/Down jump to the start/latest message.")
 
         let sv = TranscriptScrollView()
         sv.documentView = tv
@@ -232,13 +246,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.dataSource = self
         tv.delegate = self
 
-        // Arrow-Down jumps to the bottom of the conversation in one step (and
-        // re-engages following). Scrolling the transcript takes key focus so
-        // Down works right after a trackpad scroll — focus otherwise stays on
-        // the prompt bar.
-        tv.onArrowDown = { [weak self] in
-            self?.jumpToBottom()
-        }
+        // Scrolling the transcript takes key focus (so VoiceOver and keyboard
+        // users land on the conversation); plain Arrow-Up/Down are handled
+        // window-level by `arrowScrollMonitor`, not by table key navigation.
         sv.onUserScroll = { [weak self] in
             guard let self, let window = self.tableView.window,
                   window.firstResponder !== self.tableView else { return }
@@ -247,15 +257,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if self.viewModel?.isSearchVisible == true { return }
             window.makeFirstResponder(self.tableView)
         }
-        // Cmd+Down jumps to the tail from anywhere in the window — not just
-        // when the table has key focus (which only happens on scroll). A row
-        // selection puts key focus on the row's non-editable text view, where
-        // plain Arrow-Down does nothing; Cmd+Down always works. Deferred to
-        // EDITABLE text views (the prompt input, the find field), which use
-        // Cmd+Down to move to the end of their own text, and to open
-        // dropdowns/sheets, like the prompt's Esc handling.
-        cmdDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard event.keyCode == 125, // Down
+        // Cmd+Down / Cmd+Up jump to the tail / the top from anywhere in the
+        // window — the always-works jumps, regardless of focus/selection
+        // (plain arrows scroll instead, see below). Deferred to EDITABLE text
+        // views (the prompt input, the find field), which use Cmd+Up/Down to
+        // move the insertion point to the beginning/end of their own text,
+        // and to open dropdowns/sheets, like the prompt's Esc handling.
+        cmdJumpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 125 || event.keyCode == 126, // Down / Up
                   event.modifierFlags.contains(.command),
                   !event.modifierFlags.contains(.option),
                   !event.modifierFlags.contains(.control),
@@ -269,7 +278,65 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if let editor = window.firstResponder as? NSTextView, editor.isEditable {
                 return event
             }
-            self.jumpToBottom()
+            if event.keyCode == 126 {
+                self.jumpToTop()
+            } else {
+                self.jumpToBottom()
+            }
+            return nil
+        }
+        // Arrow keys scroll the transcript, following the standard text-scroll
+        // conventions: plain Up/Down move a few rows (the wheel feel), Fn+Up/
+        // Fn+Down and the Page Up/Down keys move one page, Fn+Left / Home go
+        // to the beginning, Fn+Right / End to the tail — from anywhere in the
+        // window, so they work right after a trackpad scroll (focus otherwise
+        // stays on the prompt bar or a row's text view). This is "like
+        // scrolling", NOT a jump: Cmd+Up/Cmd+Down above are the jumps to the
+        // top/tail. Deferred to EDITABLE text views (the prompt input, the
+        // find field), which use the arrows for their own caret/page
+        // navigation, and to open dropdowns/sheets, like the Cmd+Down handling.
+        arrowScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // Scope: plain / Fn arrows and the Home/End/Page keys. Cmd/Option/
+            // Ctrl/Shift-modified keys fall through untouched (Cmd+Up/Down is
+            // the jump monitor above; Option+arrows are text-editing in fields).
+            let flags = event.modifierFlags
+            guard !flags.contains(.command), !flags.contains(.option),
+                  !flags.contains(.control), !flags.contains(.shift) else { return event }
+            let isFn = flags.contains(.function)
+            enum ScrollAction { case lines(Int), page(Int), top, tail }
+            let scroll: ScrollAction?
+            switch event.keyCode {
+            case 126: // Up / Fn+Up
+                scroll = isFn ? .page(-1) : .lines(-1)
+            case 125: // Down / Fn+Down
+                scroll = isFn ? .page(1) : .lines(1)
+            case 123 where isFn, 115: // Fn+Left / Home: beginning of conversation
+                scroll = .top
+            case 124 where isFn, 119: // Fn+Right / End: tail
+                scroll = .tail
+            case 116: // Page Up
+                scroll = .page(-1)
+            case 121: // Page Down
+                scroll = .page(1)
+            default:
+                return event
+            }
+            guard let self, let window = self.tableView?.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle it.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A visible popup-menu-level window (a dropdown / the completion
+            // list) is tracking: don't steal the key from it.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            if let editor = window.firstResponder as? NSTextView, editor.isEditable {
+                return event
+            }
+            switch scroll {
+            case .lines(let d): self.scrollByArrow(CGFloat(d))
+            case .page(let d): self.scrollByPage(CGFloat(d))
+            case .top: self.jumpToTop()
+            case .tail: self.jumpToBottom()
+            case nil: break
+            }
             return nil
         }
 
@@ -314,8 +381,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     deinit {
-        if let cmdDownMonitor {
-            NSEvent.removeMonitor(cmdDownMonitor)
+        if let cmdJumpMonitor {
+            NSEvent.removeMonitor(cmdJumpMonitor)
+        }
+        if let arrowScrollMonitor {
+            NSEvent.removeMonitor(arrowScrollMonitor)
         }
         NotificationCenter.default.removeObserver(self)
     }
@@ -1214,9 +1284,44 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
-    // MARK: - Streaming fade, arrow-down, tool-card expansion
+    // MARK: - Streaming fade, arrow scrolling, jump-to-tail, tool-card expansion
 
-    /// Arrow-Down: jump to the tail in one step and re-engage following. The
+    /// Plain Arrow-Up/Down scroll the transcript like the wheel: each press
+    /// moves the view by `arrowScrollStep` (a few rows) toward the head or the
+    /// tail, clamped to the document. This is incremental "scrolling", not a
+    /// jump — Cmd+Down (`jumpToBottom`) is the one-key jump to the tail. The
+    /// scroll feeds the normal direction-aware follow logic in
+    /// `reconcileOnScroll` (scrolling up disengages following; reaching the
+    /// bottom re-engages it).
+    private func scrollByArrow(_ direction: CGFloat) {
+        guard let scrollView, let documentView = scrollView.documentView else { return }
+        let viewport = scrollView.contentView.bounds.height
+        let step = max(arrowScrollStep, viewport / 8)
+        let maxY = max(0, documentView.frame.height - viewport)
+        let target = min(maxY, max(0, scrollView.contentView.bounds.origin.y + direction * step))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    /// Fn+Up/Fn+Down and the Page Up/Down keys: scroll one full viewport
+    /// toward the head or the tail (Apple's "Page Up: scroll up one page").
+    private func scrollByPage(_ direction: CGFloat) {
+        guard let scrollView, let documentView = scrollView.documentView else { return }
+        let viewport = scrollView.contentView.bounds.height
+        let maxY = max(0, documentView.frame.height - viewport)
+        let target = min(maxY, max(0, scrollView.contentView.bounds.origin.y + direction * viewport))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    /// Home / Fn+Left / Cmd+Up: jump to the very beginning of the
+    /// conversation (store index 0), materializing older history as needed,
+    /// and stop following (the user returning to the bottom re-engages it).
+    private func jumpToTop() {
+        scrollToStoreIndex(0)
+    }
+
+    /// Cmd+Down: jump to the tail in one step and re-engage following. The
     /// tail row is refreshed first so content that grew while scrolled up
     /// renders at its true height before the jump.
     private func jumpToBottom() {
@@ -1249,26 +1354,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
 // MARK: - Transcript table
 
-/// The transcript table. Arrow-Down jumps to the bottom of the conversation in
-/// one step (rather than the default line-by-line key navigation), so a
-/// scrolled-up user gets back to the live tail with one keypress.
+/// The transcript table. Accepts key focus so a scroll (which makes the table
+/// first responder) enables keyboard navigation. Plain Arrow-Up/Down and the
+/// Cmd+Down jump are handled window-level by the coordinator's key monitors —
+/// the table itself has no arrow handling (rows aren't selectable, so the
+/// default key navigation would do nothing).
 final class TranscriptTableView: NSTableView {
-    var onArrowDown: (() -> Void)?
-
     override var acceptsFirstResponder: Bool { true }
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 125 { // Down arrow
-            onArrowDown?()
-            return
-        }
-        super.keyDown(with: event)
-    }
 }
 
 /// The transcript scroll view. `onUserScroll` fires only for real wheel
 /// events (never for programmatic follow-scrolls), so scrolling the transcript
-/// can take key focus for Arrow-Down without fighting the prompt bar.
+/// can take key focus without fighting the prompt bar.
 final class TranscriptScrollView: NSScrollView {
     var onUserScroll: (() -> Void)?
 
