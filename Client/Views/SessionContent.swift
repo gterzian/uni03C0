@@ -59,6 +59,40 @@ struct SessionContent: View {
                     .opacity(0)
                     .frame(width: 0, height: 0)
                     .accessibilityHidden(true)
+                // Cmd+G / Shift+Cmd+G cycle the search matches (Find Again /
+                // Find Previous, the standard text-editing convention).
+                // Disabled (inert) when the bar is closed — match cycling
+                // only makes sense while a search is active.
+                Button("") { vm.nextSearchMatch() }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!vm.isSearchVisible)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+                Button("") { vm.previousSearchMatch() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!vm.isSearchVisible)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+                // Cmd+R reloads the session from disk — the same action as
+                // the toolbar Reload button ("refresh / reload" per Apple's
+                // conventions).
+                Button("") { Task { await vm.reload() } }
+                    .keyboardShortcut("r", modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+                // Cmd+= increases the conversation font — Apple lists
+                // Command-= as equivalent to Shift-Command-+ for "increase
+                // size" (the View menu carries the visible item).
+                Button("") {
+                    FontSettings.shared.bodySize = min(FontSettings.shared.bodySize + 1, 28)
+                }
+                    .keyboardShortcut("=", modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
             }
 
             Divider()

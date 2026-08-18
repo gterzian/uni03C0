@@ -223,6 +223,10 @@ public final class SessionViewModel {
     }
 
     private func advanceSearchMatch(by delta: Int) {
+        // Cycling only makes sense while the bar is open: with it closed the
+        // query is stale and re-running it would jump the transcript around
+        // behind the user's back (Cmd+G is a no-op until Cmd+F reopens).
+        guard isSearchVisible else { return }
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty, lastSearchedQuery == trimmed, lastSearchedCaseSensitive == isCaseSensitive, !searchMatches.isEmpty {
             // The visible matches are current for this query — advance now.

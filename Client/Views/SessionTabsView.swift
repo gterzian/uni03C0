@@ -28,6 +28,7 @@ struct SessionTabsView: View {
             if let active = activeTab {
                 SessionContent(tab: active)
             }
+            tabShortcuts
         }
         .navigationTitle(activeTab?.cwd.lastPathComponent ?? "uni03C0")
         .toolbar {
@@ -101,6 +102,36 @@ struct SessionTabsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             Task { await addTab(cwd: url) }
         }
+    }
+
+    private func cycleTab(by delta: Int) {
+        guard !tabs.isEmpty, let current = activeTab,
+              let index = tabs.firstIndex(where: { $0.id == current.id }) else { return }
+        activeID = tabs[(index + delta + tabs.count) % tabs.count].id
+    }
+
+    /// Hidden keyboard shortcuts for tab management, Safari-style: Cmd+T
+    /// starts a new session, Cmd+1…9 switches to the numbered session, and
+    /// Cmd+Shift+[ / Cmd+Shift+] cycle to the previous / next session. The
+    /// buttons are zero-size and invisible; only their key equivalents are
+    /// live (key equivalents fire even while typing in the prompt input,
+    /// matching tabbed-browser behavior).
+    private var tabShortcuts: some View {
+        ZStack {
+            Button("") { chooseFolderAndAddTab() }
+                .keyboardShortcut("t", modifiers: .command)
+            ForEach(Array(tabs.enumerated()), id: \.element.id) { index, tab in
+                Button("") { activeID = tab.id }
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+            }
+            Button("") { cycleTab(by: 1) }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+            Button("") { cycleTab(by: -1) }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Tab bar
