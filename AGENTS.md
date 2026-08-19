@@ -541,9 +541,10 @@ Behavior details that matter:
   front of the window) is **never** popped.
 - **Sticky follow, no jumps.** Following is on by default. The moment the user
   scrolls *up*, following disengages so streaming doesn't drag them back down;
-  it re-engages when they return to the bottom. Sending a message (or a
-  queued-steering flush) **never jumps the scroll** — the view stays exactly
-  where the user left it, even while the response streams in off-screen.
+  it re-engages when they return to the bottom. **Sending a prompt (or a
+  queued-steering flush) jumps to the tail** — the moment the user's message
+  echoes into the store, the view scrolls to the bottom and re-engages
+  following, so the response streams into view.
   Direction is detected from the scroll position (whether content remains
   below the viewport), **not** from row indices — a tall streaming row fills
   the viewport, so the last visible row can still be the tail even when

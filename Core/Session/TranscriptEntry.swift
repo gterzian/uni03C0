@@ -65,14 +65,20 @@ public struct ToolCallCard: Hashable, Sendable, Identifiable {
     public var argumentsValue: JSONValue?
     public var output: String
     public var state: ToolCallState
+    /// When the tool call started executing — live-stream cards only. Cards
+    /// rebuilt from `get_messages` are already settled and carry no real
+    /// start time (nil). The running bash card's per-second elapsed timer
+    /// reads this.
+    public var startedAt: Date?
 
-    public init(id: String, toolName: String, arguments: String, argumentsValue: JSONValue? = nil, output: String = "", state: ToolCallState = .running) {
+    public init(id: String, toolName: String, arguments: String, argumentsValue: JSONValue? = nil, output: String = "", state: ToolCallState = .running, startedAt: Date? = nil) {
         self.id = id
         self.toolName = toolName
         self.arguments = arguments
         self.argumentsValue = argumentsValue
         self.output = output
         self.state = state
+        self.startedAt = startedAt
     }
 }
 
