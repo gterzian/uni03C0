@@ -88,7 +88,9 @@ struct SessionTabsView: View {
 
     /// "+" — pick a folder to start a new session in. Any folder works, but
     /// the agent's workspace is the projects folder (every project inside it
-    /// is read+write), so the panel opens there.
+    /// is read+write). The panel opens on the right-most tab's folder (a new
+    /// session usually continues from the same project area), falling back to
+    /// the projects root while no tabs exist yet.
     private func chooseFolderAndAddTab() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -96,9 +98,7 @@ struct SessionTabsView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Start Session"
         panel.message = "Choose the folder to start a new agent session in. The agent's workspace is your projects folder — every project inside it is read + write."
-        if let root = AppState.shared.projectsRoot {
-            panel.directoryURL = root
-        }
+        panel.directoryURL = tabs.last?.cwd ?? AppState.shared.projectsRoot
         if panel.runModal() == .OK, let url = panel.url {
             Task { await addTab(cwd: url) }
         }

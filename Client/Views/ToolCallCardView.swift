@@ -163,9 +163,22 @@ struct ToolCallCardView: View {
                 HStack(spacing: 6) {
                     SpinnerView()
                         .frame(width: 12, height: 12)
-                    Text("running…")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if card.toolName == "bash", let start = card.startedAt {
+                        // The run timer lives here — the prompt-bar readout
+                        // no longer shows one. Ticks once per second via
+                        // TimelineView while the tool runs (the only SwiftUI
+                        // invalidation is this caption; the row height is
+                        // unchanged, so the table never churns).
+                        TimelineView(.periodic(from: start, by: 1)) { _ in
+                            Text("⏱ \(Self.formatElapsed(Date().timeIntervalSince(start)))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        Text("running…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -276,6 +289,16 @@ struct ToolCallCardView: View {
         // alpha alone.
         case .failed: DisplayOptions.increaseContrast ? .red : .red.opacity(0.5)
         }
+    }
+
+    /// "23s" under a minute, "1:23" (m:ss) above — the running bash tool's
+    /// per-second elapsed readout.
+    private static func formatElapsed(_ elapsed: TimeInterval) -> String {
+        let total = max(0, Int(elapsed.rounded(.down)))
+        if total >= 60 {
+            return String(format: "%d:%02d", total / 60, total % 60)
+        }
+        return "\(total)s"
     }
 }
 

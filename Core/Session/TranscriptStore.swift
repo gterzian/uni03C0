@@ -603,7 +603,7 @@ public final class TranscriptStore: @unchecked Sendable {
             } else {
                 _entries.append(TranscriptEntry(
                     id: callID,
-                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: block.name ?? "tool", arguments: pretty, argumentsValue: block.toolArguments))
+                    kind: .toolCall(card: ToolCallCard(id: callID, toolName: block.name ?? "tool", arguments: pretty, argumentsValue: block.toolArguments, startedAt: Date()))
                 ))
             }
         default:
@@ -629,7 +629,8 @@ public final class TranscriptStore: @unchecked Sendable {
             toolName: start.toolName ?? "tool",
             arguments: start.args?.prettyPrinted() ?? "",
             argumentsValue: start.args,
-            state: .running
+            state: .running,
+            startedAt: Date()
         )
         _entries.append(TranscriptEntry(id: id, kind: .toolCall(card: card)))
     }

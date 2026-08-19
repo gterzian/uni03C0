@@ -558,14 +558,24 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         if newCount > windowEnd {
             let oldEnd = windowEnd
             windowEnd = newCount
+            var appendedUserMessage = false
             let tableRange = (oldEnd - windowStart)..<(newCount - windowStart)
             for i in oldEnd..<newCount {
                 if let entry = store.entry(at: i) {
                     heights.invalidate(entry.id)
+                    if case .userMessage = entry.kind { appendedUserMessage = true }
                 }
             }
             tableView.insertRows(at: IndexSet(integersIn: tableRange), withAnimation: [])
             didAppend = true
+            // A freshly sent prompt (or a queued-steering flush) echoes the
+            // user's message into the store: jump to the tail and re-engage
+            // following so the response streams into view. The followTail
+            // below does the actual scroll; setting isFollowing first lets the
+            // streaming refresh run for the new turn-start placeholder.
+            if appendedUserMessage {
+                isFollowing = true
+            }
         }
 
         // Turn-end tool-card settles (abort/error/truncation): the store
@@ -592,10 +602,8 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             }
         }
 
-        // Deliberately NO jump-to-bottom on send: the scroll stays exactly
-        // where the user left it (they may be reading history while a queued
-        // steering message is flushed). The tail still streams in off-screen;
-        // following re-engages only when the user returns to the bottom.
+        // A prompt was just sent: the append above already re-engaged
+        // following, so the tail streams into view from the first echo.
         guard isFollowing else { return }
 
         // Batched in-place refresh of streaming rows: a few words at a time,
