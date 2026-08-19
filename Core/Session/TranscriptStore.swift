@@ -143,44 +143,92 @@ public final class TranscriptStore: @unchecked Sendable {
 
     // MARK: - Off-main entry points
 
+    /// One pre-decoded mutation, resolved from a frame's payload before the
+    /// lock is taken. Decoding is pure — it reads only the frame's own
+    /// immutable bytes, never store state — and for `message_end` it is the
+    /// single most expensive thing in `apply` (the whole accumulated message
+    /// is re-parsed), so it must never run under the lock, where it would
+    /// stall the renderer's lock-guarded reads on the main thread.
+    private enum FoldAction {
+        case beginMessage(AgentMessage)
+        case finalizeAssistant(AgentMessage)
+        case assistantEvent(AssistantMessageEvent)
+        case endTurn
+        case beginToolCall(ToolExecutionStart)
+        case updateToolCall(ToolExecutionUpdate)
+        case endToolCall(ToolExecutionEnd)
+        case bashOutput(id: String?, delta: String)
+        case none
+    }
+
+    /// Decodes a frame's payload without touching any store state. Cheap for
+    /// the streaming hot path (`message_update` deltas are small); the big
+    /// decodes (`message_end`, `toolcall_end`) happen here, off the lock.
+    private static func decode(_ frame: RPCFrame) -> FoldAction {
+        switch frame.type {
+        case "message_start":
+            return frame.decodeMessage().map(FoldAction.beginMessage) ?? .none
+        case "message_end":
+            guard let message = frame.decodeMessage(), message.role == "assistant" else { return .none }
+            return .finalizeAssistant(message)
+        case "message_update":
+            return frame.decodeAssistantEvent().map(FoldAction.assistantEvent) ?? .none
+        case "agent_end", "turn_end":
+            return .endTurn
+        case "tool_execution_start":
+            return frame.decodeToolStart().map(FoldAction.beginToolCall) ?? .none
+        case "tool_execution_update":
+            return frame.decodeToolUpdate().map(FoldAction.updateToolCall) ?? .none
+        case "tool_execution_end":
+            return frame.decodeToolEnd().map(FoldAction.endToolCall) ?? .none
+        case "bash_execution_update":
+            guard let delta = frame.deltaText() else { return .none }
+            return .bashOutput(id: frame.id, delta: delta)
+        default:
+            return .none // response/compaction/queue/extension frames: not surfaced in v1
+        }
+    }
+
     /// Folds one RPC frame into the transcript. Returns true if it mutated the
     /// transcript (i.e. the renderer should be notified).
     ///
-    /// The whole mutation runs under the lock: folding happens off the main
-    /// thread (detached tasks) while the renderer reads on the main thread, so
-    /// every write must be serialized against `entry(at:)`/`count`/… — not just
-    /// the version bump.
+    /// The frame's payload is decoded BEFORE the lock (see `FoldAction`); only
+    /// the mutation runs under it. The lock is held for the mutation because
+    /// folding happens off the main thread (detached tasks) while the renderer
+    /// reads on the main thread, so every write must be serialized against
+    /// `entry(at:)`/`count`/… — not just the version bump.
     @discardableResult
     public func apply(_ frame: RPCFrame) -> Bool {
+        let action = Self.decode(frame)
         lock.lock()
         defer { lock.unlock() }
-        var changed = false
-        switch frame.type {
-        case "message_start":
-            if let message = frame.decodeMessage() { beginMessage(message); changed = true }
-        case "message_end":
-            if let message = frame.decodeMessage(), message.role == "assistant" {
-                finalizeAssistant(message)
-                changed = true
-            }
-        case "message_update":
-            if let event = frame.decodeAssistantEvent() { applyAssistantEvent(event); changed = true }
-
-        case "agent_end", "turn_end":
+        let changed: Bool
+        switch action {
+        case .beginMessage(let message):
+            beginMessage(message)
+            changed = true
+        case .finalizeAssistant(let message):
+            finalizeAssistant(message)
+            changed = true
+        case .assistantEvent(let event):
+            applyAssistantEvent(event)
+            changed = true
+        case .endTurn:
             changed = endTurnPlaceholderOrFinalize()
-
-        case "tool_execution_start":
-            if let start = frame.decodeToolStart() { beginToolCall(start); changed = true }
-        case "tool_execution_update":
-            if let update = frame.decodeToolUpdate() { updateToolCall(update); changed = true }
-        case "tool_execution_end":
-            if let end = frame.decodeToolEnd() { endToolCall(end); changed = true }
-
-        case "bash_execution_update":
-            if let delta = frame.deltaText() { appendBashOutput(id: frame.id, delta: delta); changed = true }
-
-        default:
-            break // response/compaction/queue/extension frames: not surfaced in v1
+        case .beginToolCall(let start):
+            beginToolCall(start)
+            changed = true
+        case .updateToolCall(let update):
+            updateToolCall(update)
+            changed = true
+        case .endToolCall(let end):
+            endToolCall(end)
+            changed = true
+        case .bashOutput(let id, let delta):
+            appendBashOutput(id: id, delta: delta)
+            changed = true
+        case .none:
+            changed = false
         }
         if changed {
             _version &+= 1
