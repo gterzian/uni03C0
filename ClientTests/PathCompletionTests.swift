@@ -48,6 +48,22 @@ final class PathCompletionTests: XCTestCase {
         XCTAssertEqual(results, [])
     }
 
+    func testTrailingSlashKeepsDirectoryPrefix() throws {
+        try "".write(to: tempDir.appendingPathComponent("Sources/PathCompletion.swift"), atomically: true, encoding: .utf8)
+        // Regression: a trailing-slash fragment used to lose its directory
+        // prefix (deletingLastPathComponent returns "" for "Sources/"),
+        // emitting "/PathCompletion.swift" — committing that replaced the
+        // whole token with only the last path component.
+        let results = PathCompletion.candidates(for: "Sources/", cwd: tempDir)
+        XCTAssertEqual(results, ["Sources/PathCompletion.swift"])
+    }
+
+    func testTrailingSlashWithPartialKeepsDirectoryPrefix() throws {
+        try "".write(to: tempDir.appendingPathComponent("Sources/PathCompletion.swift"), atomically: true, encoding: .utf8)
+        let results = PathCompletion.candidates(for: "Sources/PathCom", cwd: tempDir)
+        XCTAssertEqual(results, ["Sources/PathCompletion.swift"])
+    }
+
     func testNoMatchYieldsEmpty() {
         XCTAssertEqual(PathCompletion.candidates(for: "zzz", cwd: tempDir), [])
     }

@@ -44,8 +44,21 @@ public enum PathCompletion {
             let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
             let completedName = name + (isDir ? "/" : "")
             if fragmentHasSlash {
-                let dirText = (fragment as NSString).deletingLastPathComponent
-                results.append(dirText + "/" + completedName)
+                if endsInSlash {
+                    // The slash is part of the typed fragment itself, so the
+                    // prefix to re-emit is the fragment verbatim (with its
+                    // trailing slash) and no separator is added. Do NOT use
+                    // deletingLastPathComponent here: for a trailing-slash
+                    // path it returns "" (Foundation treats the trailing-slash
+                    // name as the final component with no parent), which used
+                    // to drop the directory and emit a bogus leading "/" —
+                    // selecting a candidate then replaced "scratchpad/" with
+                    // "/something.md".
+                    results.append(fragment + completedName)
+                } else {
+                    let dirText = (fragment as NSString).deletingLastPathComponent
+                    results.append(dirText + "/" + completedName)
+                }
             } else {
                 results.append(completedName)
             }
