@@ -98,6 +98,19 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// caret/page navigation, and to open dropdowns/sheets, like the Cmd+Down
     /// handling. Same lifecycle rules as `cmdJumpMonitor`.
     private nonisolated(unsafe) var arrowScrollMonitor: Any?
+    /// Local key monitor handling the session-bound command shortcuts — Cmd+F
+    /// (toggle the find bar), Cmd+G / Shift+Cmd+G (cycle matches), Cmd+R
+    /// (reload) — from anywhere in the window. These read `viewModel` AT EVENT
+    /// TIME, never captured at render time, so they always act on the ACTIVE
+    /// tab: a SwiftUI `.keyboardShortcut` on a hidden button inside
+    /// `SessionContent` captured the first tab's view model and kept firing it
+    /// after a tab switch, so Cmd+F silently toggled the FIRST tab's find bar
+    /// while another tab was active (the reported bug). Unlike Cmd+Up/Down
+    /// and the arrows, these are NOT deferred to editable text views — like
+    /// menu key equivalents they work while typing in the prompt input or the
+    /// find field (Cmd+F from the input opens find; Cmd+G from the field
+    /// cycles). Same lifecycle rules as `cmdJumpMonitor`.
+    private nonisolated(unsafe) var sessionShortcutMonitor: Any?
     /// The ACTIVE session's height cache (an element of `heightsBySession`).
     private var heights = HeightCache()
     /// Per-session height caches. Row ids are only unique WITHIN a session, so
@@ -349,6 +362,43 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             return nil
         }
 
+        // Cmd+F / Cmd+G / Shift+Cmd+G / Cmd+R — the session-bound command
+        // shortcuts, handled here (not as SwiftUI hidden buttons) so they
+        // always act on the ACTIVE tab: the coordinator's `viewModel` is
+        // re-pointed on every rebind, and the monitor reads it at event time.
+        // See the property comment on `sessionShortcutMonitor`.
+        sessionShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let key = event.keyCode
+            guard key == 3 || key == 5 || key == 15, // F / G / R
+                  event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.option),
+                  !event.modifierFlags.contains(.control) else { return event }
+            let isShift = event.modifierFlags.contains(.shift)
+            guard let self, let window = self.tableView?.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle it.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A visible popup-menu-level window (a dropdown / the completion
+            // list) is tracking: don't steal the key from it.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            guard let vm = self.viewModel else { return event }
+            switch key {
+            case 3: // Cmd+F: toggle the find bar (closing clears the query).
+                vm.toggleSearch()
+            case 5: // Cmd+G / Shift+Cmd+G: cycle matches while the bar is up.
+                guard vm.isSearchVisible else { return event }
+                if isShift {
+                    vm.previousSearchMatch()
+                } else {
+                    vm.nextSearchMatch()
+                }
+            case 15: // Cmd+R: reload the session from disk.
+                Task { await vm.reload() }
+            default:
+                return event
+            }
+            return nil
+        }
+
         // Fetch older history (and refresh the tail) on scroll.
         NotificationCenter.default.addObserver(
             self,
@@ -395,6 +445,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
         if let arrowScrollMonitor {
             NSEvent.removeMonitor(arrowScrollMonitor)
+        }
+        if let sessionShortcutMonitor {
+            NSEvent.removeMonitor(sessionShortcutMonitor)
         }
         NotificationCenter.default.removeObserver(self)
     }

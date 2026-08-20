@@ -50,39 +50,15 @@ struct SessionContent: View {
                     .padding(.top, 8)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
-                // Cmd+F toggles the find bar (hidden: just the shortcut). The
-                // bar itself lives in the window toolbar, left of the Stop
-                // button — never over the transcript, so it can't block
-                // content.
-                Button("") { vm.toggleSearch() }
-                    .keyboardShortcut("f", modifiers: .command)
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-                    .accessibilityHidden(true)
-                // Cmd+G / Shift+Cmd+G cycle the search matches (Find Again /
-                // Find Previous, the standard text-editing convention).
-                // Disabled (inert) when the bar is closed — match cycling
-                // only makes sense while a search is active.
-                Button("") { vm.nextSearchMatch() }
-                    .keyboardShortcut("g", modifiers: .command)
-                    .disabled(!vm.isSearchVisible)
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-                    .accessibilityHidden(true)
-                Button("") { vm.previousSearchMatch() }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(!vm.isSearchVisible)
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-                    .accessibilityHidden(true)
-                // Cmd+R reloads the session from disk — the same action as
-                // the toolbar Reload button ("refresh / reload" per Apple's
-                // conventions).
-                Button("") { Task { await vm.reload() } }
-                    .keyboardShortcut("r", modifiers: .command)
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-                    .accessibilityHidden(true)
+                // The session-bound command shortcuts (Cmd+F find, Cmd+G /
+                // Shift+Cmd+G cycling, Cmd+R reload) are handled by the
+                // transcript coordinator's local key monitor, which reads the
+                // ACTIVE tab's view model at event time — hidden SwiftUI
+                // shortcut buttons captured the first tab's vm and kept firing
+                // it after a tab switch. Only app-wide shortcuts (no per-tab
+                // state) stay here. The find bar itself lives in the window
+                // toolbar, left of the Stop button — never over the transcript,
+                // so it can't block content.
                 // Cmd+= increases the conversation font — Apple lists
                 // Command-= as equivalent to Shift-Command-+ for "increase
                 // size" (the View menu carries the visible item).
