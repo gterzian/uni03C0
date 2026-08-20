@@ -55,13 +55,15 @@ final class SessionViewModelSearchTests: XCTestCase {
         }
     }
 
-    func testBatchedSearchLandsMatchesInStoreOrderAfterCompletion() async {
+    func testBatchedSearchLandsMatchesInReverseSessionOrder() async {
         let vm = makeViewModel()
         vm.runSearch("needle")
         await waitUntil { !vm.isSearching && vm.searchMatches.count == 3 }
-        XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [0, 1, 4], "final list must be in store order")
+        XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [4, 1, 0],
+            "results are presented in REVERSE session order: the bottom-most match first")
         XCTAssertFalse(vm.isSearching, "search must be complete")
-        XCTAssertEqual(vm.searchCurrentIndex, 2, "the current match stays the first-found (bottom) match")
+        XCTAssertEqual(vm.searchCurrentIndex, 0,
+            "the current match is the first-found (bottom) match, so the counter reads 1/3")
     }
 
     func testResultsArriveIncrementallyTailFirst() async {
@@ -127,18 +129,23 @@ final class SessionViewModelSearchTests: XCTestCase {
         vm.toggleSearch()
         vm.runSearch("needle")
         await waitUntil { !vm.isSearching && vm.searchMatches.count == 3 }
-        // Matches are in store order [0, 1, 4]; the current match is the
-        // first-found (bottom, row 4) match, at the END of the list.
-        XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [0, 1, 4])
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4)
+        // Matches are in reverse session order [4, 1, 0]; the current match is
+        // the first-found (bottom) match, at index 0.
+        XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [4, 1, 0])
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "result 1 is the bottom-most match")
+        // ↓/Enter moves DOWN the session (toward newer content), so the
+        // result number DECREASES: from result 1 (bottom) it wraps to the
+        // last result (top), then walks back down through the history.
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 0, "next from the last match wraps to the first")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 0, "↓ from the bottom-most match wraps to the top-most (result 3/3)")
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1)
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "↓ then walks down the history (result 2/3)")
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "wraps around again")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "↓ wraps back to result 1/3 (the bottom)")
+        // ↑/Shift+Enter moves UP the session (toward older content), so the
+        // result number INCREASES.
         vm.previousSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "previous wraps backwards")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "↑ from the bottom goes to result 2/3")
     }
 
     func testEmptyQueryClearsResultsImmediately() async {

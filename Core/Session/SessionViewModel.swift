@@ -68,12 +68,13 @@ public final class SessionViewModel {
     public var isSearchVisible = false
     /// The current query (the find bar's text, kept per session).
     public var searchQuery = ""
-    /// The live match list, in store order. While a search is in progress
-    /// (`isSearching`) this is a PARTIAL list — only the ranges processed so
-    /// far — and grows as each batch lands; it reaches the full
-    /// conversation's matches once the search completes. Ranges are searched
-    /// tail-first, so new matches always prepend (they sit at earlier store
-    /// indices than everything found so far) and the list stays sorted.
+    /// The live match list, in REVERSE session order — the bottom-most (most
+    /// recent) match is index 0, so the find bar reads 1/270 and the first
+    /// result is the one nearest the viewport (the search jumps to it, and
+    /// never yanks the viewport up to earlier history). While a search is in
+    /// progress (`isSearching`) this is a PARTIAL list — only the ranges
+    /// processed so far — and grows at the END as each batch lands; it
+    /// reaches the full conversation's matches once the search completes.
     public private(set) var searchMatches: [TranscriptStore.SearchMatch] = []
     /// Index into `searchMatches` of the current match; -1 when there are none.
     public private(set) var searchCurrentIndex = -1
@@ -220,30 +221,33 @@ public final class SessionViewModel {
     /// main actor as they land, then the next range above is searched, until
     /// the whole conversation is covered.
     ///
-    /// Threading model (deliberate): the LOOP stays on the main actor; only
-    /// the `store.search` work is off-main, inside the per-batch detached
-    /// task. The `await` between batches yields the main actor, so streaming,
-    /// folding and the rest of the UI never stall while a search is in
-    /// flight. The apply (`applySearchResults`) mutates MainActor state
+    /// Threading model (deliberate): this loop is NONISOLATED — it runs on
+    /// the search task's executor, OFF the main actor — and hops to the main
+    /// actor once per batch, only to apply the results. The main thread's
+    /// per-batch work is therefore just the apply (match-list prepend, index
+    /// fix-up, highlight notification); it never drives the loop and never
+    /// waits on a scan, so scrolling/streaming stay free for the whole
+    /// search. The apply (`applySearchResults`) mutates MainActor state
     /// (`searchMatches`, `searchCurrentIndex`, `isSearching`) and calls the
-    /// coordinator hooks, so it must run on the main actor no matter what.
-    /// Do NOT move the whole loop off the main actor to "parallelize" it:
-    /// the apply would hop back anyway, no search work is gained, and the
-    /// loop must observe cancellation between batches.
+    /// coordinator hooks, so it must run on the main actor — but nothing
+    /// else in the search does. Cancellation is observed between batches
+    /// (`Task.isCancelled`), and a superseding run is dropped by the run-id
+    /// guard inside `applySearchResults`.
     ///
     /// Note: the ranges are computed ONCE from the store's count at search
     /// start. Rows appended WHILE the search runs (a turn streaming in) are
     /// deliberately not covered by this run — re-running the search (or the
     /// next Enter) picks them up. This is a known, accepted limitation for
     /// now, kept so the loop is a simple countdown over a fixed slice list.
-    @MainActor
-    private func searchBatches(store: TranscriptStore, trimmed: String, caseSensitive: Bool, runID: UInt64, advanceBy: Int?) async {
+    private nonisolated func searchBatches(store: TranscriptStore, trimmed: String, caseSensitive: Bool, runID: UInt64, advanceBy: Int?) async {
+        let batchSize = await MainActor.run { self.searchBatchSize }
         let total = store.count
         if total == 0 {
-            applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true, advanceBy: advanceBy)
+            await MainActor.run {
+                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true, advanceBy: advanceBy)
+            }
             return
         }
-        let batchSize = searchBatchSize
         var upperBound = total
         var isFirstBatch = true
         while upperBound > 0, !Task.isCancelled {
@@ -255,23 +259,30 @@ public final class SessionViewModel {
                 store.search(trimmed, caseSensitive: caseSensitive, in: lowerBound..<upperBound)
             }.value
             guard !Task.isCancelled else { return }
-            applySearchResults(matches, trimmed: trimmed, runID: runID, isFirstBatch: isFirstBatch, searchComplete: lowerBound == 0, advanceBy: isFirstBatch ? advanceBy : nil)
+            await MainActor.run {
+                self.applySearchResults(matches, trimmed: trimmed, runID: runID, isFirstBatch: isFirstBatch, searchComplete: lowerBound == 0, advanceBy: isFirstBatch ? advanceBy : nil)
+            }
             upperBound = lowerBound
             isFirstBatch = false
         }
     }
 
-    /// Applies ONE search batch on the main actor. The first batch of a run
-    /// replaces the (cleared) match list and positions the current match
-    /// (landing on the first match, or advancing by `advanceBy` when the user
-    /// pressed Enter mid-search); every later batch prepends its matches —
-    /// they sit ABOVE the already-searched ranges in store order — and shifts
-    /// the current index so the current match stays put. Only the first batch
-    /// (or the first match appearing after an empty tail) jumps the
-    /// transcript; later batches just extend the highlight set without moving
-    /// the user's viewport.
+    /// Applies ONE search batch on the main actor. The match list is built in
+    /// REVERSE session order — the bottom-most (most recent) match is index 0,
+    /// so the find bar reads 1/270 and the first result is the one nearest the
+    /// viewport, and the search jump never yanks the viewport up to earlier
+    /// history (which fought the user's own scrolling). Batches arrive
+    /// tail-first, so each batch's matches (ascending store index within the
+    /// batch) are reversed and APPENDED: index 0 is always the first-found
+    /// (bottom) match and never shifts as later batches land. The first batch
+    /// replaces the cleared list and positions the current match (landing on
+    /// the first match, or advancing by `advanceBy` when the user pressed
+    /// Enter mid-search). Only the first batch (or the first match appearing
+    /// after an empty tail) jumps the transcript; later batches just extend
+    /// the highlight set without moving the user's viewport.
     private func applySearchResults(_ batch: [TranscriptStore.SearchMatch], trimmed: String, runID: UInt64, isFirstBatch: Bool, searchComplete: Bool, advanceBy: Int?) {
         guard runID == searchRunID else { return } // superseded by a newer run
+        let batch = Array(batch.reversed())
         var shouldJump = false
         if isFirstBatch {
             searchMatches = batch
@@ -284,16 +295,14 @@ public final class SessionViewModel {
             }
             shouldJump = !batch.isEmpty
         } else {
-            searchMatches = batch + searchMatches
+            // Appending never shifts the current match's index (it sits at the
+            // front of the list), so no index fix-up is needed.
+            searchMatches = searchMatches + batch
             if searchCurrentIndex < 0, !searchMatches.isEmpty {
                 // The tail batches found nothing — the first match just
                 // appeared, adopt it and jump so the user sees the first hit.
                 searchCurrentIndex = 0
                 shouldJump = true
-            } else if !batch.isEmpty, searchCurrentIndex >= 0 {
-                // New matches landed ABOVE the current one — keep the current
-                // match under the same row, just at a shifted index.
-                searchCurrentIndex += batch.count
             }
         }
         lastSearchedQuery = trimmed
@@ -315,14 +324,19 @@ public final class SessionViewModel {
         }
     }
 
-    /// Enter / ↓: cycle to the next match, wrapping.
+    /// Enter / ↓: move to the next match DOWN the session — toward newer
+    /// content, so the result number DECREASES (result 1 is the bottom-most
+    /// match, and the counter reads 1/N for it) — wrapping around to the
+    /// last match at the top of the session.
     public func nextSearchMatch() {
-        advanceSearchMatch(by: 1)
+        advanceSearchMatch(by: -1)
     }
 
-    /// Shift+Enter / ↑: cycle to the previous match, wrapping.
+    /// Shift+Enter / ↑: move to the previous match UP the session — toward
+    /// older content, so the result number INCREASES — wrapping around to
+    /// the bottom-most match.
     public func previousSearchMatch() {
-        advanceSearchMatch(by: -1)
+        advanceSearchMatch(by: 1)
     }
 
     private func advanceSearchMatch(by delta: Int) {

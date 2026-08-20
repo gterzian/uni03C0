@@ -558,25 +558,34 @@ Behavior details that matter:
   message — the same wording as pi's TUI (`assistant-message.js`). Send
   preflight failures (auth, rejected prompts) and a dead agent process surface
   as an error banner above the prompt bar instead of being silently swallowed.
-- **Batched find: results stream in, the loop stays on the main actor.**
+- **Batched find: results stream in, the loop runs off the main actor.**
   `TranscriptStore.search` takes a range; the view model searches the session
   from the TAIL upward in slices of `searchBatchSize`, each slice in its own
   detached task and applied as it lands — the find bar fills in near the
   bottom first (the rows the user can already see) and shows "x of
   ⟨spinner⟩" until the whole session is covered, while cycling works on the
-  partial list. The batch LOOP is deliberately `@MainActor`: only the search
-  is off-main, and the per-batch `await` yields the actor (streaming/folding
-  never stall); the apply must be on main anyway — it mutates the match
-  list/current index and notifies the coordinator. Don't move the loop
-  off-main to "parallelize" it: the apply hops back regardless and nothing is
-  gained. Rows appended while a search runs are not covered by that run (the
-  ranges are snapshotted at search start); re-running or the next Enter picks
-  them up. The store uses a **reader-writer lock** (`StoreLock`, pthread_rwlock)
-  precisely so this works: the batched search scan takes a READ lock, as do
-  the renderer's per-tile/scroll reads (`entry(at:)`), so readers never block
-  each other — a scan over the tail's huge tool outputs can't freeze
-  scrolling (the first batch is the worst offender) — while `apply`/`rebuild`
-  mutations take the exclusive WRITE lock and wait for any scan to finish.
+  partial list. Results are presented in REVERSE session order — the
+  bottom-most (most recent) match is index 0, so the find bar reads 1/270
+  and the search jump lands near the viewport (never yanking up to earlier
+  history, which fought the user's own scrolling). The batch LOOP is
+  `nonisolated` — it runs on the search
+  task's executor, OFF the main actor — and hops to the main actor once per
+  batch, only to apply the results (the apply mutates the match list/current
+  index and notifies the coordinator, so it must be on main; nothing else in
+  the search is). The main thread never drives the loop and never waits on a
+  scan, so scrolling/streaming stay free for the whole search. Rows appended
+  while a search runs are not covered by that run (the ranges are snapshotted
+  at search start); re-running or the next Enter picks them up. The store
+  uses a **reader-writer lock** (`StoreLock`, pthread_rwlock) precisely so
+  this works: the batched search scan takes a READ lock, as do the renderer's
+  per-tile/scroll reads (`entry(at:)`), so readers never block each other — a
+  scan over the tail's huge tool outputs can't freeze scrolling (the first
+  batch is the worst offender) — while `apply`/`rebuild` mutations take the
+  exclusive WRITE lock and wait for any scan to finish. Highlight refreshes
+  are coalesced to one `reloadData` per 0.25s while the search runs (the
+  match list grows every batch; a reload per batch re-typesets every visible
+  row's markdown and freezes scrolling); the search completion always
+  flushes, so the final highlights are never stale.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
   views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
   tail row updates at most every 0.25s (a hard cap, never per character-delta),
