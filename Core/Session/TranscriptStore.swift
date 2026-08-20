@@ -1,4 +1,38 @@
+import Darwin
 import Foundation
+
+/// A reader-writer lock (POSIX) so `TranscriptStore`'s reads never block each
+/// other: the renderer's per-tile `entry(at:)` calls and the batched search
+/// scan all take the READ lock (concurrent with other readers), while
+/// `apply`/`rebuild` mutations take the WRITE lock (exclusive). Without this,
+/// a search scan holding a plain lock would stall every tile/scroll read
+/// until the batch finished — a visible UI freeze (the tail's huge tool
+/// outputs make the first batch the worst offender).
+private final class StoreLock: @unchecked Sendable {
+    private var rwlock = pthread_rwlock_t()
+
+    init() {
+        pthread_rwlock_init(&rwlock, nil)
+    }
+
+    deinit {
+        pthread_rwlock_destroy(&rwlock)
+    }
+
+    /// Exclusive (mutations): blocks until every reader and writer is done.
+    func writeLock() {
+        pthread_rwlock_wrlock(&rwlock)
+    }
+
+    /// Shared (reads): concurrent with other readers, blocks writers.
+    func readLock() {
+        pthread_rwlock_rdlock(&rwlock)
+    }
+
+    func unlock() {
+        pthread_rwlock_unlock(&rwlock)
+    }
+}
 
 /// Owns the FULL ordered transcript, independent of any rendering concern.
 ///
@@ -16,7 +50,12 @@ import Foundation
 /// of AppKit. The store's only measurement role is to own the mutable entry
 /// list the render side keys its height cache on.
 public final class TranscriptStore: @unchecked Sendable {
-    private let lock = NSLock()
+    /// Reader-writer lock (see `StoreLock`): reads — `entry(at:)` per
+    /// tile/scroll, the batched search scan — run concurrently with each
+    /// other; only mutations (`apply`, `rebuild`) are exclusive. A plain
+    /// lock held across a scan would make the renderer's per-tile reads block
+    /// behind an in-flight search batch and freeze scrolling.
+    private let lock = StoreLock()
     private var _entries: [TranscriptEntry] = []
     /// Bumped on every tail mutation (append or in-place change).
     private var _version: UInt64 = 0
@@ -58,7 +97,7 @@ public final class TranscriptStore: @unchecked Sendable {
     // MARK: - Read API (any thread, cheap, lock-guarded)
 
     public var count: Int {
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
         return _entries.count
     }
@@ -67,26 +106,26 @@ public final class TranscriptStore: @unchecked Sendable {
     /// in-place edit at the end"; changes to `_generation` mean "everything
     /// was replaced".
     public var currentVersion: UInt64 {
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
         return _version
     }
 
     public var currentGeneration: UInt64 {
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
         return _generation
     }
 
     public func entry(at index: Int) -> TranscriptEntry? {
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
         guard _entries.indices.contains(index) else { return nil }
         return _entries[index]
     }
 
     public func entries(in range: Range<Int>) -> [TranscriptEntry] {
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
         guard range.lowerBound >= 0, range.lowerBound < _entries.count else { return [] }
         let clamped = range.clamped(to: _entries.indices)
@@ -111,22 +150,38 @@ public final class TranscriptStore: @unchecked Sendable {
         }
     }
 
-    /// Searches the FULL conversation — every folded row, including history
-    /// the view has not materialized — for `query`, case-insensitive by
-    /// default (`caseSensitive: true` matches exactly), in each row's
-    /// `searchableText`. Returns matches in store order.
-    public func search(_ query: String, caseSensitive: Bool = false) -> [SearchMatch] {
+    /// Searches `range` of the conversation — every folded row in that slice,
+    /// including history the view has not materialized — for `query`,
+    /// case-insensitive by default (`caseSensitive: true` matches exactly), in
+    /// each row's `searchableText`. Returns matches in ascending store order
+    /// within the range. The range is clamped to the live entry count, so a
+    /// slice that extends past the tail is safe (rows appended after the
+    /// caller snapshotted the count simply are not covered).
+    ///
+    /// The view model drives this in batches — the caller searches ranges,
+    /// never the whole store at once, so a huge conversation is covered in
+    /// pieces with results landing incrementally.
+    ///
+    /// The scan takes a READ lock (see `StoreLock`), so it runs concurrently
+    /// with the renderer's other reads — `entry(at:)` on every tile/scroll
+    /// never blocks behind an in-flight batch — while mutations wait for it
+    /// to finish.
+    public func search(_ query: String, caseSensitive: Bool = false, in range: Range<Int>) -> [SearchMatch] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
         let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
-        lock.lock()
+        lock.readLock()
         defer { lock.unlock() }
+        guard !_entries.isEmpty else { return [] }
+        let clamped = range.clamped(to: _entries.indices)
+        guard !clamped.isEmpty else { return [] }
         var matches: [SearchMatch] = []
-        for (index, entry) in _entries.enumerated() {
+        for index in clamped {
+            let entry = _entries[index]
             let haystack = entry.searchableText
             guard !haystack.isEmpty else { continue }
-            guard let range = haystack.range(of: q, options: options) else { continue }
-            matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: range)))
+            guard let hit = haystack.range(of: q, options: options) else { continue }
+            matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: hit)))
         }
         return matches
     }
@@ -200,7 +255,7 @@ public final class TranscriptStore: @unchecked Sendable {
     @discardableResult
     public func apply(_ frame: RPCFrame) -> Bool {
         let action = Self.decode(frame)
-        lock.lock()
+        lock.writeLock()
         defer { lock.unlock() }
         let changed: Bool
         switch action {
@@ -386,7 +441,7 @@ public final class TranscriptStore: @unchecked Sendable {
             }
         }
 
-        lock.lock()
+        lock.writeLock()
         _entries = result
         _version &+= 1
         _generation &+= 1

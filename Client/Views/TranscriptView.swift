@@ -189,6 +189,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var currentSearchRowID: String?
     private var lastSearchQuery: String?
 
+    /// Mid-search highlight refreshes are coalesced to at most this often: a
+    /// `reloadData` per search batch re-typesets every visible row's markdown
+    /// (the batch loop can land a batch every few ms on a large session),
+    /// which saturates the main thread and freezes scrolling while the
+    /// spinner is up. The search completion always flushes below, so the
+    /// final highlights are never stale. Same cadence as the streaming gate.
+    private static let searchHighlightRefreshInterval: TimeInterval = 0.25
+    private var lastSearchHighlightRefresh: TimeInterval = 0
+
     /// How many rows currently fit in the viewport (or a sane default).
     private func viewportRows() -> Int {
         guard let tableView else { return 20 }
@@ -1178,6 +1187,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// stay cached and the scroll position is preserved).
     private func refreshSearchHighlight() {
         guard let viewModel else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if viewModel.isSearching {
+            // Coalesce while the search runs: a reloadData per batch
+            // re-typesets every visible row's markdown (and deriving the match
+            // id set is O(matches)), which saturates the main thread and
+            // freezes scrolling. Inside the window, skip even the set
+            // derivation; the completion (isSearching false, below) always
+            // flushes the final state.
+            if now - lastSearchHighlightRefresh < Self.searchHighlightRefreshInterval {
+                return
+            }
+        }
         let ids = Set(viewModel.searchMatches.map(\.rowID))
         let current = viewModel.searchMatches.indices.contains(viewModel.searchCurrentIndex)
             ? viewModel.searchMatches[viewModel.searchCurrentIndex].rowID
@@ -1187,6 +1208,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         searchMatchRowIDs = ids
         currentSearchRowID = current
         lastSearchQuery = query
+        if viewModel.isSearching {
+            lastSearchHighlightRefresh = now
+        }
         tableView.reloadData()
     }
 

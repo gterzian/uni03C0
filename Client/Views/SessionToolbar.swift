@@ -173,7 +173,23 @@ enum SessionToolbar {
                 .onChange(of: vm.searchQuery) { _, q in vm.updateSearchQuery(q) }
                 let trimmed = vm.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    if vm.searchMatches.isEmpty {
+                    if vm.isSearching {
+                        // Batched search in progress: the total is unknown
+                        // until the whole session is covered, so show the
+                        // current position with a spinner instead of a final
+                        // count. Cycling still works on the partial results.
+                        HStack(spacing: 4) {
+                            if vm.searchMatches.isEmpty {
+                                Text("searching…")
+                            } else {
+                                Text("\(vm.searchCurrentIndex + 1) of")
+                            }
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    } else if vm.searchMatches.isEmpty {
                         Text("no matches")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -187,22 +203,22 @@ enum SessionToolbar {
                                 : ""))
                     }
                 }
-                Button { vm.previousSearchMatch() } label: {
+                Button { vm.nextSearchMatch() } label: {
                     Image(systemName: "chevron.up")
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .disabled(vm.searchMatches.isEmpty)
-                .help("Previous match")
-                Button { vm.nextSearchMatch() } label: {
+                .help("Next match (↩)")
+                Button { vm.previousSearchMatch() } label: {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .disabled(vm.searchMatches.isEmpty)
-                .help("Next match (↩)")
+                .help("Previous match")
                 // Case-sensitive matching, unticked by default. Toggling
                 // re-runs the current query immediately (the match list and
                 // highlight follow the new sensitivity). fixedSize keeps the

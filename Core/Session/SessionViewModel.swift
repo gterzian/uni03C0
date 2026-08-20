@@ -68,11 +68,21 @@ public final class SessionViewModel {
     public var isSearchVisible = false
     /// The current query (the find bar's text, kept per session).
     public var searchQuery = ""
-    /// The live match list, in store order — always the FULL conversation
-    /// (`TranscriptStore.search` scans the store, never the view window).
+    /// The live match list, in REVERSE session order — the bottom-most (most
+    /// recent) match is index 0, so the find bar reads 1/270 and the first
+    /// result is the one nearest the viewport (the search jumps to it, and
+    /// never yanks the viewport up to earlier history). While a search is in
+    /// progress (`isSearching`) this is a PARTIAL list — only the ranges
+    /// processed so far — and grows at the END as each batch lands; it
+    /// reaches the full conversation's matches once the search completes.
     public private(set) var searchMatches: [TranscriptStore.SearchMatch] = []
     /// Index into `searchMatches` of the current match; -1 when there are none.
     public private(set) var searchCurrentIndex = -1
+    /// True while a batched search has ranges still to cover. The find bar
+    /// shows "x of ⟨spinner⟩" instead of a final total until this flips
+    /// false — the total is only known once the whole session has been
+    /// searched. Cycling (Enter/Shift+Enter) still works on the partial list.
+    public private(set) var isSearching = false
     /// Case-sensitive matching for the find bar (off by default, matching
     /// most find-in-page defaults).
     public var isCaseSensitive = false
@@ -86,6 +96,10 @@ public final class SessionViewModel {
     public var onSearchResultsChanged: (() -> Void)?
 
     private var searchTask: Task<Void, Never>?
+    /// Monotonic id per search run. Batch applications guard on it: a batch
+    /// whose run was superseded (the query changed mid-search, or the bar
+    /// closed) is dropped even if its task escaped cancellation.
+    private var searchRunID: UInt64 = 0
     /// The query the current match list was computed for (Enter re-runs the
     /// search when the text has changed since the last run).
     private var lastSearchedQuery = ""
@@ -99,16 +113,26 @@ public final class SessionViewModel {
     /// feeling laggy (250ms fired per keystroke, 800ms waited too long).
     private static let searchSettleDelay: Duration = .milliseconds(500)
 
-    /// Toggles the find bar. Closing it clears the match state and returns the
-    /// transcript to the user's own position.
+    /// Rows per search batch. The search walks the conversation from the tail
+    /// upward in slices of this size; each slice is searched in its own task
+    /// and the results applied as they land, so the find bar fills in
+    /// incrementally (bottom of the conversation first — the rows the user
+    /// can already see) instead of after one whole-store pass. Sized so a
+    /// single-batch search is well under a millisecond even for text-heavy
+    /// rows. Internal so tests can shrink it to observe intermediate states.
+    internal var searchBatchSize = 200
+
+    /// Toggles the find bar. Closing it clears the search state AND the
+    /// query, so reopening starts a blank new search (no stale results or
+    /// auto-run of the previous query).
     public func toggleSearch() {
         if isSearchVisible {
             closeSearch()
         } else {
             isSearchVisible = true
-            // Reopening with the previous query still in the field re-runs it,
-            // so Cmd+F brings the results (and highlight) straight back instead
-            // of an empty match list until the query is edited again.
+            // Closing cleared the query, so the field reopens blank; this is
+            // a defensive no-op in the normal flow (no path leaves a query
+            // set while the bar is closed).
             if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 runSearch(searchQuery)
             }
@@ -117,16 +141,21 @@ public final class SessionViewModel {
 
     public func closeSearch() {
         isSearchVisible = false
+        searchQuery = ""
         clearSearchResults()
     }
 
     /// Clears the match state (closing the bar, or a session switch that made
     /// the old row ids meaningless) and tells the view to drop the highlights.
+    /// Also invalidates any in-flight batched search: the run id is bumped so
+    /// batches already dispatched under the old run are dropped on arrival.
     private func clearSearchResults() {
         searchTask?.cancel()
         searchTask = nil
+        searchRunID &+= 1
         searchMatches = []
         searchCurrentIndex = -1
+        isSearching = false
         lastSearchedQuery = ""
         lastSearchedCaseSensitive = false
         onSearchResultsChanged?()
@@ -137,20 +166,24 @@ public final class SessionViewModel {
     /// restarts the settle timer, so a burst of typing launches a single
     /// search instead of one per character.
     public func updateSearchQuery(_ query: String) {
-        performSearch(query: query, debounce: Self.searchSettleDelay, advanceBy: nil)
+        performSearch(query: query, debounce: Self.searchSettleDelay)
     }
 
     /// Runs the search now (Enter / Cmd+F reopen / sensitivity toggle).
     public func runSearch(_ query: String) {
-        performSearch(query: query, debounce: .zero, advanceBy: nil)
+        performSearch(query: query, debounce: .zero)
     }
 
-    /// Searches the FULL store on a background executor, then applies the
-    /// results on the main actor. The store is lock-guarded and thread-safe,
-    /// so searching a huge conversation never blocks the UI — only the result
-    /// application (match list, jump, notification) touches the main thread.
-    private func performSearch(query: String, debounce: Duration, advanceBy: Int?) {
+    /// Runs a batched search over the store. The whole conversation is NOT
+    /// searched in one pass: `performSearch` resets the run state, then
+    /// `searchBatches` walks the store from the TAIL upward in slices of
+    /// `searchBatchSize` rows, searching each slice in its own task and
+    /// applying the results as they land, until every row is covered. The
+    /// find bar therefore fills in near the bottom first (the rows the user
+    /// can already see) and the total only appears once the run completes.
+    private func performSearch(query: String, debounce: Duration) {
         searchTask?.cancel()
+        searchRunID &+= 1
         searchQuery = query
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask = Task { [weak self] in
@@ -159,37 +192,128 @@ public final class SessionViewModel {
                 try? await Task.sleep(for: debounce)
                 guard !Task.isCancelled else { return }
             }
+            guard !Task.isCancelled else { return }
             let caseSensitive = self.isCaseSensitive
             let store = self.store
-            let matches: [TranscriptStore.SearchMatch]
+            let runID = self.searchRunID
             if trimmed.isEmpty {
-                matches = []
-            } else {
-                matches = await Task.detached(priority: .userInitiated) {
-                    store.search(trimmed, caseSensitive: caseSensitive)
-                }.value
+                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true)
+                return
             }
-            guard !Task.isCancelled else { return }
-            self.applySearchResults(matches, trimmed: trimmed, advanceBy: advanceBy)
+            self.beginSearchRun()
+            await self.searchBatches(store: store, trimmed: trimmed, caseSensitive: caseSensitive, runID: runID)
         }
     }
 
-    /// Applies a finished search on the main actor: publishes the match list,
-    /// keeps the current index when it is still valid (or advances it when the
-    /// user pressed Enter before the search settled), then jumps and notifies
-    /// the view that new results are ready.
-    private func applySearchResults(_ matches: [TranscriptStore.SearchMatch], trimmed: String, advanceBy: Int?) {
-        searchMatches = matches
-        if matches.isEmpty {
-            searchCurrentIndex = -1
-        } else if let advanceBy {
-            searchCurrentIndex = (searchCurrentIndex + advanceBy + matches.count) % matches.count
-        } else if !matches.indices.contains(searchCurrentIndex) {
-            searchCurrentIndex = 0
+    /// Marks a search run as in progress: the previous query's matches are
+    /// dropped and `isSearching` flips on, so the find bar shows a spinner
+    /// until the first batch lands. The current index is deliberately kept —
+    /// a same-query re-run (e.g. a case-sensitivity toggle) preserves the
+    /// position; a fresh query lands on result 1 when the first batch applies.
+    private func beginSearchRun() {
+        searchMatches = []
+        isSearching = true
+        onSearchResultsChanged?()
+    }
+
+    /// The batched search loop. Walks the conversation from the TAIL upward:
+    /// each range is searched in its own detached task (off the main thread —
+    /// the search itself never blocks the UI), the results applied on the
+    /// main actor as they land, then the next range above is searched, until
+    /// the whole conversation is covered.
+    ///
+    /// Threading model (deliberate): this loop is NONISOLATED — it runs on
+    /// the search task's executor, OFF the main actor — and hops to the main
+    /// actor once per batch, only to apply the results. The main thread's
+    /// per-batch work is therefore just the apply (match-list prepend, index
+    /// fix-up, highlight notification); it never drives the loop and never
+    /// waits on a scan, so scrolling/streaming stay free for the whole
+    /// search. The apply (`applySearchResults`) mutates MainActor state
+    /// (`searchMatches`, `searchCurrentIndex`, `isSearching`) and calls the
+    /// coordinator hooks, so it must run on the main actor — but nothing
+    /// else in the search does. Cancellation is observed between batches
+    /// (`Task.isCancelled`), and a superseding run is dropped by the run-id
+    /// guard inside `applySearchResults`.
+    ///
+    /// Note: the ranges are computed ONCE from the store's count at search
+    /// start. Rows appended WHILE the search runs (a turn streaming in) are
+    /// deliberately not covered by this run — re-running the search (or the
+    /// next Enter) picks them up. This is a known, accepted limitation for
+    /// now, kept so the loop is a simple countdown over a fixed slice list.
+    private nonisolated func searchBatches(store: TranscriptStore, trimmed: String, caseSensitive: Bool, runID: UInt64) async {
+        let batchSize = await MainActor.run { self.searchBatchSize }
+        let total = store.count
+        if total == 0 {
+            await MainActor.run {
+                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true)
+            }
+            return
+        }
+        var upperBound = total
+        var isFirstBatch = true
+        while upperBound > 0, !Task.isCancelled {
+            let lowerBound = max(0, upperBound - batchSize)
+            // Each range is searched in a NEW task, so a superseding search
+            // can cancel this loop between batches and the dispatched work is
+            // simply dropped (the run-id guard in applySearchResults).
+            let matches = await Task.detached(priority: .userInitiated) { [store, trimmed, caseSensitive, lowerBound, upperBound] in
+                store.search(trimmed, caseSensitive: caseSensitive, in: lowerBound..<upperBound)
+            }.value
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self.applySearchResults(matches, trimmed: trimmed, runID: runID, isFirstBatch: isFirstBatch, searchComplete: lowerBound == 0)
+            }
+            upperBound = lowerBound
+            isFirstBatch = false
+        }
+    }
+
+    /// Applies ONE search batch on the main actor. The match list is built in
+    /// REVERSE session order — the bottom-most (most recent) match is index 0,
+    /// so the find bar reads 1/270 and the first result is the one nearest the
+    /// viewport, and the search jump never yanks the viewport up to earlier
+    /// history (which fought the user's own scrolling). Batches arrive
+    /// tail-first, so each batch's matches (ascending store index within the
+    /// batch) are reversed and APPENDED: index 0 is always the first-found
+    /// (bottom) match and never shifts as later batches land. A fresh search
+    /// always lands on result 1 (index 0) — a same-query re-run (e.g. a
+    /// case-sensitivity toggle) keeps the current position when it is still
+    /// valid. Only the first batch (or the first match appearing after an
+    /// empty tail) jumps the transcript; later batches just extend the
+    /// highlight set without moving the user's viewport.
+    private func applySearchResults(_ batch: [TranscriptStore.SearchMatch], trimmed: String, runID: UInt64, isFirstBatch: Bool, searchComplete: Bool) {
+        guard runID == searchRunID else { return } // superseded by a newer run
+        let batch = Array(batch.reversed())
+        var shouldJump = false
+        if isFirstBatch {
+            searchMatches = batch
+            if batch.isEmpty {
+                searchCurrentIndex = -1
+            } else if lastSearchedQuery == trimmed, batch.indices.contains(searchCurrentIndex) {
+                // Same-query re-run: keep the current position.
+            } else {
+                // Fresh search: land on result 1 — the bottom-most match — so
+                // the counter reads 1/N and the jump stays near the viewport.
+                searchCurrentIndex = 0
+            }
+            shouldJump = !batch.isEmpty
+        } else {
+            // Appending never shifts the current match's index (it sits at the
+            // front of the list), so no index fix-up is needed.
+            searchMatches = searchMatches + batch
+            if searchCurrentIndex < 0, !searchMatches.isEmpty {
+                // The tail batches found nothing — the first match just
+                // appeared, adopt it and jump so the user sees the first hit.
+                searchCurrentIndex = 0
+                shouldJump = true
+            }
         }
         lastSearchedQuery = trimmed
         lastSearchedCaseSensitive = isCaseSensitive
-        jumpToCurrentMatch()
+        isSearching = !searchComplete
+        if shouldJump {
+            jumpToCurrentMatch()
+        }
         onSearchResultsChanged?()
     }
 
@@ -203,12 +327,16 @@ public final class SessionViewModel {
         }
     }
 
-    /// Enter / ↓: cycle to the next match, wrapping.
+    /// Enter / Cmd+G / chevron-up: move to the NEXT result in list order —
+    /// 1 → 2 → 3, up the session toward older content (the result number
+    /// INCREASES) — wrapping around to the bottom-most match after the last.
     public func nextSearchMatch() {
         advanceSearchMatch(by: 1)
     }
 
-    /// Shift+Enter / ↑: cycle to the previous match, wrapping.
+    /// Shift+Enter / Shift+Cmd+G / chevron-down: move to the PREVIOUS result —
+    /// down the session toward newer content (the result number DECREASES) —
+    /// wrapping around to the top-most match.
     public func previousSearchMatch() {
         advanceSearchMatch(by: -1)
     }
@@ -221,13 +349,22 @@ public final class SessionViewModel {
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty, lastSearchedQuery == trimmed, lastSearchedCaseSensitive == isCaseSensitive, !searchMatches.isEmpty {
             // The visible matches are current for this query — advance now.
-            searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+            if isSearching {
+                // Partial list, still growing: CLAMP instead of wrapping. The
+                // modular wrap would jump from result 1 to the partial list's
+                // END (the top-most match found so far) — e.g. Enter mid-
+                // search landing on 76/307 and yanking the viewport up the
+                // history while more batches are landing.
+                searchCurrentIndex = min(max(searchCurrentIndex + delta, 0), searchMatches.count - 1)
+            } else {
+                searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+            }
             jumpToCurrentMatch()
             onSearchResultsChanged?()
         } else if !trimmed.isEmpty {
             // The matches are stale (typing since the last run) or a search is
-            // in flight — re-run and advance once the fresh results land.
-            performSearch(query: searchQuery, debounce: .zero, advanceBy: delta)
+            // in flight — re-run; the fresh results land on result 1.
+            performSearch(query: searchQuery, debounce: .zero)
         }
     }
 
