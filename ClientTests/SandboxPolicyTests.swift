@@ -32,6 +32,7 @@ final class SandboxSettingsTests: XCTestCase {
             "auth.openai.com", "githubcopilot.com", "x.ai", "openrouter.ai",
             "whatwg.org", "w3c.org", "w3c.github.io",
             "github.com", "githubusercontent.com",
+            "github.io", // GitHub Pages (docs sites, project pages)
             "crates.io", "npmjs.org", "pypi.org", "files.pythonhosted.org",
             "proxy.golang.org", "static.rust-lang.org", "nodejs.org", "ghcr.io",
             "docs.rs", "doc.rust-lang.org", "developer.mozilla.org", "developer.apple.com",
@@ -81,7 +82,10 @@ final class SandboxPolicyTests: XCTestCase {
 
     func testPolicyIsDefaultDeny() {
         let source = source(settings: .init(readOnlyPaths: [], allowedHosts: []))
-        XCTAssertTrue(source.contains("(deny default)"))
+        // The general denial carries the unified-log message explaining where
+        // the denial came from and what to do (added when the policy gained
+        // `(with message …)` explanations).
+        XCTAssertTrue(source.contains("(deny default (with message"))
         XCTAssertTrue(source.contains("(version 1)"))
     }
 
