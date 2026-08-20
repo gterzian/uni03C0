@@ -571,7 +571,12 @@ Behavior details that matter:
   off-main to "parallelize" it: the apply hops back regardless and nothing is
   gained. Rows appended while a search runs are not covered by that run (the
   ranges are snapshotted at search start); re-running or the next Enter picks
-  them up.
+  them up. The store uses a **reader-writer lock** (`StoreLock`, pthread_rwlock)
+  precisely so this works: the batched search scan takes a READ lock, as do
+  the renderer's per-tile/scroll reads (`entry(at:)`), so readers never block
+  each other — a scan over the tail's huge tool outputs can't freeze
+  scrolling (the first batch is the worst offender) — while `apply`/`rebuild`
+  mutations take the exclusive WRITE lock and wait for any scan to finish.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
   views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
   tail row updates at most every 0.25s (a hard cap, never per character-delta),
