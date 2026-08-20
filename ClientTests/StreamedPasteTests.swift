@@ -71,7 +71,10 @@ final class StreamedPasteTests: XCTestCase {
     }
 
     func testWindowTextAtTopIsTheHead() {
-        let full = String(repeating: "ab", count: 50_000)
+        // Text that fits in the budget: the window at the head is the whole
+        // text. ("ab" is TWO UTF-16 units, so 25k repetitions are 50k units —
+        // within the 65_536 budget.)
+        let full = String(repeating: "ab", count: 25_000)
         let window = StreamedPaste.windowText(fullText: full, windowStart: 0, budget: budget)
         XCTAssertEqual(window, full)
     }
@@ -85,14 +88,29 @@ final class StreamedPasteTests: XCTestCase {
     }
 
     func testWindowTextStartDoesNotSplitSurrogatePair() {
-        // The window start lands exactly inside a surrogate pair: the pair
-        // must be kept whole in the window (start moves back one unit).
-        let full = String(repeating: "q", count: budget - 1) + "🙂" + String(repeating: "r", count: 10)
-        let start = budget - 1 // would split "🙂" (units budget-1, budget)
+        // A window start that lands BETWEEN the two units of a surrogate pair
+        // must move back one unit so the pair is kept WHOLE at the start of
+        // the window. The window shifts left and stays budget-sized (the end
+        // is computed from the adjusted start, so it never exceeds the
+        // budget). Text is ~2× the budget so the window doesn't clamp.
+        let full = String(repeating: "q", count: budget - 2) + "🙂" + String(repeating: "r", count: budget)
+        let start = budget - 1 // boundary between "🙂"'s units (high at budget-2, low at budget-1)
         let window = StreamedPaste.windowText(fullText: full, windowStart: start, budget: budget)
         XCTAssertTrue(window.unicodeScalars.allSatisfy { !$0.isSurrogate }, "window must be well-formed UTF-16")
-        XCTAssertEqual((window as NSString).length, budget + 1, "the pair is included whole, so the window is one unit longer")
-        XCTAssertTrue(window.hasSuffix("🙂"), "the emoji ends up in the window")
+        XCTAssertEqual((window as NSString).length, budget, "the window stays budget-sized, shifted left to keep the pair whole")
+        XCTAssertTrue(window.hasPrefix("🙂"), "the pair is kept whole at the start of the window")
+    }
+
+    func testWindowTextEndDoesNotSplitSurrogatePair() {
+        // A budget cut that lands BETWEEN the two units of a surrogate pair
+        // must move back one unit, so the window never ends with a lone high
+        // surrogate — the pair is left OUT of the window whole (the window is
+        // one unit shorter than the budget).
+        let full = String(repeating: "q", count: budget - 1) + "🙂" + String(repeating: "r", count: 10)
+        let window = StreamedPaste.windowText(fullText: full, windowStart: 0, budget: budget)
+        XCTAssertTrue(window.unicodeScalars.allSatisfy { !$0.isSurrogate }, "window must be well-formed UTF-16")
+        XCTAssertEqual((window as NSString).length, budget - 1, "the pair is left out whole, so the window is one unit shorter")
+        XCTAssertEqual(window, String(repeating: "q", count: budget - 1), "the window ends with plain text, not a split pair")
     }
 
     func testSlidingWindowsCoverTheStore() {
