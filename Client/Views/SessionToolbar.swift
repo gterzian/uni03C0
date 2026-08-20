@@ -203,22 +203,22 @@ enum SessionToolbar {
                                 : ""))
                     }
                 }
-                Button { vm.previousSearchMatch() } label: {
+                Button { vm.nextSearchMatch() } label: {
                     Image(systemName: "chevron.up")
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .disabled(vm.searchMatches.isEmpty)
-                .help("Previous match")
-                Button { vm.nextSearchMatch() } label: {
+                .help("Next match (↩)")
+                Button { vm.previousSearchMatch() } label: {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .disabled(vm.searchMatches.isEmpty)
-                .help("Next match (↩)")
+                .help("Previous match")
                 // Case-sensitive matching, unticked by default. Toggling
                 // re-runs the current query immediately (the match list and
                 // highlight follow the new sensitivity). fixedSize keeps the

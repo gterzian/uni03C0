@@ -567,9 +567,11 @@ Behavior details that matter:
   partial list. Results are presented in REVERSE session order — the
   bottom-most (most recent) match is index 0, so the find bar reads 1/270
   and the search jump lands near the viewport (never yanking up to earlier
-  history, which fought the user's own scrolling). ↓/Enter move DOWN the
-  session toward newer content (the result number decreases — result 1 is
-  the bottom-most match); ↑/Shift+Enter move the other way. The batch LOOP is
+  history, which fought the user's own scrolling). Enter/Cmd+G/↑ move to the
+  NEXT result in list order (1 → 2 → 3, up the session toward older content);
+  Shift+Enter/Shift+Cmd+G/↓ the other way. Cycling never wraps while the
+  search is in flight (the partial list is still growing) — it clamps at the
+  ends instead. The batch LOOP is
   `nonisolated` — it runs on the search
   task's executor, OFF the main actor — and hops to the main actor once per
   batch, only to apply the results (the apply mutates the match list/current

@@ -122,16 +122,17 @@ public final class SessionViewModel {
     /// rows. Internal so tests can shrink it to observe intermediate states.
     internal var searchBatchSize = 200
 
-    /// Toggles the find bar. Closing it clears the match state and returns the
-    /// transcript to the user's own position.
+    /// Toggles the find bar. Closing it clears the search state AND the
+    /// query, so reopening starts a blank new search (no stale results or
+    /// auto-run of the previous query).
     public func toggleSearch() {
         if isSearchVisible {
             closeSearch()
         } else {
             isSearchVisible = true
-            // Reopening with the previous query still in the field re-runs it,
-            // so Cmd+F brings the results (and highlight) straight back instead
-            // of an empty match list until the query is edited again.
+            // Closing cleared the query, so the field reopens blank; this is
+            // a defensive no-op in the normal flow (no path leaves a query
+            // set while the bar is closed).
             if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 runSearch(searchQuery)
             }
@@ -140,6 +141,7 @@ public final class SessionViewModel {
 
     public func closeSearch() {
         isSearchVisible = false
+        searchQuery = ""
         clearSearchResults()
     }
 
@@ -164,12 +166,12 @@ public final class SessionViewModel {
     /// restarts the settle timer, so a burst of typing launches a single
     /// search instead of one per character.
     public func updateSearchQuery(_ query: String) {
-        performSearch(query: query, debounce: Self.searchSettleDelay, advanceBy: nil)
+        performSearch(query: query, debounce: Self.searchSettleDelay)
     }
 
     /// Runs the search now (Enter / Cmd+F reopen / sensitivity toggle).
     public func runSearch(_ query: String) {
-        performSearch(query: query, debounce: .zero, advanceBy: nil)
+        performSearch(query: query, debounce: .zero)
     }
 
     /// Runs a batched search over the store. The whole conversation is NOT
@@ -179,7 +181,7 @@ public final class SessionViewModel {
     /// applying the results as they land, until every row is covered. The
     /// find bar therefore fills in near the bottom first (the rows the user
     /// can already see) and the total only appears once the run completes.
-    private func performSearch(query: String, debounce: Duration, advanceBy: Int?) {
+    private func performSearch(query: String, debounce: Duration) {
         searchTask?.cancel()
         searchRunID &+= 1
         searchQuery = query
@@ -195,20 +197,19 @@ public final class SessionViewModel {
             let store = self.store
             let runID = self.searchRunID
             if trimmed.isEmpty {
-                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true, advanceBy: advanceBy)
+                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true)
                 return
             }
             self.beginSearchRun()
-            await self.searchBatches(store: store, trimmed: trimmed, caseSensitive: caseSensitive, runID: runID, advanceBy: advanceBy)
+            await self.searchBatches(store: store, trimmed: trimmed, caseSensitive: caseSensitive, runID: runID)
         }
     }
 
     /// Marks a search run as in progress: the previous query's matches are
     /// dropped and `isSearching` flips on, so the find bar shows a spinner
     /// until the first batch lands. The current index is deliberately kept —
-    /// an `advanceBy` (Enter/Shift+Enter pressed while the run was starting)
-    /// is applied relative to the previous position when the first batch
-    /// lands, matching the pre-batched behavior.
+    /// a same-query re-run (e.g. a case-sensitivity toggle) preserves the
+    /// position; a fresh query lands on result 1 when the first batch applies.
     private func beginSearchRun() {
         searchMatches = []
         isSearching = true
@@ -239,12 +240,12 @@ public final class SessionViewModel {
     /// deliberately not covered by this run — re-running the search (or the
     /// next Enter) picks them up. This is a known, accepted limitation for
     /// now, kept so the loop is a simple countdown over a fixed slice list.
-    private nonisolated func searchBatches(store: TranscriptStore, trimmed: String, caseSensitive: Bool, runID: UInt64, advanceBy: Int?) async {
+    private nonisolated func searchBatches(store: TranscriptStore, trimmed: String, caseSensitive: Bool, runID: UInt64) async {
         let batchSize = await MainActor.run { self.searchBatchSize }
         let total = store.count
         if total == 0 {
             await MainActor.run {
-                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true, advanceBy: advanceBy)
+                self.applySearchResults([], trimmed: trimmed, runID: runID, isFirstBatch: true, searchComplete: true)
             }
             return
         }
@@ -260,7 +261,7 @@ public final class SessionViewModel {
             }.value
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                self.applySearchResults(matches, trimmed: trimmed, runID: runID, isFirstBatch: isFirstBatch, searchComplete: lowerBound == 0, advanceBy: isFirstBatch ? advanceBy : nil)
+                self.applySearchResults(matches, trimmed: trimmed, runID: runID, isFirstBatch: isFirstBatch, searchComplete: lowerBound == 0)
             }
             upperBound = lowerBound
             isFirstBatch = false
@@ -274,13 +275,13 @@ public final class SessionViewModel {
     /// history (which fought the user's own scrolling). Batches arrive
     /// tail-first, so each batch's matches (ascending store index within the
     /// batch) are reversed and APPENDED: index 0 is always the first-found
-    /// (bottom) match and never shifts as later batches land. The first batch
-    /// replaces the cleared list and positions the current match (landing on
-    /// the first match, or advancing by `advanceBy` when the user pressed
-    /// Enter mid-search). Only the first batch (or the first match appearing
-    /// after an empty tail) jumps the transcript; later batches just extend
-    /// the highlight set without moving the user's viewport.
-    private func applySearchResults(_ batch: [TranscriptStore.SearchMatch], trimmed: String, runID: UInt64, isFirstBatch: Bool, searchComplete: Bool, advanceBy: Int?) {
+    /// (bottom) match and never shifts as later batches land. A fresh search
+    /// always lands on result 1 (index 0) — a same-query re-run (e.g. a
+    /// case-sensitivity toggle) keeps the current position when it is still
+    /// valid. Only the first batch (or the first match appearing after an
+    /// empty tail) jumps the transcript; later batches just extend the
+    /// highlight set without moving the user's viewport.
+    private func applySearchResults(_ batch: [TranscriptStore.SearchMatch], trimmed: String, runID: UInt64, isFirstBatch: Bool, searchComplete: Bool) {
         guard runID == searchRunID else { return } // superseded by a newer run
         let batch = Array(batch.reversed())
         var shouldJump = false
@@ -288,9 +289,11 @@ public final class SessionViewModel {
             searchMatches = batch
             if batch.isEmpty {
                 searchCurrentIndex = -1
-            } else if let advanceBy {
-                searchCurrentIndex = (searchCurrentIndex + advanceBy + batch.count) % batch.count
-            } else if !batch.indices.contains(searchCurrentIndex) {
+            } else if lastSearchedQuery == trimmed, batch.indices.contains(searchCurrentIndex) {
+                // Same-query re-run: keep the current position.
+            } else {
+                // Fresh search: land on result 1 — the bottom-most match — so
+                // the counter reads 1/N and the jump stays near the viewport.
                 searchCurrentIndex = 0
             }
             shouldJump = !batch.isEmpty
@@ -324,19 +327,18 @@ public final class SessionViewModel {
         }
     }
 
-    /// Enter / ↓: move to the next match DOWN the session — toward newer
-    /// content, so the result number DECREASES (result 1 is the bottom-most
-    /// match, and the counter reads 1/N for it) — wrapping around to the
-    /// last match at the top of the session.
+    /// Enter / Cmd+G / chevron-up: move to the NEXT result in list order —
+    /// 1 → 2 → 3, up the session toward older content (the result number
+    /// INCREASES) — wrapping around to the bottom-most match after the last.
     public func nextSearchMatch() {
-        advanceSearchMatch(by: -1)
+        advanceSearchMatch(by: 1)
     }
 
-    /// Shift+Enter / ↑: move to the previous match UP the session — toward
-    /// older content, so the result number INCREASES — wrapping around to
-    /// the bottom-most match.
+    /// Shift+Enter / Shift+Cmd+G / chevron-down: move to the PREVIOUS result —
+    /// down the session toward newer content (the result number DECREASES) —
+    /// wrapping around to the top-most match.
     public func previousSearchMatch() {
-        advanceSearchMatch(by: 1)
+        advanceSearchMatch(by: -1)
     }
 
     private func advanceSearchMatch(by delta: Int) {
@@ -347,13 +349,22 @@ public final class SessionViewModel {
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty, lastSearchedQuery == trimmed, lastSearchedCaseSensitive == isCaseSensitive, !searchMatches.isEmpty {
             // The visible matches are current for this query — advance now.
-            searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+            if isSearching {
+                // Partial list, still growing: CLAMP instead of wrapping. The
+                // modular wrap would jump from result 1 to the partial list's
+                // END (the top-most match found so far) — e.g. Enter mid-
+                // search landing on 76/307 and yanking the viewport up the
+                // history while more batches are landing.
+                searchCurrentIndex = min(max(searchCurrentIndex + delta, 0), searchMatches.count - 1)
+            } else {
+                searchCurrentIndex = (searchCurrentIndex + delta + searchMatches.count) % searchMatches.count
+            }
             jumpToCurrentMatch()
             onSearchResultsChanged?()
         } else if !trimmed.isEmpty {
             // The matches are stale (typing since the last run) or a search is
-            // in flight — re-run and advance once the fresh results land.
-            performSearch(query: searchQuery, debounce: .zero, advanceBy: delta)
+            // in flight — re-run; the fresh results land on result 1.
+            performSearch(query: searchQuery, debounce: .zero)
         }
     }
 

@@ -17,8 +17,9 @@ final class SessionViewModelSearchTests: XCTestCase {
     ///   2 user      "nothing here"
     ///   3 assistant "nothing here either"
     ///   4 user      "needle at the bottom"
-    ///   5 assistant "no results here"
-    private func makeViewModel() -> SessionViewModel {
+    ///   5 assistant `bottomAssistantText` (default "no results here" — no
+    ///     match; override to give the tail batch a match too)
+    private func makeViewModel(bottomAssistantText: String = "no results here") -> SessionViewModel {
         let vm = SessionViewModel(cwd: URL(fileURLWithPath: "/tmp"))
         vm.searchBatchSize = 1
         let store = vm.store
@@ -36,7 +37,7 @@ final class SessionViewModelSearchTests: XCTestCase {
 
         turn("needle at the top", "needle in the middle")
         turn("nothing here", "nothing here either")
-        turn("needle at the bottom", "no results here")
+        turn("needle at the bottom", bottomAssistantText)
         XCTAssertEqual(store.count, 6, "expected 6 rows (one user + one assistant per turn)")
         return vm
     }
@@ -124,6 +125,47 @@ final class SessionViewModelSearchTests: XCTestCase {
             "the advanced index must point into the visible match list")
     }
 
+    func testEnterDuringSearchStartupLandsOnFirstResult() async {
+        let vm = makeViewModel()
+        vm.toggleSearch()
+        vm.runSearch("needle")
+        // Press ↓/Enter on the SAME main-actor turn, before the search task
+        // has run: the matches are stale/absent, so this re-runs the search.
+        // The fresh results must land on result 1 — this is the exact
+        // regression where pressing Enter during a search landed at a shifted
+        // index (76/307) instead of 1/307.
+        vm.nextSearchMatch()
+        await waitUntil { !vm.isSearching && vm.searchMatches.count == 3 }
+        XCTAssertEqual(vm.searchCurrentIndex, 0,
+            "Enter during search startup lands on result 1, never a shifted index")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "result 1 is the bottom-most match")
+    }
+
+    func testCyclingMidSearchClampsInsteadOfWrapping() async {
+        // The tail batch (rows 4-5) has TWO matches, so with batchSize 2 the
+        // partial list has 2 entries when the first batch lands. Pressing
+        // next mid-search twice: once to reach the partial list's end, once
+        // to prove the CLAMP — a wrap would reset to the front (index 0), the
+        // clamp keeps the end (index 1) until more results land.
+        let vm = makeViewModel(bottomAssistantText: "needle too")
+        vm.searchBatchSize = 2
+        vm.toggleSearch()
+        var presses = 0
+        vm.onSearchResultsChanged = {
+            // The callback fires synchronously per batch, so this is exact.
+            if presses < 2, vm.isSearching, vm.searchMatches.count > 0 {
+                presses += 1
+                vm.nextSearchMatch()
+            }
+        }
+        vm.runSearch("needle")
+        await waitUntil { !vm.isSearching && vm.searchMatches.count == 4 }
+        XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [5, 4, 1, 0])
+        XCTAssertEqual(presses, 2, "both mid-search presses must have happened")
+        XCTAssertEqual(vm.searchCurrentIndex, 1,
+            "next mid-search advances to the partial end and CLAMPS there instead of wrapping to the front")
+    }
+
     func testCyclingAfterCompletionWalksAndWraps() async {
         let vm = makeViewModel()
         vm.toggleSearch()
@@ -133,19 +175,16 @@ final class SessionViewModelSearchTests: XCTestCase {
         // the first-found (bottom) match, at index 0.
         XCTAssertEqual(vm.searchMatches.map(\.storeIndex), [4, 1, 0])
         XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "result 1 is the bottom-most match")
-        // ↓/Enter moves DOWN the session (toward newer content), so the
-        // result number DECREASES: from result 1 (bottom) it wraps to the
-        // last result (top), then walks back down through the history.
+        // Enter / next walks the result list: 1 → 2 → 3 (up the session).
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 0, "↓ from the bottom-most match wraps to the top-most (result 3/3)")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "next: result 2/3")
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "↓ then walks down the history (result 2/3)")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 0, "next: result 3/3")
         vm.nextSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "↓ wraps back to result 1/3 (the bottom)")
-        // ↑/Shift+Enter moves UP the session (toward older content), so the
-        // result number INCREASES.
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 4, "next wraps from the last result back to result 1 (the bottom)")
+        // Shift+Enter / previous moves the other way: 1 → 3 (wrap).
         vm.previousSearchMatch()
-        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 1, "↑ from the bottom goes to result 2/3")
+        XCTAssertEqual(vm.searchMatches[vm.searchCurrentIndex].storeIndex, 0, "previous from result 1 wraps to the last result (the top)")
     }
 
     func testEmptyQueryClearsResultsImmediately() async {
@@ -182,5 +221,24 @@ final class SessionViewModelSearchTests: XCTestCase {
         await waitUntil { !vm.isSearching && vm.searchMatches.isEmpty }
         XCTAssertEqual(vm.searchCurrentIndex, -1)
         XCTAssertEqual(observations.last?.searching, false)
+    }
+
+    func testCloseSearchClearsQueryForBlankReopen() async {
+        let vm = makeViewModel()
+        vm.toggleSearch() // open the find bar
+        vm.runSearch("needle")
+        await waitUntil { !vm.isSearching && vm.searchMatches.count == 3 }
+        XCTAssertEqual(vm.searchQuery, "needle")
+        vm.closeSearch()
+        XCTAssertFalse(vm.isSearchVisible)
+        XCTAssertEqual(vm.searchQuery, "", "closing the bar clears the query")
+        XCTAssertTrue(vm.searchMatches.isEmpty)
+        XCTAssertEqual(vm.searchCurrentIndex, -1)
+        // Reopening starts a blank new search: empty field, no auto-run.
+        vm.toggleSearch()
+        XCTAssertTrue(vm.isSearchVisible)
+        XCTAssertEqual(vm.searchQuery, "")
+        XCTAssertTrue(vm.searchMatches.isEmpty)
+        XCTAssertFalse(vm.isSearching, "reopening must not auto-run a stale query")
     }
 }
