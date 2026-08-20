@@ -173,7 +173,23 @@ enum SessionToolbar {
                 .onChange(of: vm.searchQuery) { _, q in vm.updateSearchQuery(q) }
                 let trimmed = vm.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    if vm.searchMatches.isEmpty {
+                    if vm.isSearching {
+                        // Batched search in progress: the total is unknown
+                        // until the whole session is covered, so show the
+                        // current position with a spinner instead of a final
+                        // count. Cycling still works on the partial results.
+                        HStack(spacing: 4) {
+                            if vm.searchMatches.isEmpty {
+                                Text("searching…")
+                            } else {
+                                Text("\(vm.searchCurrentIndex + 1) of")
+                            }
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    } else if vm.searchMatches.isEmpty {
                         Text("no matches")
                             .font(.caption)
                             .foregroundStyle(.secondary)

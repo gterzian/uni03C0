@@ -291,13 +291,16 @@ because of them.
   resolving Swift packages runs SPM, which wraps manifest execution in
   `sandbox-exec`; the sandbox denies the nested `sandbox_apply` (EPERM, and
   no policy rule can lift it — even `(allow system-mac-syscall)` does not
-  cover it, verified). Building from the sandbox works only when the package
-  graph is already resolved: the build then skips "Resolve Package Graph"
-  and compiles from the cached DerivedData `SourcePackages`. When a build
-  fails with "Could not resolve package dependencies: sandbox-exec:
-  sandbox_apply: Operation not permitted", the fix is to run `./run.sh`
-  (or `xcodebuild`) once in the terminal to refresh the resolution, then the
-  same build succeeds in the sandbox.
+  cover it, verified). **The in-sandbox way to build and test is the SwiftPM
+  harness: `swift test --disable-sandbox` from the repo root** (see *Tests →
+  Running* below) — `--disable-sandbox` skips SPM's own manifest sandbox, so
+  no Seatbelt policy rule is involved at all. `xcodebuild` remains a
+  terminal-only workflow: when its build fails with "Could not resolve
+  package dependencies: sandbox-exec: sandbox_apply: Operation not
+  permitted", the fix is to run `./run.sh` (or `xcodebuild`) once in the
+  terminal to refresh the resolution, then the same build succeeds in the
+  sandbox (the build then skips "Resolve Package Graph" and compiles from
+  the cached DerivedData `SourcePackages`).
 - **Not every failure is the sandbox — check the machine first.**
   `java_home`/`/usr/bin/java` reporting "Unable to locate a Java Runtime"
   looked sandbox-caused but was not: JVM discovery goes through the Spotlight
@@ -555,6 +558,20 @@ Behavior details that matter:
   message — the same wording as pi's TUI (`assistant-message.js`). Send
   preflight failures (auth, rejected prompts) and a dead agent process surface
   as an error banner above the prompt bar instead of being silently swallowed.
+- **Batched find: results stream in, the loop stays on the main actor.**
+  `TranscriptStore.search` takes a range; the view model searches the session
+  from the TAIL upward in slices of `searchBatchSize`, each slice in its own
+  detached task and applied as it lands — the find bar fills in near the
+  bottom first (the rows the user can already see) and shows "x of
+  ⟨spinner⟩" until the whole session is covered, while cycling works on the
+  partial list. The batch LOOP is deliberately `@MainActor`: only the search
+  is off-main, and the per-batch `await` yields the actor (streaming/folding
+  never stall); the apply must be on main anyway — it mutates the match
+  list/current index and notifies the coordinator. Don't move the loop
+  off-main to "parallelize" it: the apply hops back regardless and nothing is
+  gained. Rows appended while a search runs are not covered by that run (the
+  ranges are snapshotted at search start); re-running or the next Enter picks
+  them up.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
   views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
   tail row updates at most every 0.25s (a hard cap, never per character-delta),
@@ -749,18 +766,55 @@ live model):
   and Core must stay AppKit-free. Default actor isolation `MainActor` (the
   renderer sources assume the Client target's default).
 
-### Running
+### Running inside the sandbox (the normal case for an agent)
 
-From a terminal (package resolution cannot run inside the sandbox):
+**`swift test --disable-sandbox` from the repo root** builds and runs
+ClientTests — the real Core, the real XCTest overlay (auto-discovery,
+async test methods), no stubs, no xcodebuild:
+
+```
+swift test --disable-sandbox
+# one suite only, e.g. the search tests:
+swift test --disable-sandbox --filter SessionViewModelSearchTests
+```
+
+How this works and what can go wrong:
+
+- The committed `Package.swift` is a test harness: a `Core` target over the
+  real sources plus a `ClientTests` test target, depending on
+  swift-subprocess / swift-system by URL. It is **ignored by `xcodegen` and
+  `xcodebuild`** — the Xcode project is unchanged by it.
+- `--disable-sandbox` is required: without it SPM evaluates the manifest
+  inside its own `sandbox-exec`, which the Seatbelt policy denies
+  (`sandbox_apply: Operation not permitted`).
+- The first run resolves the dependencies (from the local SCM cache
+  populated by `./run.sh`, or over the app's whitelist proxy — GitHub is on
+  the default allowlist) and writes `Package.resolved`. Later runs build
+  incrementally in `.build/` (gitignored). If a build looks stale, `rm -rf
+  .build` and re-run.
+- Both `ClientTests` and the new `SessionViewModelSearchTests` are plain
+  `XCTestCase` subclasses (the view-model ones `@MainActor`, since
+  `SessionViewModel` is). XCTest discovers `test*` methods automatically,
+  including `async` ones — no runner is needed.
+
+### Running from a terminal (xcodebuild only works there)
 
 ```
 xcodebuild -scheme ClientTests test
 xcodebuild -scheme RenderingTests test
 ```
 
-Inside the sandbox, xcodebuild's "Resolve Package Graph" step fails (SPM's
-`sandbox-exec`), so run the rendering tests with plain `swiftc` instead — the
-same files, driven by a tiny XCTest shim:
+### RenderingTests in the sandbox (swiftc + stub — do not "fix")
+
+RenderingTests are deliberately NOT in the `Package.swift` harness, and the
+Xcode `RenderingTests` target cannot build either — under Swift 6 language
+mode, `-default-isolation MainActor` (which the renderer sources require)
+makes the `XCTestCase` subclasses' `override func setUp()` and the inherited
+`init()`s MainActor-isolated, and the compiler rejects that against real
+XCTest's nonisolated ObjC declarations (even an explicit `@MainActor
+override` fails; verified). The working route is plain `swiftc` with a stub
+`XCTest` module compiled under the *same* default isolation, so the override
+isolation check passes by construction:
 
 ```
 # build a stub XCTest module + library once (it provides XCTestCase + the
@@ -782,10 +836,11 @@ swiftc -swift-version 6 -default-isolation MainActor \
 
 (The exact flags live in the shell history / scratch space; the essential
 pieces are: the stub `XCTest` module must be compiled with
-`-default-isolation MainActor`, `FontSettings` must be stubbed because the
-`@Observable` macro's plugin server is blocked in the sandbox, `Core` needs an
-empty stub module for TextRowView's `import Core`, and the runner calls every
-`test*` method explicitly since pure-Swift methods are not ObjC-visible.)
+`-default-isolation MainActor` so its `setUp`/`init` match the renderer's
+isolation, `FontSettings` must be stubbed because the `@Observable` macro's
+plugin server is blocked in the sandbox, `Core` needs an empty stub module
+for TextRowView's `import Core`, and the runner calls every `test*` method
+explicitly since pure-Swift methods are not ObjC-visible.)
 
 ### Adding a rendering test
 

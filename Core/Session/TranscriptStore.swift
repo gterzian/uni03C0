@@ -111,22 +111,33 @@ public final class TranscriptStore: @unchecked Sendable {
         }
     }
 
-    /// Searches the FULL conversation — every folded row, including history
-    /// the view has not materialized — for `query`, case-insensitive by
-    /// default (`caseSensitive: true` matches exactly), in each row's
-    /// `searchableText`. Returns matches in store order.
-    public func search(_ query: String, caseSensitive: Bool = false) -> [SearchMatch] {
+    /// Searches `range` of the conversation — every folded row in that slice,
+    /// including history the view has not materialized — for `query`,
+    /// case-insensitive by default (`caseSensitive: true` matches exactly), in
+    /// each row's `searchableText`. Returns matches in ascending store order
+    /// within the range. The range is clamped to the live entry count, so a
+    /// slice that extends past the tail is safe (rows appended after the
+    /// caller snapshotted the count simply are not covered).
+    ///
+    /// The view model drives this in batches — the caller searches ranges,
+    /// never the whole store at once, so a huge conversation is covered in
+    /// pieces with results landing incrementally.
+    public func search(_ query: String, caseSensitive: Bool = false, in range: Range<Int>) -> [SearchMatch] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
         let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
         lock.lock()
         defer { lock.unlock() }
+        guard !_entries.isEmpty else { return [] }
+        let clamped = range.clamped(to: _entries.indices)
+        guard !clamped.isEmpty else { return [] }
         var matches: [SearchMatch] = []
-        for (index, entry) in _entries.enumerated() {
+        for index in clamped {
+            let entry = _entries[index]
             let haystack = entry.searchableText
             guard !haystack.isEmpty else { continue }
-            guard let range = haystack.range(of: q, options: options) else { continue }
-            matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: range)))
+            guard let hit = haystack.range(of: q, options: options) else { continue }
+            matches.append(SearchMatch(storeIndex: index, rowID: entry.id, snippet: Self.snippet(of: haystack, around: hit)))
         }
         return matches
     }
