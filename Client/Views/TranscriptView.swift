@@ -192,6 +192,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var isFollowing = true
     /// Last viewport bottom edge (document y), for detecting scroll direction.
     private var lastVisibleMaxY: CGFloat = 0
+    /// The last row render width (the table column width). When it changes
+    /// (a window resize), the table's row rects keep the OLD width's heights
+    /// while the cells re-lay out at the new width — the text wraps more, gets
+    /// taller than the stale short rects, and overflows upward, clipping the
+    /// row's top. `reconcileOnScroll` detects the change and re-queries every
+    /// row height (the (id, width)-keyed HeightCache re-measures only the rows
+    /// whose width actually changed).
+    private var lastRowWidth: CGFloat = 0
 
     /// The store row ids that currently contain a search match, and the id of
     /// the current match — drive the yellow term backdrops. Rebuilt whenever
@@ -267,6 +275,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scrollView = sv
         tv.dataSource = self
         tv.delegate = self
+        lastRowWidth = rowWidth(in: tv)
 
         // Scrolling the transcript takes key focus (so VoiceOver and keyboard
         // users land on the conversation); plain Arrow-Up/Down are handled
@@ -764,6 +773,20 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let store = viewModel.store
         let visible = tableView.rows(in: tableView.visibleRect)
         guard visible.length > 0 else { return }
+
+        // A column-width change (window resize) leaves the table's row rects at
+        // the old width's heights: the cells re-lay out at the new width, wrap
+        // more, and their text overflows upward past the stale short rects —
+        // the row's top is clipped ("cut off as if scrolled down"). Streaming
+        // happens to heal it via the per-delta `noteHeightOfRows`; an abort
+        // (or any settled state) freezes it forever. Re-query every materialized
+        // row's height when the render width changes; the cache is
+        // (id, width)-keyed, so only the width-changed rows actually re-measure.
+        let width = rowWidth(in: tableView)
+        if abs(width - lastRowWidth) > 0.5 {
+            lastRowWidth = width
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows))
+        }
 
         let firstVisibleStore = windowStart + visible.location
 
