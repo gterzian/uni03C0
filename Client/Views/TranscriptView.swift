@@ -1240,6 +1240,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// streaming tail (the full bottom) in the window, then scrolls the row
     /// into the middle of the viewport.
     func scrollToStoreIndex(_ storeIndex: Int) {
+        cancelOngoingScroll()
         guard let row = materialize(storeIndex: storeIndex, completion: .centered) else { return }
         // A search jump is a deliberate position — stop following; the user
         // returning to the bottom re-engages it.
@@ -1504,8 +1505,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// bottom re-engages it).
     private func scrollByArrow(_ direction: CGFloat) {
         // A keyboard scroll is the user taking over navigation: the
-        // user-message cycle restarts from the viewport position.
+        // user-message cycle restarts from the viewport position, and any
+        // in-flight scroll is cancelled.
         cycleAnchor = nil
+        cancelOngoingScroll()
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
         let step = max(arrowScrollStep, viewport / 8)
@@ -1519,6 +1522,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// toward the head or the tail (Apple's "Page Up: scroll up one page").
     private func scrollByPage(_ direction: CGFloat) {
         cycleAnchor = nil
+        cancelOngoingScroll()
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
         let maxY = max(0, documentView.frame.height - viewport)
@@ -1534,6 +1538,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// goes all the way to the top.
     func jumpToTop() {
         cycleAnchor = nil
+        cancelOngoingScroll()
         scrollToStoreIndex(0)
         takeTranscriptFocus()
     }
@@ -1544,6 +1549,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// the jump.
     func jumpToBottom() {
         cycleAnchor = nil
+        cancelOngoingScroll()
         isFollowing = true
         let lastRow = windowEnd - windowStart - 1
         if lastRow >= 0, let lastEntry = viewModel?.store.entry(at: windowEnd - 1) {
@@ -1570,6 +1576,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let window = tableView.window else { return }
         guard viewModel?.isSearchVisible != true else { return }
         window.makeFirstResponder(tableView)
+    }
+
+    /// Cancels an in-flight scroll (trackpad momentum after a flick, or a
+    /// live gesture) so keyboard navigation takes over: the rest of the
+    /// gesture is swallowed and can't fight the jump or clear the cycle
+    /// anchor. Called at the start of every transcript navigation.
+    private func cancelOngoingScroll() {
+        (scrollView as? TranscriptScrollView)?.cancelScroll()
     }
 
     /// The store index the Cmd+Up/Down cycle last landed on, plus the viewport
@@ -1654,6 +1668,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// lands as low as the content allows instead of overscrolling into blank
     /// space below the last row.
     func jumpToUserMessage(_ storeIndex: Int) {
+        cancelOngoingScroll()
         guard let row = materialize(storeIndex: storeIndex, completion: .userMessage) else { return }
         isFollowing = false
         tableView.tile()
@@ -1704,10 +1719,54 @@ final class TranscriptTableView: NSTableView {
 /// The transcript scroll view. `onUserScroll` fires only for real wheel
 /// events (never for programmatic follow-scrolls), so scrolling the transcript
 /// can take key focus without fighting the prompt bar.
+///
+/// Keyboard navigation (the Cmd+Up/Down cycle, arrow/page keys, Home/End)
+/// calls `cancelScroll` to TAKE OVER an in-flight scroll: the tail of the
+/// current gesture — trackpad momentum after a flick, or the remaining
+/// `changed` events while the fingers are still down — is swallowed so it
+/// can't keep moving the viewport (and re-firing `onUserScroll`, which clears
+/// the cycle anchor) after the jump lands. The suppression self-ends on the
+/// gesture/momentum end or on a brand-new gesture (or a plain mouse-wheel
+/// tick), so scrolling resumes normally.
 final class TranscriptScrollView: NSScrollView {
     var onUserScroll: (() -> Void)?
 
+    /// True from a keyboard navigation until the in-flight gesture/momentum
+    /// ends: remaining scroll events are swallowed.
+    private var suppressesScroll = false
+
+    /// Cancels any in-flight scroll so a keyboard navigation jump can take
+    /// over: the rest of the current gesture/momentum is swallowed until the
+    /// gesture ends or a new one begins (a plain mouse-wheel tick also counts
+    /// as new input).
+    func cancelScroll() {
+        suppressesScroll = true
+    }
+
+    /// Whether `event` is the TAIL of an in-flight gesture or its momentum —
+    /// a scroll event that carries a phase (so it is part of a gesture or
+    /// momentum) but is not a boundary (.began/.ended/.cancelled). A plain
+    /// mouse-wheel tick has no phase at all and is never a tail.
+    static func isScrollTail(_ event: NSEvent) -> Bool {
+        let phase = event.phase
+        let momentum = event.momentumPhase
+        let hasPhase = !phase.isEmpty || !momentum.isEmpty
+        let isBoundary = phase == .began || phase == .ended || phase == .cancelled
+            || momentum == .began || momentum == .ended || momentum == .cancelled
+        return hasPhase && !isBoundary
+    }
+
     override func scrollWheel(with event: NSEvent) {
+        if suppressesScroll {
+            // The keyboard took over mid-scroll: the tail of the interrupted
+            // gesture/momentum is swallowed so it can't fight the jump; a
+            // boundary (.began/.ended/.cancelled) or a plain wheel tick ends
+            // the suppression — the user is scrolling again.
+            if Self.isScrollTail(event) {
+                return
+            }
+            suppressesScroll = false
+        }
         onUserScroll?()
         super.scrollWheel(with: event)
     }

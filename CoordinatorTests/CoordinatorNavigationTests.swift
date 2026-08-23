@@ -275,6 +275,70 @@ final class CoordinatorNavigationTests: XCTestCase {
         XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 2, "the deferred landing completed")
     }
 
+    // MARK: - Scroll cancellation
+
+    /// A synthetic scroll event with the given live/momentum phase, built via
+    /// `CGEvent` so the phases survive into `NSEvent`. The CG field encoding
+    /// differs from `NSEvent.Phase`'s raw values: 1 = began, 2 = changed,
+    /// 4 = ended, 8 = cancelled; 0 = no phase (a plain mouse-wheel tick).
+    private func scrollEvent(deltaY: CGFloat, phase: Int = 0, momentumPhase: Int = 0) -> NSEvent {
+        let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1,
+                         wheel1: Int32(deltaY), wheel2: 0, wheel3: 0)!
+        if phase != 0 { cg.setIntegerValueField(CGEventField(rawValue: 99)!, value: Int64(phase)) }
+        if momentumPhase != 0 { cg.setIntegerValueField(CGEventField(rawValue: 123)!, value: Int64(momentumPhase)) }
+        return NSEvent(cgEvent: cg)!
+    }
+
+    func testJumpCancelsAnOngoingScroll() {
+        let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 20)
+        let transcriptSV = sv as! TranscriptScrollView
+        var userScrolls = 0
+        transcriptSV.onUserScroll = { userScrolls += 1 }
+
+        // Baseline: a momentum event (the tail of a flick) reaches the
+        // transcript as a user scroll.
+        transcriptSV.scrollWheel(with: scrollEvent(deltaY: -3, momentumPhase: 2))
+        XCTAssertGreaterThan(userScrolls, 0, "precondition: an ongoing momentum scroll counts as a user scroll")
+
+        // A keyboard jump takes over and cancels the scroll.
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        let scrollsBefore = userScrolls
+        let pos = sv.documentVisibleRect.minY
+
+        // The interrupted scroll's tail arrives: swallowed — the viewport
+        // stays put and no user-scroll callback fires (which would clear the
+        // cycle anchor and re-fight the landing).
+        transcriptSV.scrollWheel(with: scrollEvent(deltaY: -3, momentumPhase: 2))
+        XCTAssertEqual(sv.documentVisibleRect.minY, pos, "the momentum tail does not move the viewport")
+        XCTAssertEqual(userScrolls, scrollsBefore, "the momentum tail is swallowed")
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22, "the landed message stays the cycle anchor")
+
+        // The momentum ends, then a brand-new gesture begins: scrolling
+        // resumes normally.
+        transcriptSV.scrollWheel(with: scrollEvent(deltaY: 0, momentumPhase: 4))
+        transcriptSV.scrollWheel(with: scrollEvent(deltaY: 0, phase: 1))
+        transcriptSV.scrollWheel(with: scrollEvent(deltaY: -3, phase: 2))
+        XCTAssertGreaterThan(userScrolls, scrollsBefore, "a new gesture resumes scrolling")
+        _ = vm
+    }
+
+    func testScrollTailClassification() {
+        // A tail: any event carrying a non-boundary phase.
+        XCTAssertTrue(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: -3, phase: 2)))
+        XCTAssertTrue(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: -3, momentumPhase: 2)))
+        XCTAssertTrue(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: -3, phase: 2, momentumPhase: 2)))
+        // Boundaries end the suppression.
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, phase: 1)))
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, phase: 4)))
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, phase: 8)))
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, momentumPhase: 1)))
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, momentumPhase: 4)))
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: 0, momentumPhase: 8)))
+        // A plain mouse-wheel tick has no phase: never a tail, never swallowed.
+        XCTAssertFalse(TranscriptScrollView.isScrollTail(scrollEvent(deltaY: -3)))
+    }
+
     // MARK: - Key focus after a jump
 
     /// A borderless, never-shown window hosting the scroll view, with an

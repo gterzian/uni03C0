@@ -14,6 +14,8 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testCycleAdvancesAcrossAProgrammaticViewportShift", { CoordinatorNavigationTests().testCycleAdvancesAcrossAProgrammaticViewportShift() }),
     ("testWheelScrollRestartsTheCycleFromTheViewport", { CoordinatorNavigationTests().testWheelScrollRestartsTheCycleFromTheViewport() }),
     ("testLargeMaterializationDefersWithSpinner", { CoordinatorNavigationTests().testLargeMaterializationDefersWithSpinner() }),
+    ("testJumpCancelsAnOngoingScroll", { CoordinatorNavigationTests().testJumpCancelsAnOngoingScroll() }),
+    ("testScrollTailClassification", { CoordinatorNavigationTests().testScrollTailClassification() }),
     ("testJumpMovesKeyFocusToTheTranscript", { CoordinatorNavigationTests().testJumpMovesKeyFocusToTheTranscript() }),
     ("testJumpDoesNotStealFocusWhileTheFindBarIsUp", { CoordinatorNavigationTests().testJumpDoesNotStealFocusWhileTheFindBarIsUp() }),
 ]
