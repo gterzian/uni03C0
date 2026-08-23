@@ -100,7 +100,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         // Move off the tail first so the Down walk starts mid-conversation,
         // where messages can be anchored at the top of the viewport.
         coordinator.jumpToPreviousUserMessage()
-        guard let start = coordinator.cycleAnchor?.storeIndex else {
+        guard let start = coordinator.cycleAnchor else {
             XCTFail("the Up jump should land on a message"); return
         }
         XCTAssertEqual(start, 18, "the first Up from the tail lands on the previous user message")
@@ -118,7 +118,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         var clamped = 0
         while let target = expected {
             coordinator.jumpToNextUserMessage()
-            XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, target,
+            XCTAssertEqual(coordinator.cycleAnchor, target,
                 "Down lands on the next user message, never the one just left")
             let rect = coordinator.tableView.rect(ofRow: target - coordinator.windowStart)
             let docMaxY = max(0, sv.documentView!.frame.height - sv.contentView.bounds.height)
@@ -163,7 +163,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         var landed = 0
         while let target = expected {
             coordinator.jumpToPreviousUserMessage()
-            XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, target,
+            XCTAssertEqual(coordinator.cycleAnchor, target,
                 "Up lands on the previous user message")
             XCTAssertEqual(rowTopOffset(coordinator, target), 8, accuracy: 0.5,
                 "the message is anchored at the top of the viewport")
@@ -205,7 +205,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         // the message lands at the top of the viewport — no RPC round trip.
         coordinator.jumpToUserMessage(2)
         XCTAssertEqual(coordinator.windowStart, 0, "older history was materialized")
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 2, "the target message was landed on")
+        XCTAssertEqual(coordinator.cycleAnchor, 2, "the target message was landed on")
         XCTAssertEqual(rowTopOffset(coordinator, 2), 8, accuracy: 0.5)
     }
 
@@ -220,7 +220,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 20)
         // Down from the tail lands on 22, clamped at the document bottom.
         coordinator.jumpToNextUserMessage()
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        XCTAssertEqual(coordinator.cycleAnchor, 22)
         // followTail aims at the LAST ROW's bottom, ~10pt above the frame
         // bottom the clamp uses — a small programmatic shift, no user input.
         let lastRow = coordinator.tableView.numberOfRows - 1
@@ -229,7 +229,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         sv.reflectScrolledClipView(sv.contentView)
         // The next Down must advance to 24 — not re-land on 22.
         coordinator.jumpToNextUserMessage()
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 24,
+        XCTAssertEqual(coordinator.cycleAnchor, 24,
             "the cycle advances past the landed message despite the programmatic shift")
         _ = vm
     }
@@ -239,11 +239,40 @@ final class CoordinatorNavigationTests: XCTestCase {
         let window = NSWindow(contentRect: sv.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         sv.frame = window.contentView!.bounds
         window.contentView = sv
-        coordinator.jumpToNextUserMessage()
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        // Land on a POSITIONABLE message (top-anchored), so the viewport's top
+        // substantial row after the landing IS the landed message.
+        coordinator.jumpToPreviousUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor, 18)
         // A real wheel scroll is the user taking over navigation.
         (sv as! TranscriptScrollView).onUserScroll?()
         XCTAssertNil(coordinator.cycleAnchor, "a wheel scroll clears the cycle anchor")
+        // The next Down advances from the viewport's top MESSAGE (sliver-
+        // skipped) — it must NOT re-target 18 via the 8pt sliver of the row
+        // above it (the wasted press that made cycling feel two-per-message).
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor, 20,
+            "after a user scroll the cycle advances, never re-shows the message just landed on")
+        _ = vm
+    }
+
+    func testCycleAdvancesAfterALargeViewportShift() {
+        // Regression: an eviction re-anchor (rows removed above the viewport)
+        // or a streaming follow-scroll moves the viewport by far more than any
+        // offset tolerance while the landed message stays visible. The cycle
+        // must still advance ONE press per message — a "has the viewport
+        // moved" check would fall back and re-target the message just landed
+        // on (or skip ahead), the "two presses per message" report.
+        let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 20)
+        coordinator.jumpToPreviousUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor, 18)
+        // Move the viewport far up: 18 stays visible (it was at top+8), but
+        // the offset moved well beyond any tight tolerance.
+        let before = sv.documentVisibleRect.minY
+        sv.contentView.scroll(to: NSPoint(x: 0, y: max(0, before - 250)))
+        sv.reflectScrolledClipView(sv.contentView)
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor, 20,
+            "the cycle advances despite a large viewport shift")
         _ = vm
     }
 
@@ -272,7 +301,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         spinRunLoop()
         XCTAssertFalse(vm.isFetchingOlder, "the load completed")
         XCTAssertEqual(coordinator.windowStart, 0, "the whole conversation is materialized")
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 2, "the deferred landing completed")
+        XCTAssertEqual(coordinator.cycleAnchor, 2, "the deferred landing completed")
     }
 
     // MARK: - Scroll cancellation
@@ -302,7 +331,7 @@ final class CoordinatorNavigationTests: XCTestCase {
 
         // A keyboard jump takes over and cancels the scroll.
         coordinator.jumpToNextUserMessage()
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        XCTAssertEqual(coordinator.cycleAnchor, 22)
         let scrollsBefore = userScrolls
         let pos = sv.documentVisibleRect.minY
 
@@ -312,7 +341,7 @@ final class CoordinatorNavigationTests: XCTestCase {
         transcriptSV.scrollWheel(with: scrollEvent(deltaY: -3, momentumPhase: 2))
         XCTAssertEqual(sv.documentVisibleRect.minY, pos, "the momentum tail does not move the viewport")
         XCTAssertEqual(userScrolls, scrollsBefore, "the momentum tail is swallowed")
-        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22, "the landed message stays the cycle anchor")
+        XCTAssertEqual(coordinator.cycleAnchor, 22, "the landed message stays the cycle anchor")
 
         // The momentum ends, then a brand-new gesture begins: scrolling
         // resumes normally.

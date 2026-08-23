@@ -1587,48 +1587,56 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// The store index the Cmd+Up/Down cycle last landed on, plus the viewport
-    /// position at that moment. The cycle continues from the LANDED message,
-    /// not the viewport's top row: a jump anchors the message 8pt below the
-    /// top, which leaves the previous row's bottom sliver visible — reading
-    /// the anchor from the viewport there would re-target the message just
-    /// landed on (the cycle would stick). When the user scrolls (the viewport
-    /// moves away from the landed position) the anchor falls back to the
-    /// viewport's top row.
-    var cycleAnchor: (storeIndex: Int, viewportMinY: CGFloat)?
+    /// The store index the Cmd+Up/Down cycle last landed on. The cycle
+    /// continues from the LANDED message rather than the viewport's top row: a
+    /// landing anchors the message 8pt below the top (leaving the previous
+    /// row's bottom sliver visible) and, near the tail, clamps with earlier
+    /// rows above it — so the viewport's top row is often NOT the message just
+    /// landed on. The landing stays authoritative until the user takes over
+    /// navigation (a real wheel / arrow / page scroll clears it) or the
+    /// message scrolls out of the viewport (the viewport's top message wins).
+    /// Programmatic shifts — the follow-scroll that runs while streaming,
+    /// eviction re-anchors — keep it: a "has the viewport moved" check (any
+    /// tolerance) made the cycle re-target the message it had just landed on
+    /// when a shift fell outside it — the "two presses per message" report.
+    var cycleAnchor: Int?
 
     /// The anchor for the next user-message cycle step: the last landed
-    /// message if the user hasn't taken over navigation since (a real wheel /
-    /// arrow / page scroll clears it), else the viewport's top row.
-    /// Programmatic viewport shifts do NOT invalidate the landing: the
-    /// follow-scroll that runs while streaming (following re-engages after a
-    /// near-tail landing) moves the viewport between keypresses, and a tight
-    /// "has the viewport moved" check made the cycle re-target the message it
-    /// had just landed on — the reported "Cmd+Down needs two inputs to
-    /// advance" while a turn streams. The half-viewport safety net below only
-    /// catches a genuine scroll-away (a scroller drag, which fires no user
-    /// scroll callback).
+    /// message while it is still visible (or at least in the viewport's
+    /// visible range), else the viewport's top message.
     func cycleAnchorStoreIndex() -> Int {
-        let minY = scrollView.documentVisibleRect.minY
         if let last = cycleAnchor,
-           last.storeIndex >= windowStart, last.storeIndex < windowEnd,
-           abs(minY - last.viewportMinY) < scrollView.contentView.bounds.height / 2 {
-            return last.storeIndex
+           last >= windowStart, last < windowEnd,
+           visibleStoreRange().contains(last) {
+            return last
         }
         return currentAnchorStoreIndex()
     }
 
-    /// The store index the viewport is anchored at — the first row visible at
-    /// the top of the viewport. Cmd+Up / Cmd+Down cycle user messages relative
-    /// to this: the jump always lands on the next user message STRICTLY
-    /// above/below it, so standing on a user message and pressing Down moves
-    /// to the one after it (never re-showing the same one). This is the
-    /// FALLBACK anchor for the cycle; the primary one is the last landed
-    /// message (`cycleAnchor`), which is exact even when the landing leaves a
-    /// sliver of the previous row visible.
+    /// The store indices of the rows currently intersecting the viewport.
+    private func visibleStoreRange() -> Range<Int> {
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.length > 0 else { return windowStart..<(windowStart + 1) }
+        return (windowStart + visible.location)..<(windowStart + visible.location + visible.length)
+    }
+
+    /// The store index the viewport is anchored at — the first row that is
+    /// SUBSTANTIALLY visible (more than a thin sliver). A landing leaves the
+    /// previous row's bottom 8pt visible, so without the sliver skip the
+    /// anchor would be that row, and the next Down would re-target the message
+    /// just landed on (a wasted press per message).
     func currentAnchorStoreIndex() -> Int {
         let visible = tableView.rows(in: tableView.visibleRect)
-        let row = visible.length > 0 ? visible.location : 0
-        return windowStart + row
+        guard visible.length > 0 else { return windowStart }
+        let minY = tableView.visibleRect.minY
+        let sliver: CGFloat = 12
+        for r in visible.location..<(visible.location + visible.length) {
+            let rect = tableView.rect(ofRow: r)
+            if rect.maxY - minY > sliver {
+                return windowStart + r
+            }
+        }
+        return windowStart + visible.location
     }
 
     /// Cmd+Up: cycle to the previous user message (the one strictly above the
@@ -1684,7 +1692,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // from the viewport there would re-target the same message on the next
         // Down — the cycle would stick. The next step continues from HERE
         // unless the user scrolls the viewport away.
-        cycleAnchor = (storeIndex, scrollView.documentVisibleRect.minY)
+        cycleAnchor = storeIndex
         takeTranscriptFocus()
     }
 

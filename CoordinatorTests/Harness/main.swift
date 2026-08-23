@@ -13,6 +13,7 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testJumpAboveTheWindowMaterializesHistory", { CoordinatorNavigationTests().testJumpAboveTheWindowMaterializesHistory() }),
     ("testCycleAdvancesAcrossAProgrammaticViewportShift", { CoordinatorNavigationTests().testCycleAdvancesAcrossAProgrammaticViewportShift() }),
     ("testWheelScrollRestartsTheCycleFromTheViewport", { CoordinatorNavigationTests().testWheelScrollRestartsTheCycleFromTheViewport() }),
+    ("testCycleAdvancesAfterALargeViewportShift", { CoordinatorNavigationTests().testCycleAdvancesAfterALargeViewportShift() }),
     ("testLargeMaterializationDefersWithSpinner", { CoordinatorNavigationTests().testLargeMaterializationDefersWithSpinner() }),
     ("testJumpCancelsAnOngoingScroll", { CoordinatorNavigationTests().testJumpCancelsAnOngoingScroll() }),
     ("testScrollTailClassification", { CoordinatorNavigationTests().testScrollTailClassification() }),
