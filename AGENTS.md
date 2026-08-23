@@ -360,6 +360,25 @@ Three targets (see `project.yml`):
   (`StreamingStorageTests`). Run via `xcodebuild -scheme RenderingTests
   test`; can also be run with plain `swiftc` + a tiny XCTest shim when the
   sandbox blocks package resolution.
+- **CoordinatorTests** (unit-test bundle, XCTest, `MainActor`): end-to-end
+  tests for the transcript `Coordinator`'s keyboard navigation — the
+  Cmd+Up/Down user-message cycle, its scroll/focus/follow effects, and
+  older-history materialization — driven through a REAL offscreen
+  `NSTableView` + `NSScrollView` with a REAL `TranscriptStore` folded from
+  RPC frames. The target compiles `TranscriptView.swift` + the renderer/
+  measurement sources directly (the same trick as RenderingTests) and links
+  the real Core framework. `SessionViewModel` is a member-compatible stand-in
+  (the real one spawns `pi --mode rpc` at init; tests never spawn pi) — keep
+  `CoordinatorTests/SessionViewModelStub.swift` in sync with what
+  `TranscriptView.swift` touches. The cycle decision itself lives in
+  `TranscriptCycler` (Core) and is covered by ClientTests; the coordinator
+  tests prove the view does what the decision says (landed message anchored
+  at the viewport top, clamped near the tail, focus taken unless the find
+  bar is up). The key monitors (`NSEvent.addLocalMonitorForEvents`) stay
+  thin wiring — they need a key window, which tests can't fake headlessly.
+  Run from a terminal via `xcodebuild -scheme CoordinatorTests test`; in the
+  sandbox via `scripts/run-coordinator-tests.sh` (swiftc + stub XCTest
+  against the harness-built Core module).
 
 Concurrency defaults are set per target in `project.yml`:
 `Core = nonisolated`, `Client = MainActor`, both Swift 6 strict
@@ -769,20 +788,29 @@ touching the markdown renderer or the transcript rows.
 
 ## Tests
 
-Two unit-test bundles, both deterministic (no pi process, no network, no
-live model):
+Three deterministic bundles (no pi process, no network, no live model):
 
 - **ClientTests** — Core-only logic: framing, request encoding, response
-  decoding, store folding, diff, sandbox policy, and the streaming-refresh
+  decoding, store folding, diff, sandbox policy, the streaming-refresh
   regression (`StreamingRefreshGateTests` replays a realistic delta stream
   through the real store + gate and asserts the refresh count is bounded by
-  the batch interval — never per delta). Links Core only.
+  the batch interval — never per delta), and the user-message cycle decision
+  (`TranscriptCyclerTests`). Links Core only.
 - **RenderingTests** — the AppKit renderer. Compiles the renderer sources
   (Client/Views/MarkdownText.swift, TextRowView.swift, CodeCopyButton.swift,
   Client/Accessibility/DisplayOptions.swift, Client/Support/FontSettings.swift)
   directly into the bundle, because ClientTests cannot link the Client target
   and Core must stay AppKit-free. Default actor isolation `MainActor` (the
   renderer sources assume the Client target's default).
+- **CoordinatorTests** — the transcript `Coordinator`. Compiles
+  `TranscriptView.swift` + the renderer/measurement sources against the REAL
+  Core framework and drives an offscreen `NSTableView` with a real store:
+  the Cmd+Up/Down cycle, scroll geometry (top-anchored vs near-tail clamped),
+  follow state, key focus after a jump, and older-history materialization.
+  `SessionViewModel` is stubbed (spawns pi at init — see
+  CoordinatorTests/SessionViewModelStub.swift). Run from a terminal via
+  `xcodebuild -scheme CoordinatorTests test`; in the sandbox via
+  `scripts/run-coordinator-tests.sh`.
 
 ### Running inside the sandbox (the normal case for an agent)
 

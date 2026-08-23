@@ -72,8 +72,8 @@ private struct SessionScrollState {
 // MARK: - Coordinator
 
 final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-    private var tableView: NSTableView!
-    private var scrollView: NSScrollView!
+    var tableView: NSTableView!
+    var scrollView: NSScrollView!
     /// Local key monitor making Cmd+Up / Cmd+Down cycle through the user's
     /// messages from anywhere in the window — Cmd+Up to the previous one,
     /// Cmd+Down to the next one (or, past the last, all the way to the live
@@ -153,7 +153,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// back down and rows above the buffer are evicted. The store keeps the
     /// full conversation, so evicted rows re-materialize instantly on a later
     /// scroll-up (no RPC round trip).
-    private var windowStart = 0
+    var windowStart = 0
     private var windowEnd = 0
     private var lastGeneration: UInt64 = 0
 
@@ -190,7 +190,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Whether the user is pinned to the tail and wants to auto-follow. Once
     /// they scroll up, this turns off so streaming doesn't keep yanking them
     /// back down; it re-engages only when they return to the bottom.
-    private var isFollowing = true
+    var isFollowing = true
     /// Last viewport bottom edge (document y), for detecting scroll direction.
     private var lastVisibleMaxY: CGFloat = 0
     /// The last row render width (the table column width). When it changes
@@ -993,6 +993,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         searchMatchRowIDs = []
         currentSearchRowID = nil
         lastSearchQuery = nil
+        cycleAnchor = nil
         tableView.reloadData()
         if saved.isFollowing {
             scheduleScrollToBottom()
@@ -1042,6 +1043,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel?.isFetchingOlder = false
         // A reload rebuilds the whole history: any previously-saved position is
         // meaningless, so the next visit to this session starts at the tail.
+        cycleAnchor = nil
         if let vm = viewModel {
             scrollStateBySession.removeValue(forKey: ObjectIdentifier(vm))
         }
@@ -1442,15 +1444,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// (the user returning to the bottom re-engages it). This is also the
     /// terminal step of the Cmd+Up cycle — past the first user message, Up
     /// goes all the way to the top.
-    private func jumpToTop() {
+    func jumpToTop() {
+        cycleAnchor = nil
         scrollToStoreIndex(0)
+        takeTranscriptFocus()
     }
 
     /// End / Fn+Right / Cmd+Down past the last user message: jump to the tail
     /// in one step and re-engage following. The tail row is refreshed first so
     /// content that grew while scrolled up renders at its true height before
     /// the jump.
-    private func jumpToBottom() {
+    func jumpToBottom() {
+        cycleAnchor = nil
         isFollowing = true
         let lastRow = windowEnd - windowStart - 1
         if lastRow >= 0, let lastEntry = viewModel?.store.entry(at: windowEnd - 1) {
@@ -1460,14 +1465,55 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: lastRow))
         }
         scheduleScrollToBottom()
+        takeTranscriptFocus()
+    }
+
+    /// Takes key focus on the transcript table after a keyboard navigation
+    /// jump (Cmd+Up/Cmd+Down, Home/End, Fn+Left/Right). Without this, a jump
+    /// performed while the prompt input (or any editable field) had focus
+    /// leaves the insertion point THERE, and the very next plain Arrow-Up/Down
+    /// is deferred to that field (moving its caret) instead of scrolling the
+    /// transcript — the reported "Arrow-Down does nothing after the jump"
+    /// until a wheel scroll moves focus to the table. Mirrors the wheel
+    /// behavior in `onUserScroll` (scrolling the transcript takes key focus);
+    /// like it, does NOT steal focus while the find bar is up, so typing a
+    /// new query keeps working.
+    func takeTranscriptFocus() {
+        guard let window = tableView.window else { return }
+        guard viewModel?.isSearchVisible != true else { return }
+        window.makeFirstResponder(tableView)
+    }
+
+    /// The store index the Cmd+Up/Down cycle last landed on, plus the viewport
+    /// position at that moment. The cycle continues from the LANDED message,
+    /// not the viewport's top row: a jump anchors the message 8pt below the
+    /// top, which leaves the previous row's bottom sliver visible — reading
+    /// the anchor from the viewport there would re-target the message just
+    /// landed on (the cycle would stick). When the user scrolls (the viewport
+    /// moves away from the landed position) the anchor falls back to the
+    /// viewport's top row.
+    var cycleAnchor: (storeIndex: Int, viewportMinY: CGFloat)?
+
+    /// The anchor for the next user-message cycle step: the last landed
+    /// message if the viewport hasn't moved since, else the viewport's top
+    /// row (the user scrolled, so their position wins).
+    func cycleAnchorStoreIndex() -> Int {
+        let minY = scrollView.documentVisibleRect.minY
+        if let last = cycleAnchor, abs(minY - last.viewportMinY) < 0.5 {
+            return last.storeIndex
+        }
+        return currentAnchorStoreIndex()
     }
 
     /// The store index the viewport is anchored at — the first row visible at
     /// the top of the viewport. Cmd+Up / Cmd+Down cycle user messages relative
     /// to this: the jump always lands on the next user message STRICTLY
     /// above/below it, so standing on a user message and pressing Down moves
-    /// to the one after it (never re-showing the same one).
-    private func currentAnchorStoreIndex() -> Int {
+    /// to the one after it (never re-showing the same one). This is the
+    /// FALLBACK anchor for the cycle; the primary one is the last landed
+    /// message (`cycleAnchor`), which is exact even when the landing leaves a
+    /// sliver of the previous row visible.
+    func currentAnchorStoreIndex() -> Int {
         let visible = tableView.rows(in: tableView.visibleRect)
         let row = visible.length > 0 ? visible.location : 0
         return windowStart + row
@@ -1476,18 +1522,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Cmd+Up: cycle to the previous user message (the one strictly above the
     /// viewport's top row), anchoring it at the top of the viewport so the
     /// exchange below it is visible. With no user message above, jumps to the
-    /// very beginning of the conversation (store index 0).
-    private func jumpToPreviousUserMessage() {
+    /// very beginning of the conversation (store index 0). The decision lives
+    /// in `TranscriptCycler` (Core) so it is unit-testable.
+    func jumpToPreviousUserMessage() {
         guard let store = viewModel?.store else { return }
-        let anchor = currentAnchorStoreIndex()
-        var target: Int?
-        for i in stride(from: anchor - 1, through: 0, by: -1) {
-            if let entry = store.entry(at: i), case .userMessage = entry.kind {
-                target = i
-                break
-            }
-        }
-        if let target {
+        let anchor = cycleAnchorStoreIndex()
+        if let target = TranscriptCycler.previousUserMessage(anchor: anchor, entryAt: store.entry(at:)) {
             jumpToUserMessage(target)
         } else {
             jumpToTop()
@@ -1497,18 +1537,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Cmd+Down: cycle to the next user message (the one strictly below the
     /// viewport's top row). With no user message below — already at the last
     /// one — jumps all the way to the tail, re-engaging following so the
-    /// incoming streaming content stays in view.
-    private func jumpToNextUserMessage() {
+    /// incoming streaming content stays in view. The decision lives in
+    /// `TranscriptCycler` (Core) so it is unit-testable.
+    func jumpToNextUserMessage() {
         guard let store = viewModel?.store else { return }
-        let anchor = currentAnchorStoreIndex()
-        var target: Int?
-        for i in (anchor + 1)..<store.count {
-            if let entry = store.entry(at: i), case .userMessage = entry.kind {
-                target = i
-                break
-            }
-        }
-        if let target {
+        let anchor = cycleAnchorStoreIndex()
+        if let target = TranscriptCycler.nextUserMessage(anchor: anchor, count: store.count, entryAt: store.entry(at:)) {
             jumpToUserMessage(target)
         } else {
             jumpToBottom()
@@ -1517,16 +1551,28 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Anchors a user message at the top of the viewport (with a small
     /// margin), materializing older history as needed, and stops following —
-    /// the user returning to the bottom re-engages it.
-    private func jumpToUserMessage(_ storeIndex: Int) {
+    /// the user returning to the bottom re-engages it. The landing is clamped
+    /// to the document: a message near the tail can't reach the top, so it
+    /// lands as low as the content allows instead of overscrolling into blank
+    /// space below the last row.
+    func jumpToUserMessage(_ storeIndex: Int) {
         guard let row = materialize(storeIndex: storeIndex) else { return }
         isFollowing = false
         tableView.tile()
         let rowRect = tableView.rect(ofRow: row)
-        let targetY = max(0, rowRect.origin.y - 8)
+        let docMaxY = max(0, (scrollView.documentView?.frame.height ?? 0) - scrollView.contentView.bounds.height)
+        let targetY = min(max(0, rowRect.origin.y - 8), docMaxY)
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
         lastVisibleMaxY = scrollView.documentVisibleRect.maxY
+        // Remember the landed message as the cycle's anchor: right after a
+        // jump the viewport's top row is the row ABOVE the message (its bottom
+        // sliver stays visible under the 8pt margin), so reading the anchor
+        // from the viewport there would re-target the same message on the next
+        // Down — the cycle would stick. The next step continues from HERE
+        // unless the user scrolls the viewport away.
+        cycleAnchor = (storeIndex, scrollView.documentVisibleRect.minY)
+        takeTranscriptFocus()
     }
 
     /// Expand/collapse a tool card: flip the shared expansion registry (which
