@@ -108,6 +108,40 @@ targets:
         # The renderer sources assume the Client target's MainActor default.
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
+  CoordinatorTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      # The transcript Coordinator + the renderer/measurement sources it needs,
+      # compiled directly (ClientTests links Core only; the Coordinator drives
+      # a real NSTableView). `SessionViewModel` is a member-compatible stand-in
+      # (the real one spawns pi at init; tests never spawn pi).
+      - Client/Views/MarkdownText.swift
+      - Client/Views/TextRowView.swift
+      - Client/Views/CodeCopyButton.swift
+      - Client/Views/ToolCallCardView.swift
+      - Client/Accessibility/DisplayOptions.swift
+      - Client/Support/FontSettings.swift
+      - Client/Views/TranscriptEntry+Measurement.swift
+      - Client/Views/TranscriptView.swift
+      - path: CoordinatorTests
+        excludes:
+          # Sandbox-only harness (stub XCTest module, FontSettings stub,
+          # explicit runner): the Xcode target uses real XCTest and the real
+          # FontSettings instead.
+          - Harness
+    dependencies:
+      - target: Core
+      - package: Subprocess
+        product: Subprocess
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.uni03c0.CoordinatorTests
+        GENERATE_INFOPLIST_FILE: YES
+        # The coordinator + renderer sources assume the Client target's
+        # MainActor default.
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @loader_path/../Frameworks"
 
 schemes:
   Client:
@@ -138,3 +172,12 @@ schemes:
       config: Debug
       targets:
         - RenderingTests
+  CoordinatorTests:
+    build:
+      targets:
+        Core: all
+        CoordinatorTests: [test]
+    test:
+      config: Debug
+      targets:
+        - CoordinatorTests
