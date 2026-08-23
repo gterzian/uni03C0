@@ -282,7 +282,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // users land on the conversation); plain Arrow-Up/Down are handled
         // window-level by `arrowScrollMonitor`, not by table key navigation.
         sv.onUserScroll = { [weak self] in
-            guard let self, let window = self.tableView.window,
+            guard let self else { return }
+            // A real wheel scroll is the user taking over navigation: the
+            // user-message cycle restarts from the viewport position. Cleared
+            // before the focus guards so it applies whether or not the table
+            // already holds key focus.
+            self.cycleAnchor = nil
+            guard let window = self.tableView.window,
                   window.firstResponder !== self.tableView else { return }
             // Don't steal focus while the find bar is up: typing in the search
             // field must keep working even as the transcript scrolls under it.
@@ -927,6 +933,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             self.prependHistory(fetched, anchorStore: anchorStore, anchorOffset: anchorOffset)
             self.isFetchingOlder = false
             self.viewModel?.isFetchingOlder = false
+            // A user-message cycle / search jump queued behind this load
+            // (the spinner was already up) lands now that the window grew.
+            self.flushDeferredMaterialize()
         }
     }
 
@@ -1231,10 +1240,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// streaming tail (the full bottom) in the window, then scrolls the row
     /// into the middle of the viewport.
     func scrollToStoreIndex(_ storeIndex: Int) {
-        guard let row = materialize(storeIndex: storeIndex) else { return }
+        guard let row = materialize(storeIndex: storeIndex, completion: .centered) else { return }
         // A search jump is a deliberate position — stop following; the user
         // returning to the bottom re-engages it.
         isFollowing = false
+        cycleAnchor = nil
         tableView.tile()
         let rowRect = tableView.rect(ofRow: row)
         let targetY = rowRect.midY - scrollView.contentView.bounds.height / 2
@@ -1243,6 +1253,24 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         lastVisibleMaxY = scrollView.documentVisibleRect.maxY
     }
 
+    /// How a jump re-lands after a deferred materialization: user-message
+    /// landings anchor at the top (`jumpToUserMessage`), search jumps center
+    /// (`scrollToStoreIndex`).
+    private enum MaterializeCompletion {
+        case userMessage
+        case centered
+    }
+
+    /// A jump whose materialization was deferred behind the loading spinner;
+    /// landed once the in-flight prepend completes.
+    private var deferredMaterialize: (storeIndex: Int, completion: MaterializeCompletion)?
+
+    /// Fetches of more than this many rows are deferred one run-loop turn with
+    /// the loading spinner up, so a slow measurement (big text rows, tool
+    /// cards) shows the spinner instead of a silent main-thread freeze. The
+    /// cycle's boundary fetch (~40 rows) and far search jumps both exceed it.
+    private static let largeMaterializeThreshold = 25
+
     /// Makes `storeIndex` part of the materialized window, prepending older
     /// history above it as needed, and returns its table row. The store holds
     /// the FULL conversation, so a row above the materialized window just
@@ -1250,7 +1278,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// target lands below a buffer (fluid scrolling up from it), and the
     /// streaming tail (the full bottom) stays in the window. Shared by the
     /// search jump and the Cmd+Up/Down user-message cycle.
-    private func materialize(storeIndex: Int) -> Int? {
+    ///
+    /// A large fetch is DEFERRED: the loading spinner is raised, the prepend
+    /// runs on the next run-loop turn (so the spinner paints before the
+    /// synchronous measurement), and the caller re-lands via `completion`.
+    /// In that case nil is returned now and the landing happens later.
+    private func materialize(storeIndex: Int, completion: MaterializeCompletion) -> Int? {
         guard let store = viewModel?.store, store.count > 0 else { return nil }
         let clamped = min(max(0, storeIndex), store.count - 1)
         if clamped < windowStart {
@@ -1262,15 +1295,66 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             let targetStart = max(0, clamped - buffer)
             let fetched = windowStart - targetStart
             guard fetched > 0 else { return nil }
-            windowStart = targetStart
-            tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
-            tableView.tile()
-            // The compounding block restarts small: this fetch covered the gap.
-            fetchBlock = max(initialChunkRows() / 2, 20)
+            if fetched > Self.largeMaterializeThreshold, !isEvictingOlder {
+                scheduleDeferredMaterialize(targetStart: targetStart, fetched: fetched,
+                                            storeIndex: clamped, completion: completion)
+                return nil
+            }
+            prependMaterialized(targetStart: targetStart, fetched: fetched)
         }
         let row = clamped - windowStart
         guard row >= 0, row < (windowEnd - windowStart) else { return nil }
         return row
+    }
+
+    /// Prepends `fetched` rows at the top of the materialized window (rows
+    /// above the viewport never shift it) and restarts the compounding block.
+    private func prependMaterialized(targetStart: Int, fetched: Int) {
+        windowStart = targetStart
+        tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
+        tableView.tile()
+        // The compounding block restarts small: this fetch covered the gap.
+        fetchBlock = max(initialChunkRows() / 2, 20)
+    }
+
+    /// Defers a large materialization behind the loading spinner (the same
+    /// `isFetchingOlder` the compounding scroll-fetch raises): raise the
+    /// spinner, prepend on the next run-loop turn so it paints first, then
+    /// re-land the jump. A second jump arriving while one is deferred rides on
+    /// the same prepend (`deferredMaterialize`).
+    private func scheduleDeferredMaterialize(targetStart: Int, fetched: Int, storeIndex: Int, completion: MaterializeCompletion) {
+        if isFetchingOlder {
+            // A load is already in flight (a scroll-fetch or an earlier
+            // deferred materialization); the in-flight prepend — or the
+            // re-materialize it triggers — will cover this target too.
+            deferredMaterialize = (storeIndex, completion)
+            return
+        }
+        isFetchingOlder = true
+        viewModel?.isFetchingOlder = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isFetchingOlder = false
+            self.viewModel?.isFetchingOlder = false
+            self.prependMaterialized(targetStart: targetStart, fetched: fetched)
+            self.flushDeferredMaterialize()
+            switch completion {
+            case .userMessage: self.jumpToUserMessage(storeIndex)
+            case .centered: self.scrollToStoreIndex(storeIndex)
+            }
+        }
+    }
+
+    /// Lands a jump that queued behind an in-flight load once that load's
+    /// prepend has grown the window (re-deferring if it still needs more
+    /// history). Called by both loaders' completions.
+    private func flushDeferredMaterialize() {
+        guard let pending = deferredMaterialize else { return }
+        deferredMaterialize = nil
+        switch pending.completion {
+        case .userMessage: jumpToUserMessage(pending.storeIndex)
+        case .centered: scrollToStoreIndex(pending.storeIndex)
+        }
     }
 
     /// Re-renders the yellow search-term highlights after the match list, the
@@ -1419,6 +1503,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// `reconcileOnScroll` (scrolling up disengages following; reaching the
     /// bottom re-engages it).
     private func scrollByArrow(_ direction: CGFloat) {
+        // A keyboard scroll is the user taking over navigation: the
+        // user-message cycle restarts from the viewport position.
+        cycleAnchor = nil
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
         let step = max(arrowScrollStep, viewport / 8)
@@ -1431,6 +1518,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Fn+Up/Fn+Down and the Page Up/Down keys: scroll one full viewport
     /// toward the head or the tail (Apple's "Page Up: scroll up one page").
     private func scrollByPage(_ direction: CGFloat) {
+        cycleAnchor = nil
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
         let maxY = max(0, documentView.frame.height - viewport)
@@ -1495,11 +1583,21 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var cycleAnchor: (storeIndex: Int, viewportMinY: CGFloat)?
 
     /// The anchor for the next user-message cycle step: the last landed
-    /// message if the viewport hasn't moved since, else the viewport's top
-    /// row (the user scrolled, so their position wins).
+    /// message if the user hasn't taken over navigation since (a real wheel /
+    /// arrow / page scroll clears it), else the viewport's top row.
+    /// Programmatic viewport shifts do NOT invalidate the landing: the
+    /// follow-scroll that runs while streaming (following re-engages after a
+    /// near-tail landing) moves the viewport between keypresses, and a tight
+    /// "has the viewport moved" check made the cycle re-target the message it
+    /// had just landed on — the reported "Cmd+Down needs two inputs to
+    /// advance" while a turn streams. The half-viewport safety net below only
+    /// catches a genuine scroll-away (a scroller drag, which fires no user
+    /// scroll callback).
     func cycleAnchorStoreIndex() -> Int {
         let minY = scrollView.documentVisibleRect.minY
-        if let last = cycleAnchor, abs(minY - last.viewportMinY) < 0.5 {
+        if let last = cycleAnchor,
+           last.storeIndex >= windowStart, last.storeIndex < windowEnd,
+           abs(minY - last.viewportMinY) < scrollView.contentView.bounds.height / 2 {
             return last.storeIndex
         }
         return currentAnchorStoreIndex()
@@ -1556,7 +1654,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// lands as low as the content allows instead of overscrolling into blank
     /// space below the last row.
     func jumpToUserMessage(_ storeIndex: Int) {
-        guard let row = materialize(storeIndex: storeIndex) else { return }
+        guard let row = materialize(storeIndex: storeIndex, completion: .userMessage) else { return }
         isFollowing = false
         tableView.tile()
         let rowRect = tableView.rect(ofRow: row)

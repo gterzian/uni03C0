@@ -11,6 +11,9 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testDownCyclesThroughUserMessagesThenJumpsToTheTail", { CoordinatorNavigationTests().testDownCyclesThroughUserMessagesThenJumpsToTheTail() }),
     ("testUpCyclesThroughUserMessagesThenJumpsToTheTop", { CoordinatorNavigationTests().testUpCyclesThroughUserMessagesThenJumpsToTheTop() }),
     ("testJumpAboveTheWindowMaterializesHistory", { CoordinatorNavigationTests().testJumpAboveTheWindowMaterializesHistory() }),
+    ("testCycleAdvancesAcrossAProgrammaticViewportShift", { CoordinatorNavigationTests().testCycleAdvancesAcrossAProgrammaticViewportShift() }),
+    ("testWheelScrollRestartsTheCycleFromTheViewport", { CoordinatorNavigationTests().testWheelScrollRestartsTheCycleFromTheViewport() }),
+    ("testLargeMaterializationDefersWithSpinner", { CoordinatorNavigationTests().testLargeMaterializationDefersWithSpinner() }),
     ("testJumpMovesKeyFocusToTheTranscript", { CoordinatorNavigationTests().testJumpMovesKeyFocusToTheTranscript() }),
     ("testJumpDoesNotStealFocusWhileTheFindBarIsUp", { CoordinatorNavigationTests().testJumpDoesNotStealFocusWhileTheFindBarIsUp() }),
 ]

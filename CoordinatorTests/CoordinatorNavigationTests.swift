@@ -209,6 +209,72 @@ final class CoordinatorNavigationTests: XCTestCase {
         XCTAssertEqual(rowTopOffset(coordinator, 2), 8, accuracy: 0.5)
     }
 
+    // MARK: - Cycle anchor robustness
+
+    func testCycleAdvancesAcrossAProgrammaticViewportShift() {
+        // Regression: the follow-scroll that runs while streaming (following
+        // re-engages after a near-tail landing) shifts the viewport between
+        // keypresses. A tight "has the viewport moved" check made the next
+        // Down re-target the message it had just landed on — the reported
+        // "Cmd+Down needs two inputs to advance".
+        let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 20)
+        // Down from the tail lands on 22, clamped at the document bottom.
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        // followTail aims at the LAST ROW's bottom, ~10pt above the frame
+        // bottom the clamp uses — a small programmatic shift, no user input.
+        let lastRow = coordinator.tableView.numberOfRows - 1
+        let lastBottom = coordinator.tableView.rect(ofRow: lastRow).maxY
+        sv.contentView.scroll(to: NSPoint(x: 0, y: lastBottom - sv.contentView.bounds.height))
+        sv.reflectScrolledClipView(sv.contentView)
+        // The next Down must advance to 24 — not re-land on 22.
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 24,
+            "the cycle advances past the landed message despite the programmatic shift")
+        _ = vm
+    }
+
+    func testWheelScrollRestartsTheCycleFromTheViewport() {
+        let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 20)
+        let window = NSWindow(contentRect: sv.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        sv.frame = window.contentView!.bounds
+        window.contentView = sv
+        coordinator.jumpToNextUserMessage()
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 22)
+        // A real wheel scroll is the user taking over navigation.
+        (sv as! TranscriptScrollView).onUserScroll?()
+        XCTAssertNil(coordinator.cycleAnchor, "a wheel scroll clears the cycle anchor")
+        _ = vm
+    }
+
+    // MARK: - Large materialization shows the spinner
+
+    func testLargeMaterializationDefersWithSpinner() {
+        // A jump far above the materialized window fetches a large block: the
+        // loading spinner goes up and the prepend runs on the next run-loop
+        // turn (so it paints before the synchronous measurement), then the
+        // landing completes.
+        let vm = SessionViewModel()
+        for t in 0..<80 {
+            foldTurn(vm.store, user: "q \(t)", reply: "ok")
+        }
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 120)
+        sv.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(coordinator.windowStart, 25,
+            "precondition: the window is a tail chunk, so the jump needs a large fetch")
+
+        coordinator.jumpToUserMessage(2)
+        XCTAssertTrue(vm.isFetchingOlder, "the spinner is raised while the block loads")
+        XCTAssertNil(coordinator.cycleAnchor, "the landing is deferred until the prepend runs")
+
+        spinRunLoop()
+        XCTAssertFalse(vm.isFetchingOlder, "the load completed")
+        XCTAssertEqual(coordinator.windowStart, 0, "the whole conversation is materialized")
+        XCTAssertEqual(coordinator.cycleAnchor?.storeIndex, 2, "the deferred landing completed")
+    }
+
     // MARK: - Key focus after a jump
 
     /// A borderless, never-shown window hosting the scroll view, with an
