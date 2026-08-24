@@ -425,6 +425,20 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             object: scrollView.contentView
         )
 
+        // A clip-view frame change (window resize, scroller show/hide) changes
+        // the column width rows render at. The bounds-change path above can
+        // DROP a resize notification — `reconcileOnScroll` bails on an empty
+        // visible rect or a reconciliation in flight — so re-check the width
+        // directly here too. `noteHeightOfRows` is idempotent (the
+        // (id, width)-keyed cache re-measures only width-changed rows), so
+        // running alongside the scroll path is harmless.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewFrameDidChange(_:)),
+            name: NSView.frameDidChangeNotification,
+            object: scrollView.contentView
+        )
+
         // Pause rendering while the window is off-screen (occluded, minimized,
         // or the app is hidden); catch up on return. Occlusion changes fire
         // once per state transition, so this is cheap in steady state.
@@ -775,6 +789,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         reconcileOnScroll()
     }
 
+    /// A clip-view frame change: the visible area resized (window resize,
+    /// scroller show/hide). Only the width affects row heights. Runs
+    /// independently of `reconcileOnScroll`'s visibility and re-entrancy
+    /// guards — a resize the scroll path drops (empty visible rect, a
+    /// reconciliation in flight) still re-queries, so a settled row can never
+    /// keep a stale too-short rect from a resize it never saw.
+    @objc private func clipViewFrameDidChange(_ note: Notification) {
+        reconcileRowWidthIfChanged()
+    }
+
+    /// Re-queries every materialized row's height when the render width
+    /// changed. The cache is (id, width)-keyed, so only the width-changed
+    /// rows actually re-measure. `noteHeightOfRows` merely marks the cached
+    /// heights dirty; the table re-queries `heightOfRow` on its next layout.
+    private func reconcileRowWidthIfChanged() {
+        guard let tableView else { return }
+        let width = rowWidth(in: tableView)
+        if abs(width - lastRowWidth) > 0.5 {
+            lastRowWidth = width
+            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows))
+        }
+    }
+
     private func reconcileOnScroll() {
         guard let viewModel, !isApplying else { return }
         isApplying = true
@@ -791,11 +828,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // (or any settled state) freezes it forever. Re-query every materialized
         // row's height when the render width changes; the cache is
         // (id, width)-keyed, so only the width-changed rows actually re-measure.
-        let width = rowWidth(in: tableView)
-        if abs(width - lastRowWidth) > 0.5 {
-            lastRowWidth = width
-            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows))
-        }
+        // `clipViewFrameDidChange` runs the same check, so a resize
+        // notification dropped here (empty visible rect, a reconciliation in
+        // flight) still re-queries.
+        reconcileRowWidthIfChanged()
 
         let firstVisibleStore = windowStart + visible.location
 
