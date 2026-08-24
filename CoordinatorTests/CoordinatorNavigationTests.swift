@@ -393,6 +393,49 @@ final class CoordinatorNavigationTests: XCTestCase {
         _ = vm
     }
 
+    // MARK: - Column-width changes (the content-clipping fix)
+
+    /// The content-clipping regression: a column-width change (window resize,
+    /// scroller show/hide) leaves the table's row rects at the OLD width's
+    /// heights. Streaming rows self-heal (the batched refresh re-measures at
+    /// the current width); a SETTLED row keeps its stale too-short rect and
+    /// clips its top. The fix must re-query every materialized row's height
+    /// when the render width changes — driven by the clip view's frame-change
+    /// hook, NOT by a scroll (a resize with no scroll in between must still
+    /// heal). This drives the hook directly: narrow the column, post the clip
+    /// view's frame-change notification, and assert the settled row re-measures
+    /// taller at the narrower width.
+    func testColumnWidthChangeReQueriesSettledRowHeights() {
+        // A reply long enough to wrap at the wide width and wrap MORE at the
+        // narrow one — the height must grow, or the test asserts nothing.
+        let longReply = (0..<160).map { "word\($0)" }.joined(separator: " ")
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 800)
+        foldTurn(vm.store, user: "question", reply: longReply)
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+
+        let tableView = coordinator.tableView!
+        let column = tableView.tableColumns.first!
+        let wide = column.width
+        // Store index 1: the assistant reply (even indices are users).
+        let wideHeight = tableView.rect(ofRow: 1).height
+
+        // Narrow the render width, as a window resize would. The table does
+        // NOT re-query `heightOfRow` on a column-width change by itself — that
+        // is the bug — so the frame-change hook must invalidate the stale
+        // rects.
+        column.width = max(wide / 2, 340)
+        NotificationCenter.default.post(name: NSView.frameDidChangeNotification, object: sv.contentView)
+        sv.layoutSubtreeIfNeeded()
+
+        let narrowHeight = tableView.rect(ofRow: 1).height
+        XCTAssertGreaterThan(narrowHeight, wideHeight,
+            "a narrower column wraps the settled reply more; its height must be re-queried, not kept at the old width's")
+    }
+
     func testJumpDoesNotStealFocusWhileTheFindBarIsUp() {
         let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 5)
         vm.isSearchVisible = true
