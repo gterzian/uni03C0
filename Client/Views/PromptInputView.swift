@@ -19,9 +19,12 @@ struct PromptInputView: NSViewRepresentable {
     let sessionID: UUID
     let isEnabled: Bool
     let fontSize: CGFloat
-    /// Live status readout (context %, model, thinking level) shown in very
-    /// light gray at the bottom-right inside the prompt bar. Empty hides it.
-    let statusText: String
+    /// The session whose live status readout (context %, model, thinking
+    /// level) the prompt bar shows. The coordinator observes it directly (via
+    /// `onStatusTextChanged`) and updates the label in place, so a 2s context
+    /// poll re-renders only the readout — never the whole `SessionContent`
+    /// body.
+    let viewModel: SessionViewModel
     /// Mirror of the input's text (kept in sync by `onDraftChange`), used to
     /// restore queued steering into the input for editing.
     let draft: String
@@ -49,6 +52,7 @@ struct PromptInputView: NSViewRepresentable {
         PromptCoordinator(
             cwd: cwd,
             sessionID: sessionID,
+            viewModel: viewModel,
             onSubmit: onSubmit,
             onAbort: onAbort,
             onDraftChange: onDraftChange,
@@ -66,6 +70,12 @@ struct PromptInputView: NSViewRepresentable {
     func updateNSView(_ nsView: PromptContainerView, context: Context) {
         context.coordinator.cwd = cwd
         context.coordinator.isEnabled = isEnabled
+        // Re-target the status readout to this session. The coordinator's
+        // `viewModel` didSet unregisters the previous session's callback and
+        // wires the new one (the representable is reused across tab switches,
+        // so the coordinator must observe the ACTIVE session, not the one it
+        // was created for).
+        context.coordinator.viewModel = viewModel
         // Refresh the action closures: the representable is reused across tab
         // switches (same structural identity), so the coordinator must target
         // the currently active session, not the one it was created for.
@@ -75,8 +85,6 @@ struct PromptInputView: NSViewRepresentable {
         context.coordinator.onContentHeightChange = onContentHeightChange
         nsView.textView.isEditable = isEnabled && !context.coordinator.pasteActive
         nsView.textView.textColor = isEnabled ? .labelColor : .tertiaryLabelColor
-        nsView.statusLabel.stringValue = statusText
-        nsView.statusLabel.isHidden = statusText.isEmpty
         if nsView.textView.font?.pointSize != fontSize {
             nsView.textView.font = .systemFont(ofSize: fontSize)
         }
@@ -298,6 +306,30 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var onDraftChange: (String) -> Void
     var onContentHeightChange: (CGFloat) -> Void
 
+    /// The session whose live status readout (context %, model, thinking level)
+    /// the prompt bar shows. Setting it (re)wires `onStatusTextChanged`, so the
+    /// label updates IN PLACE — a 2s context poll never re-evaluates the
+    /// `SessionContent` body. Re-targeted on tab switch (the representable is
+    /// reused), so the previous session's callback is unregistered first.
+    var viewModel: SessionViewModel? {
+        didSet {
+            guard viewModel !== oldValue else { return }
+            oldValue?.onStatusTextChanged = nil
+            wireStatus(to: viewModel)
+        }
+    }
+
+    /// Wires the status readout to `vm`: registers the `onStatusTextChanged`
+    /// callback (which updates the label in place) and refreshes it now. Called
+    /// from `attach` (the `didSet` doesn't fire during `init` — Swift skips the
+    /// observers there) and from the `viewModel` didSet on a tab switch.
+    private func wireStatus(to vm: SessionViewModel?) {
+        vm?.onStatusTextChanged = { [weak self] in
+            self?.refreshStatusLabel()
+        }
+        refreshStatusLabel()
+    }
+
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
     private var completionItems: [String] = []
@@ -326,6 +358,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     init(
         cwd: URL,
         sessionID: UUID,
+        viewModel: SessionViewModel,
         onSubmit: @escaping (String) -> Void,
         onAbort: @escaping () -> Void,
         onDraftChange: @escaping (String) -> Void,
@@ -333,13 +366,46 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     ) {
         self.cwd = cwd
         self.sessionID = sessionID
+        self.viewModel = viewModel
         self.onSubmit = onSubmit
         self.onAbort = onAbort
         self.onDraftChange = onDraftChange
         self.onContentHeightChange = onContentHeightChange
     }
 
+    /// The live status readout text: context %, model, thinking level. Composed
+    /// in the coordinator (not the SwiftUI body), so a context-usage change
+    /// updates only the label.
+    @MainActor private static func statusText(_ vm: SessionViewModel) -> String {
+        var parts: [String] = []
+        if let percent = vm.contextUsage?.percent {
+            parts.append("ctx \(Int(percent.rounded()))%")
+        }
+        if let name = vm.model?.name ?? vm.model?.id {
+            parts.append(name)
+        }
+        if let level = vm.thinkingLevel {
+            parts.append(level)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Updates the bottom-right status label from the current view model. Only
+    /// the label changes — never the SwiftUI body.
+    private func refreshStatusLabel() {
+        guard let container else { return }
+        guard let vm = viewModel else {
+            container.statusLabel.stringValue = ""
+            container.statusLabel.isHidden = true
+            return
+        }
+        let text = Self.statusText(vm)
+        container.statusLabel.stringValue = text
+        container.statusLabel.isHidden = text.isEmpty
+    }
+
     deinit {
+        viewModel?.onStatusTextChanged = nil
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }
@@ -356,6 +422,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         completionWindow?.parentView = container
         installEscapeMonitor()
         installPasteAbortMonitor()
+        // The view model is already set (from the init), but the `didSet` was
+        // skipped there (Swift doesn't run observers during init), so wire the
+        // status readout now that the container exists.
+        wireStatus(to: viewModel)
         container.pasteClearButton.target = self
         container.pasteClearButton.action = #selector(clearPasteButtonClicked)
         // The paste-window slides and the spinner track the scroll position.
