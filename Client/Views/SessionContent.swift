@@ -99,7 +99,7 @@ struct SessionContent: View {
                 sessionID: tab.id,
                 isEnabled: inputEnabled(vm),
                 fontSize: FontSettings.shared.bodySize,
-                statusText: statusText(vm),
+                viewModel: vm,
                 draft: tab.promptDraft,
                 restoreRequest: tab.restoreRequest,
                 onRestoreConsumed: { tab.restoreRequest = nil },
@@ -225,24 +225,5 @@ struct SessionContent: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.regularMaterial)
-    }
-
-    /// The live status readout shown in very light gray at the bottom-right of
-    /// the prompt input: the context-window usage, the current model, and the
-    /// current thinking level. Composed here from the session's observable
-    /// state (SwiftUI re-evaluates on change), so the AppKit prompt bar just
-    /// displays the string.
-    private func statusText(_ vm: SessionViewModel) -> String {
-        var parts: [String] = []
-        if let percent = vm.contextUsage?.percent {
-            parts.append("ctx \(Int(percent.rounded()))%")
-        }
-        if let name = vm.model?.name ?? vm.model?.id {
-            parts.append(name)
-        }
-        if let level = vm.thinkingLevel {
-            parts.append(level)
-        }
-        return parts.joined(separator: " · ")
     }
 }

@@ -62,6 +62,14 @@ public final class SessionViewModel {
     /// directly.
     public var onTranscriptChange: (() -> Void)?
 
+    /// AppKit-side hook: called whenever a live status-readout input changes
+    /// (context usage, model, thinking level). The prompt bar's coordinator
+    /// sets this and updates the status label IN PLACE, so the 2s context
+    /// poll re-renders only the readout — never the whole session body (which
+    /// would otherwise re-run both NSViewRepresentable `updateNSView` calls
+    /// every 2s, the whole-session redraw seen in Quartz Debug while typing).
+    public var onStatusTextChanged: (() -> Void)?
+
     // MARK: - Per-session search
 
     /// True while the find bar is shown over the transcript (Cmd+F toggles).
@@ -500,8 +508,10 @@ public final class SessionViewModel {
 
         case "thinking_level_changed":
             if let level = frame.levelText() { thinkingLevel = level }
+            onStatusTextChanged?()
         case "model_changed":
             if let model = frame.decodeModelChange() { self.model = model }
+            onStatusTextChanged?()
 
         default:
             break // transcript frames are folded by the store below
@@ -594,6 +604,7 @@ public final class SessionViewModel {
         } else if let model = response.decodeModelChange() {
             self.model = model
         }
+        onStatusTextChanged?()
         // The set of supported thinking levels depends on the model: re-fetch
         // after a switch so the menu matches the new model. The thinking level
         // itself is left as pi has it — switching the model never forces one.
@@ -603,6 +614,7 @@ public final class SessionViewModel {
     public func setThinkingLevel(_ level: String) async throws {
         _ = try await controller.send(.setThinkingLevel(level: level))
         thinkingLevel = level
+        onStatusTextChanged?()
     }
 
     /// Aborts the current agent operation — the in-flight LLM turn (including
@@ -637,6 +649,7 @@ public final class SessionViewModel {
             return
         }
         contextUsage = payload.contextUsage
+        onStatusTextChanged?()
     }
 
     /// Starts the continuous context-usage poller (idempotent). Runs until
@@ -667,6 +680,7 @@ public final class SessionViewModel {
         }
         model = payload.model
         thinkingLevel = payload.thinkingLevel
+        onStatusTextChanged?()
         if let file = payload.sessionFile { sessionFile = URL(fileURLWithPath: file) }
         sessionName = payload.sessionName
         isStreaming = payload.isStreaming ?? false
