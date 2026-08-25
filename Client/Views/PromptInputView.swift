@@ -405,7 +405,15 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     }
 
     deinit {
-        viewModel?.onStatusTextChanged = nil
+        // `deinit` is always nonisolated, but `viewModel` is a MainActor-isolated
+        // `SessionViewModel`, so unregistering its status callback must run on the
+        // main actor. The coordinator (a SwiftUI representable) is torn down on
+        // the main thread, so `assumeIsolated` is safe here.
+        if let viewModel {
+            MainActor.assumeIsolated {
+                viewModel.onStatusTextChanged = nil
+            }
+        }
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }
