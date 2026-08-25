@@ -13,6 +13,16 @@ struct SandboxSettingsView: View {
     /// The agent RPC endpoint: the local pi executable spawned as
     /// `pi --mode rpc`. Prefilled with the default (pi resolved from PATH).
     @State private var rpcEndpointText = RPCEndpointSettings.load().executablePath
+    /// Whether the tool-call timeout is enforced (Load from Settings).
+    @State private var toolTimeoutEnabled: Bool
+    /// The tool-call timeout in minutes (Load from Settings).
+    @State private var toolTimeoutMinutes: Int
+
+    init() {
+        let timeout = ToolTimeoutSettings.load()
+        _toolTimeoutEnabled = State(initialValue: timeout.isEnabled)
+        _toolTimeoutMinutes = State(initialValue: max(1, timeout.seconds / 60))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -77,6 +87,26 @@ struct SandboxSettingsView: View {
                         footnote: "One domain per line; subdomains are included. URLs are fine — a pasted link is saved as its bare host (https://example.com/path → example.com). The agent can reach no other internet host. The model provider's domain (e.g. api.deepseek.com) must be listed for the agent to reach its model."
                     )
 
+                    // Tool-call timeout: a runtime behavior, read LIVE at the
+                    // start of each tool call (not snapshotted at spawn, unlike
+                    // the sandbox settings and the RPC endpoint). The assistant
+                    // is free to run as long as it wants — only a single tool
+                    // call is bounded.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("Tool call timeout", systemImage: "timer")
+                            .font(.headline)
+                        Toggle("Stop a tool call that runs too long", isOn: $toolTimeoutEnabled)
+                            .font(.callout)
+                        if toolTimeoutEnabled {
+                            Stepper("\(toolTimeoutMinutes) minutes", value: $toolTimeoutMinutes, in: 1...240)
+                                .font(.callout)
+                        }
+                        Text("If a single tool call (a command, a file edit, …) runs longer than this, the client aborts it and shows a notice. The assistant itself is not limited — a turn may run indefinitely as long as no one tool exceeds the limit. Default 10 minutes. Off = no limit.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
                     // The agent RPC endpoint: where the client finds `pi --mode rpc`.
                     // Local process only — the client speaks the RPC protocol over the
                     // executable's stdin/stdout.
@@ -114,6 +144,10 @@ struct SandboxSettingsView: View {
                     model.save()
                     RPCEndpointSettings(
                         executablePath: rpcEndpointText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ).save()
+                    ToolTimeoutSettings(
+                        seconds: toolTimeoutMinutes * 60,
+                        isEnabled: toolTimeoutEnabled
                     ).save()
                     saved = true
                 }

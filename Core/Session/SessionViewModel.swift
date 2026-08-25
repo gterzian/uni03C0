@@ -451,6 +451,7 @@ public final class SessionViewModel {
         eventTask?.cancel()
         eventTask = nil
         stopContextPolling()
+        stopToolTimeout()
         await controller.terminate()
         await proxy.stop()
     }
@@ -483,11 +484,26 @@ public final class SessionViewModel {
             // (flushing here raced pi and collapsed the queue).
             isStreaming = false
 
+        case "tool_execution_start":
+            // A tool begins executing. Start the per-tool timeout: the
+            // assistant may keep thinking / generating for as long as it
+            // wants (the limit is per tool call, not per turn) — only a tool
+            // that runs too long is cut off.
+            isToolRunning = true
+            startToolTimeout()
+
+        case "tool_execution_end":
+            // The tool finished (the next tool may begin immediately after).
+            isToolRunning = false
+            stopToolTimeout()
+
         case "agent_settled":
             // The whole agent run settled. Flush any queued steering as ONE
             // combined prompt (never one turn per message like the TUI) — or,
             // after an abort, return it to the input for editing instead.
             isStreaming = false
+            isToolRunning = false
+            stopToolTimeout()
             stopContextPolling()
             if abortReturnsQueuedSteering {
                 // The user aborted: don't flush queued steering as a new
@@ -671,6 +687,59 @@ public final class SessionViewModel {
     private func stopContextPolling() {
         contextPollTask?.cancel()
         contextPollTask = nil
+    }
+
+    // MARK: - Tool timeout
+
+    /// True between a tool's `tool_execution_start` and `tool_execution_end` —
+    /// the actual execution window. Only one tool runs at a time in pi's agent
+    /// loop, so a single in-flight timer suffices. The assistant itself (long
+    /// thinking / answer, tool-call argument generation) is NOT timed out —
+    /// only a tool that runs too long is cut off.
+    private var isToolRunning = false
+    /// The scheduled abort for the current tool call. Created on
+    /// `tool_execution_start`, cancelled on `tool_execution_end`. Only one
+    /// timer runs at a time; each tool gets its own fresh limit.
+    private var toolTimeoutTask: Task<Void, Never>?
+
+    /// Starts (restarts) the per-tool timeout. The limit is read LIVE from
+    /// Settings at this moment, so a change takes effect on the next tool.
+    /// Disabled/non-positive limits schedule nothing.
+    private func startToolTimeout() {
+        stopToolTimeout() // a new tool begins — restart the clock
+        guard let duration = ToolTimeoutSettings.load().duration else {
+            return // disabled or non-positive — no limit
+        }
+        toolTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return // cancelled — the tool finished (or was torn down) first
+            }
+            guard !Task.isCancelled else { return }
+            await self?.handleToolTimeout()
+        }
+    }
+
+    private func stopToolTimeout() {
+        toolTimeoutTask?.cancel()
+        toolTimeoutTask = nil
+    }
+
+    /// Fired when a tool's timer elapses. Aborts the run if the tool is still
+    /// executing and connected, and surfaces WHY it stopped (a plain abort
+    /// would be silent, and a timeout is informational — the user needs to
+    /// know the tool didn't just finish on its own).
+    private func handleToolTimeout() async {
+        toolTimeoutTask = nil
+        guard isToolRunning, connectionState == .connected else { return }
+        let limit = ToolTimeoutSettings.load()
+        lastError = "A tool ran longer than \(limit.displayText) — aborted."
+        do {
+            try await abort()
+        } catch {
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
     }
 
     private func refreshState() async {
