@@ -405,6 +405,17 @@ concurrency.
   UI state SwiftUI reads (`isStreaming`, `model`, `isReloading`,
   `isFetchingOlder`). It forwards frames to the store off-main and does **not**
   hold the transcript.
+
+  **Tool-call timeout.** When the limit is enabled, a tool call that runs
+  longer than the configured `ToolTimeoutSettings` is aborted automatically:
+  the timer starts on `tool_execution_start`, is cancelled on
+  `tool_execution_end`, and each tool gets its own fresh limit. The assistant
+  itself is NOT limited — long thinking / answer generation, and even many
+  short tool calls in a row, are fine; only a single tool that runs too long
+  is cut off. It aborts via the same `.abort()` command as the Stop button, so
+  an abort surfaces pi's own "Operation aborted" row in the transcript AND a
+  banner above the prompt bar explaining it was the timeout. The limit is read
+  LIVE at tool-call start (see `ToolTimeoutSettings`).
 - `TranscriptEntry` / `TranscriptEntryKind` — the row model (user message,
   assistant message with thinking, tool call card).
 - `ToolCardExpansion` / `HeightCache` — the per-card expand registry and the
@@ -423,6 +434,14 @@ concurrency.
 - `RPCEndpointSettings` — the persisted agent RPC endpoint: the local pi
   executable spawned as `pi --mode rpc`. Defaults to `PiExecutable.resolve()`
   (pi on PATH); the Settings page lets the user point at a different binary.
+- `ToolTimeoutSettings` — the configurable tool-call timeout (default
+  10 minutes, off when disabled). This is a runtime *behavior*, so unlike the
+  sandbox settings / RPC endpoint it is read LIVE at the start of each tool
+  call (changing it takes effect on the next tool call; a running tool keeps
+  the limit it started with). The timer bounds ONE tool's execution window
+  (`tool_execution_start` → `tool_execution_end`) — the assistant itself is
+  never limited, so a turn may run indefinitely as long as no single tool runs
+  too long. It aborts the operation when a tool exceeds the limit.
 - `SandboxPolicy` — builds the Seatbelt policy text (project + dev paths +
   dyld-support + path-ancestors + loopback-only network).
 - `WhitelistProxy` — the loopback HTTP proxy (CONNECT + absolute-URI) that
