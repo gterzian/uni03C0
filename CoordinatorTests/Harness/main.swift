@@ -20,6 +20,7 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testJumpMovesKeyFocusToTheTranscript", { CoordinatorNavigationTests().testJumpMovesKeyFocusToTheTranscript() }),
     ("testJumpDoesNotStealFocusWhileTheFindBarIsUp", { CoordinatorNavigationTests().testJumpDoesNotStealFocusWhileTheFindBarIsUp() }),
     ("testColumnWidthChangeReQueriesSettledRowHeights", { CoordinatorNavigationTests().testColumnWidthChangeReQueriesSettledRowHeights() }),
+    ("testStreamingRowSettleRendersWhileNotFollowing", { CoordinatorNavigationTests().testStreamingRowSettleRendersWhileNotFollowing() }),
 ]
 
 var totalFailures = 0

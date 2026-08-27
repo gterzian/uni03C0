@@ -674,6 +674,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
     var codeBlocksForTesting: [TranscriptText.CodeBlockInfo] { codeBlocks }
     /// The placed corner buttons (for click/copy tests).
     var copyButtonsForTesting: [CodeCopyButton] { copyButtons }
+    /// Whether this row currently renders a streaming assistant message (the
+    /// blinking caret). Internal for CoordinatorTests — proves a settled row
+    /// stopped showing its caret even when not following.
+    var isStreamingRowForTesting: Bool { isStreamingRow }
 
     override func layout() {
         super.layout()
