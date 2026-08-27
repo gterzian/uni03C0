@@ -450,4 +450,58 @@ final class CoordinatorNavigationTests: XCTestCase {
             "the find field's editor still holds key focus")
         _ = field
     }
+
+    // MARK: - Settled streaming row (the caret leech)
+
+    /// A just-settled assistant row must re-render (stop its blinking caret)
+    /// even when the user has scrolled up (`isFollowing == false`). Before the
+    /// fix, the streaming refresh ran behind `guard isFollowing`, so a cell
+    /// that was configured streaming kept its caret timer running forever (the
+    /// 0.35s redraw in Quartz Debug) until a tab switch re-created the cells
+    /// from the already-finalized store. This drives that path: fold an
+    /// in-progress turn (the row streams, so it has a live cell), disengage
+    /// following, settle via `message_end`, and assert the cell stops
+    /// rendering as streaming.
+    func testStreamingRowSettleRendersWhileNotFollowing() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 800)
+        sv.layoutSubtreeIfNeeded()
+        // Let makeScrollView's deferred scroll-to-bottom land before we take
+        // over, so no later run-loop turn surprises the follow state.
+        spinRunLoop()
+
+        // Fold an in-progress turn: the user echo + the assistant streaming.
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u0\",\"content\":[{\"type\":\"text\",\"text\":\"shuffle\"}]}}"))
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}"))
+        _ = vm.store.apply(frame(type: "message_update",
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"hello\"}}"))
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+
+        // Store index 1 is the assistant row; with a 2-row transcript in an
+        // 800pt viewport it has a live cell configured as streaming.
+        guard let cell = coordinator.tableView.view(atColumn: 0, row: 1, makeIfNecessary: false) as? TextRowView else {
+            return XCTFail("the streaming assistant row should have a live cell")
+        }
+        XCTAssertTrue(cell.isStreamingRowForTesting,
+            "precondition: the in-progress assistant row renders as streaming")
+
+        // The user scrolls up to read while the reply is still streaming.
+        coordinator.isFollowing = false
+
+        // The turn settles (message_end). The store finalizes the row; the
+        // settling must re-render the cell to stop its blinking caret even
+        // though following is off.
+        _ = vm.store.apply(frame(type: "message_end",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}"))
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+
+        XCTAssertFalse(cell.isStreamingRowForTesting,
+            "a settled streaming row must stop showing its caret even when not following")
+    }
 }

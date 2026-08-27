@@ -698,8 +698,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         // A prompt was just sent: the append above already re-engaged
         // following, so the tail streams into view from the first echo.
-        guard isFollowing else { return }
-
+        //
         // Batched in-place refresh of streaming rows: a few words at a time,
         // not every delta, crossfaded in. Tool cards are now created the
         // moment the model starts writing a call, so the still-streaming
@@ -709,6 +708,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // rather than invalidating it first (invalidation can make the row
         // flicker between the cell-derived and the re-measured height on
         // successive ticks), so rows only ever grow — never oscillate.
+        //
+        // This runs even when NOT following: the blinking caret is a view-side
+        // timer that only stops when the cell is re-configured with
+        // `isStreaming: false`. When the user has scrolled up (`isFollowing`
+        // false) the streaming→final flag flip used to be skipped by the
+        // `isFollowing` guard, so a just-settled row kept showing its caret
+        // (and pulsing it every 0.35s — the constant redraw in Quartz Debug)
+        // until a tab switch re-created the cells from the already-finalized
+        // store. Live content still batches only while following; a SETTLE
+        // re-renders regardless, and the follow-scroll stays gated on
+        // following so the user's viewport isn't yanked down.
         let now = ProcessInfo.processInfo.systemUptime
         var didRefresh = false
         var rowsToRefresh = IndexSet()
@@ -730,15 +740,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             // Batched by `StreamingRefreshGate` (a hard 0.25s cap, plus the
             // first chunk of a new message and the streaming→final flag flip)
             // — re-rendering per delta is the 100%-CPU path.
-            if streamGate.shouldRefresh(entryID: streamingEntry.id, text: text, thinking: thinking, isStreaming: isStreaming, now: now) {
+            // The gate is only advanced when we actually render: an off-screen
+            // live batch consulted here (not following, still streaming) would
+            // corrupt the gate's "last rendered" state and delay the next real
+            // refresh. So only consult it while following, or when the message
+            // SETTLED — the flag flip must stop the caret no matter where the
+            // user is reading.
+            let settled = !isStreaming
+            if isFollowing || settled,
+               streamGate.shouldRefresh(entryID: streamingEntry.id, text: text, thinking: thinking, isStreaming: isStreaming, now: now) {
                 rowsToRefresh.insert(streamingRow)
             }
         }
 
         // 2. The tail row, when it isn't the streaming row above: a running
         // tool card streams args/output; a finished one shows its final state.
+        // Gated on following: while the user is reading history, a running
+        // card's output is off-screen and not worth repainting — a settle is
+        // re-rendered when they scroll down (the scroll path refreshes the
+        // tail row, and the visible-card settle above already runs regardless
+        // of following). The streaming flag flip above IS the message settle
+        // that must render regardless.
         let lastRow = windowEnd - windowStart - 1
-        if lastRow >= 0, lastRow != streamingRow,
+        if isFollowing, lastRow >= 0, lastRow != streamingRow,
            let lastEntry = store.entry(at: windowEnd - 1) {
             var shouldRefresh = false
             if case .toolCall(let card) = lastEntry.kind {
@@ -772,12 +796,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 }
             }
             tableView.noteHeightOfRows(withIndexesChanged: rowsToRefresh)
-            followTail()
+            if isFollowing {
+                followTail()
+            }
             CATransaction.commit()
             didRefresh = true
         }
 
-        if didAppend && !didRefresh {
+        if didAppend && !didRefresh && isFollowing {
             followTail()
         }
     }
