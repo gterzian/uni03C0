@@ -80,6 +80,17 @@ public struct ToolCallCard: Hashable, Sendable, Identifiable {
         self.state = state
         self.startedAt = startedAt
     }
+
+    /// The `path` argument from the structured arguments — the file a
+    /// `read`/`write` tool call touched. Used to enrich the card title so these
+    /// cards show the path instead of only the tool name. Nil when the tool has
+    /// no `path` argument or the arguments aren't a structured object (e.g. a
+    /// history card whose arguments were only the pretty JSON string).
+    public var pathArgument: String? {
+        guard case .object(let obj)? = argumentsValue,
+              case .string(let path)? = obj["path"], !path.isEmpty else { return nil }
+        return path
+    }
 }
 
 public extension TranscriptEntry {

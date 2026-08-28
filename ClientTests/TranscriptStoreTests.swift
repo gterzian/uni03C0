@@ -227,6 +227,27 @@ final class TranscriptStoreTests: XCTestCase {
         XCTAssertEqual(created.toolName, "bash")
     }
 
+    func testToolCallCardPathArgument() {
+        // read/write cards carry a structured `path` argument, surfaced so the
+        // card title can show the file instead of just the tool name.
+        let read = ToolCallCard(id: "r", toolName: "read", arguments: "", argumentsValue: ["path": "/tmp/x"])
+        XCTAssertEqual(read.pathArgument, "/tmp/x")
+
+        let write = ToolCallCard(id: "w", toolName: "write", arguments: "", argumentsValue: ["path": "src/main.swift", "content": "let a = 1"])
+        XCTAssertEqual(write.pathArgument, "src/main.swift")
+
+        // Tools without a path argument get nil.
+        let bash = ToolCallCard(id: "b", toolName: "bash", arguments: "", argumentsValue: ["cmd": "ls"])
+        XCTAssertNil(bash.pathArgument)
+
+        // A string-only (openai-completions) or nil args value has no structured
+        // path — the title falls back to the bare tool name.
+        let stringArgs = ToolCallCard(id: "s", toolName: "read", arguments: "{\"path\":\"/tmp/y\"}", argumentsValue: "{\"path\":\"/tmp/y\"}")
+        XCTAssertNil(stringArgs.pathArgument)
+        let noArgs = ToolCallCard(id: "n", toolName: "write", arguments: "")
+        XCTAssertNil(noArgs.pathArgument)
+    }
+
     func testTurnStartPlaceholderPromotedByMessageStart() {
         let store = TranscriptStore()
 

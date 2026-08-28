@@ -214,10 +214,21 @@ struct ToolCallCardView: View {
         .padding(.vertical, 4)
     }
 
+    /// The path shown in the card title for file-path tools (`read`/`write`),
+    /// so a card says "read /path/to/file" instead of just "read". Nil for
+    /// tools that don't act on a single path (bash, glob, …).
+    private var titlePath: String? {
+        guard card.toolName == "read" || card.toolName == "write" else { return nil }
+        return card.pathArgument
+    }
+
     /// Accessibility label: "Tool bash, done" — the state word matches the
-    /// visual state readout.
+    /// visual state readout. File-path tools include the path.
     private var cardAccessibilityLabel: String {
-        "Tool \(card.toolName), \(card.state.label)"
+        if let path = titlePath {
+            return "Tool \(card.toolName) \(path), \(card.state.label)"
+        }
+        return "Tool \(card.toolName), \(card.state.label)"
     }
 
     private var header: some View {
@@ -228,7 +239,20 @@ struct ToolCallCardView: View {
             Text(highlighted(card.toolName))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.primary)
-            Spacer()
+            if let titlePath {
+                Text(highlighted(titlePath))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    // The path is the flexible element: it takes the space the
+                    // Spacer used to occupy so the title reads "read <path>",
+                    // compressing (truncating in the middle) before the trailing
+                    // state ever moves.
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Spacer()
+            }
             if hasExpandableContent {
                 // Passive state indicator — the whole card is the click target.
                 Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
