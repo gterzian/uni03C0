@@ -202,6 +202,27 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// whose width actually changed).
     private var lastRowWidth: CGFloat = 0
 
+    /// Store indices whose row height the TABLE may no longer agree with. The
+    /// cell is authoritative: a cell is rendered from the store's CURRENT
+    /// content (`makeCell`), while the table's row rect can still hold a
+    /// height measured for older content — the row is then shorter than the
+    /// text it renders, and because the cell's text view is bottom-anchored in
+    /// the (non-flipped) cell, the overflow leaves the row UPWARD: the top of
+    /// the message is clipped by the row above. `noteHeightOfRows` cannot be
+    /// called from inside the table's own view/height request, so the rows are
+    /// collected here and re-queried once on the next run-loop turn.
+    private var pendingHeightRequery: Set<Int> = []
+    private var heightRequeryScheduled = false
+
+    /// The row id a cell was last configured with as STREAMING. While the user
+    /// is scrolled up the refresh gate is not consulted (no rendering happens),
+    /// so `streamGate.lastStreamedID` goes stale and can point at an OLDER
+    /// message than the one the cells actually show streaming; the settle
+    /// refresh would then stop at that older row and leave the newer one
+    /// rendering its half-streamed text (and its blinking caret) forever.
+    /// Tracking what was really rendered makes the settle find that row.
+    private var renderedStreamingRowID: String?
+
     /// The store row ids that currently contain a search match, and the id of
     /// the current match — drive the yellow term backdrops. Rebuilt whenever
     /// the view model's match list changes (`onSearchResultsChanged`). The
@@ -518,6 +539,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// reload that follows never re-measures a row whose content is unchanged.
     private func activateSessionCache(_ session: SessionViewModel) {
         let key = ObjectIdentifier(session)
+        // Row-height bookkeeping is per session: the pending re-queries and the
+        // streaming-row marker belong to the session being left, and a reload
+        // rebuilds every cell anyway.
+        pendingHeightRequery.removeAll()
+        renderedStreamingRowID = nil
         sessionLRU.removeAll { $0 == key }
         sessionLRU.append(key)
         if let cached = heightsBySession[key] {
@@ -543,7 +569,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let storeIndex = windowStart + row
         guard let entry = viewModel?.store.entry(at: storeIndex) else { return nil }
-        return makeCell(for: entry, in: tableView)
+        return makeCell(for: entry, row: row, in: tableView)
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
@@ -725,11 +751,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         // 1. The last streaming assistant row. Once the message settles it
         // stays matched by `lastStreamedID`, so its final text is rendered
-        // even when it is no longer the tail.
+        // even when it is no longer the tail. `renderedStreamingRowID` covers
+        // the case the gate cannot: while the user is scrolled up nothing
+        // renders, so the gate never sees the message and `lastStreamedID`
+        // still points at an OLDER row — the search would stop there and the
+        // row the cells actually show streaming would never get its final
+        // render (stale text, immortal caret, and a row height measured for
+        // the half-streamed text: the top-clip).
         var streamingRow = -1
         var streamingEntry: TranscriptEntry?
         for i in (windowStart..<windowEnd).reversed() {
-            if let e = store.entry(at: i), e.kind.isStreaming || e.id == streamGate.lastStreamedID {
+            if let e = store.entry(at: i),
+               e.kind.isStreaming || e.id == streamGate.lastStreamedID || e.id == renderedStreamingRowID {
                 streamingRow = i - windowStart
                 streamingEntry = e
                 break
@@ -1167,6 +1200,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard row >= 0, row < tableView.numberOfRows else { return false }
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
         let width = rowWidth(in: tableView)
+        if entry.kind.isStreaming {
+            renderedStreamingRowID = entry.id
+        } else if renderedStreamingRowID == entry.id {
+            renderedStreamingRowID = nil
+        }
 
         if cell is TextRowView {
             let tag = Self.contentTag(for: entry)
@@ -1242,6 +1280,44 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         cell.layoutSubtreeIfNeeded()
         heights.invalidate(entry.id)
         return true
+    }
+
+    /// Marks a row's height as possibly out of date in the TABLE (the cell
+    /// renders content the row rect was not measured for) and flushes the
+    /// re-query once on the next run-loop turn. Deferred because the callers
+    /// run inside the table's own view/height request, where
+    /// `noteHeightOfRows` is not allowed; coalesced because a scroll can
+    /// materialize a whole viewport of rows in one pass.
+    private func scheduleHeightRequery(storeIndex: Int) {
+        pendingHeightRequery.insert(storeIndex)
+        guard !heightRequeryScheduled else { return }
+        heightRequeryScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.flushHeightRequery()
+        }
+    }
+
+    /// Re-queries the collected rows' heights, but only those that still
+    /// disagree with the table (the row may have been noted in the meantime by
+    /// the streaming refresh or a reload). Rows that left the window are
+    /// dropped.
+    private func flushHeightRequery() {
+        heightRequeryScheduled = false
+        let pending = pendingHeightRequery
+        pendingHeightRequery.removeAll()
+        guard let tableView, let store = viewModel?.store, !pending.isEmpty else { return }
+        let width = rowWidth(in: tableView)
+        var rows = IndexSet()
+        for storeIndex in pending {
+            let row = storeIndex - windowStart
+            guard row >= 0, row < tableView.numberOfRows, let entry = store.entry(at: storeIndex) else { continue }
+            let height = rowHeight(for: entry, width: width)
+            if abs(tableView.rect(ofRow: row).height - height) > 0.5 {
+                rows.insert(row)
+            }
+        }
+        guard !rows.isEmpty else { return }
+        tableView.noteHeightOfRows(withIndexesChanged: rows)
     }
 
     /// Recomputes whether the window is on screen. When it transitions from
@@ -1455,7 +1531,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: - Cells
 
-    private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
+    private func makeCell(for entry: TranscriptEntry, row: Int, in tableView: NSTableView) -> NSView {
         // Search state for this row: the live query (nil when the find bar is
         // closed or this row has no match) drives the yellow term highlight;
         // the current match uses a stronger shade. Matches are tracked by row
@@ -1532,6 +1608,22 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             height = rowHeight(for: entry, width: width)
         }
         view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        if entry.kind.isStreaming {
+            renderedStreamingRowID = entry.id
+        } else if renderedStreamingRowID == entry.id {
+            renderedStreamingRowID = nil
+        }
+        // The cell now renders the store's CURRENT content, which can be
+        // taller than the height the table is still using for this row (a row
+        // materialized mid-stream: `heightOfRow` served the last height the
+        // renderer seeded, then this cell rendered newer, taller text). The
+        // table cannot be told from inside its own view request, so the row is
+        // re-queried on the next run-loop turn — otherwise the cell's text
+        // overflows the short row upward and the message's top stays clipped
+        // until the next reload (the "switch tabs and back" heal).
+        if abs(tableView.rect(ofRow: row).height - height) > 0.5 {
+            scheduleHeightRequery(storeIndex: windowStart + row)
+        }
         return view
     }
 

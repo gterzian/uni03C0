@@ -20,11 +20,15 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testJumpMovesKeyFocusToTheTranscript", { CoordinatorNavigationTests().testJumpMovesKeyFocusToTheTranscript() }),
     ("testJumpDoesNotStealFocusWhileTheFindBarIsUp", { CoordinatorNavigationTests().testJumpDoesNotStealFocusWhileTheFindBarIsUp() }),
     ("testColumnWidthChangeReQueriesSettledRowHeights", { CoordinatorNavigationTests().testColumnWidthChangeReQueriesSettledRowHeights() }),
+    ("testRowMaterializedMidStreamHasItsHeightRequeried", { CoordinatorNavigationTests().testRowMaterializedMidStreamHasItsHeightRequeried() }),
+    ("testStreamingRowNeverClipsWhileItGrows", { CoordinatorNavigationTests().testStreamingRowNeverClipsWhileItGrows() }),
+    ("testWindowResizeNeverClips", { CoordinatorNavigationTests().testWindowResizeNeverClips() }),
     ("testStreamingRowSettleRendersWhileNotFollowing", { CoordinatorNavigationTests().testStreamingRowSettleRendersWhileNotFollowing() }),
 ]
 
 var totalFailures = 0
-for test in tests {
+let filter = ProcessInfo.processInfo.environment["TEST_FILTER"]
+for test in tests where filter == nil || test.name.contains(filter!) {
     let before = __testFailures
     test.body()
     let failures = __testFailures - before

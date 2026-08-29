@@ -436,6 +436,218 @@ final class CoordinatorNavigationTests: XCTestCase {
             "a narrower column wraps the settled reply more; its height must be re-queried, not kept at the old width's")
     }
 
+    // MARK: - Row height vs. rendered content (the top-clip regressions)
+
+    /// The clipping invariant, on every materialized row that has a live cell:
+    /// the table's row rect must be at least as tall as the content the CELL
+    /// lays out. A row shorter than its content overflows UPWARD (the cell's
+    /// text view is bottom-anchored in the non-flipped cell), so the first
+    /// line(s) are painted over — and hidden by — the row above: the
+    /// "message top cut off as if scrolled down" symptom.
+    private func assertNoClipping(_ coordinator: Coordinator, _ label: String) {
+        let tableView = coordinator.tableView!
+        for row in 0..<tableView.numberOfRows {
+            guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? TextRowView else { continue }
+            let rowHeight = tableView.rect(ofRow: row).height
+            let content = cell.contentHeight
+            if content > rowHeight + 0.5 {
+                XCTFail("\(label): row \(row) (store \(coordinator.windowStart + row)) renders \(content)pt of text in a \(rowHeight)pt row — the top is clipped")
+            }
+        }
+    }
+
+    /// A row MATERIALIZED MID-STREAM must have its height re-queried.
+    ///
+    /// The regression: while the user is scrolled up, the batched refresh is
+    /// skipped, so the streaming row's cached height stays at the last rendered
+    /// content. When the row is then materialized (the user peeks at the tail,
+    /// or any recycled cell comes back), `makeCell` renders the store's CURRENT
+    /// content — taller than the height `heightOfRow` just served — and seeded
+    /// the cache with it, but the TABLE was never told: the row stayed short
+    /// and the cell's text overflowed it upward, clipping the top of the
+    /// message until a reload (switching tabs and back) re-queried the height.
+    func testRowMaterializedMidStreamHasItsHeightRequeried() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 700, height: 300)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        // Settled history to scroll up into.
+        for t in 0..<8 {
+            foldTurn(vm.store, user: "question \(t)", reply: "a short reply \(t)")
+        }
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        // ONE turn with TWO assistant messages (pi's normal shape: thinking,
+        // a tool call, then more thinking — no user echo in between). The
+        // first streams while following, so the refresh gate tracks its id.
+        foldUserEcho(vm, id: "u-turn")
+        streamAssistantThinking(vm, coordinator, id: "a-first",
+                                text: "First message thinking, streamed while pinned to the bottom of the transcript.")
+
+        // The user scrolls up to read history: following disengages, so from
+        // here on nothing renders per delta.
+        let up = max(0, sv.documentVisibleRect.minY - 120)
+        sv.contentView.scroll(to: NSPoint(x: 0, y: up))
+        sv.reflectScrolledClipView(sv.contentView)
+        spinRunLoop() // the clip view's bounds-change notification is coalesced
+        coordinator.isFollowing = false
+
+        // The turn's SECOND message streams and is peeked at halfway (the row
+        // materializes with content newer than the height the table serves).
+        // The gate never sees this message — it is still tracking the first.
+        let thinking = "Now I need to verify the edit to `timers.rs` didn't break anything, since `event_loop.rs` was refactored without me touching it. The builds passed with both V8 and Boa, so all good. Now I'll run `cargo fmt` one more time to ensure formatting is clean, then show the final diff summary and generate a commit message."
+        streamAssistantThinking(vm, coordinator, id: "a-second", text: thinking,
+                                peekAtTail: true, sv: sv, scrolledUp: true,
+                                checkEachDelta: { [self] in
+            // Mid-stream, one run-loop turn after the row was materialized:
+            // the table must already agree with the cell. A mismatch here is
+            // the clip the user stares at for the REST of the turn (the settle
+            // is minutes away).
+            assertNoClipping(coordinator, "mid-stream, scrolled up")
+        })
+
+        sv.layoutSubtreeIfNeeded()
+        coordinator.tableView.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        assertNoClipping(coordinator, "after a stream that settled while scrolled up")
+
+        // The settle must also have re-rendered the row the cells actually
+        // showed streaming: the gate's own id still points at the FIRST
+        // message, so a search that trusts only the gate leaves this row with
+        // its half-streamed text and an immortal blinking caret.
+        let tableView = coordinator.tableView!
+        for row in 0..<tableView.numberOfRows {
+            guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? TextRowView else { continue }
+            XCTAssertFalse(cell.isStreamingRowForTesting,
+                "row \(row): every message has settled, so no cell may still render as streaming")
+        }
+    }
+
+    /// Streaming rows never clip while they grow: the row height and the cell's
+    /// own layout stay in step through a realistic delta cadence (the 0.25s
+    /// refresh gate batches like production) and across the settle.
+    func testStreamingRowNeverClipsWhileItGrows() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        let thinking = "Now I need to verify the edit to `timers.rs` didn't break anything, since `event_loop.rs` was refactored without me touching it. The builds passed with both V8 and Boa, so all good. Now I'll run `cargo fmt` one more time to ensure formatting is clean, then show the final diff summary and generate a commit message."
+        foldUserEcho(vm, id: "u1")
+        streamAssistantThinking(vm, coordinator, id: "a1", text: thinking, checkEachDelta: { [self] in
+            assertNoClipping(coordinator, "while streaming")
+        })
+        sv.layoutSubtreeIfNeeded()
+        coordinator.tableView.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        assertNoClipping(coordinator, "after the settle")
+    }
+
+    /// A real window resize (the chain the app sees: window → scroll view →
+    /// clip view → table → column) re-wraps every row; the rows must grow with
+    /// the text, in both directions.
+    func testWindowResizeNeverClips() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        let thinking = "Now I need to verify the edit to `timers.rs` didn't break anything, since `event_loop.rs` was refactored without me touching it. The builds passed with both V8 and Boa, so all good."
+        for t in 0..<6 {
+            foldTurn(vm.store, user: "question \(t)", reply: thinking)
+        }
+        // Materialize the rows BEFORE the window exists: a never-shown window
+        // reads as occluded, and `applyModelChanges` (correctly) does no
+        // rendering off-screen.
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+        let (window, _) = makeWindow(sv)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        assertNoClipping(coordinator, "before the resize")
+        let tableView = coordinator.tableView!
+        let wideRow = tableView.rect(ofRow: 1).height
+
+        window.setFrame(NSRect(x: 0, y: 0, width: 520, height: 700), display: true)
+        sv.layoutSubtreeIfNeeded()
+        tableView.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        XCTAssertGreaterThan(tableView.rect(ofRow: 1).height, wideRow,
+            "a narrower window wraps the reply more, so its row must grow")
+        assertNoClipping(coordinator, "after narrowing the window")
+
+        window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 700), display: true)
+        sv.layoutSubtreeIfNeeded()
+        tableView.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        assertNoClipping(coordinator, "after widening the window")
+    }
+
+    /// Folds a user message (the prompt echo), like sending a prompt.
+    private func foldUserEcho(_ vm: SessionViewModel, id: String) {
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"\(id)\",\"content\":[{\"type\":\"text\",\"text\":\"go\"}]}}"))
+        vm.onTranscriptChange?()
+    }
+
+    /// Streams `text` as one assistant message's thinking deltas at a realistic
+    /// cadence (so the 0.25s refresh gate batches like production), then settles
+    /// it. No user echo: this is a message WITHIN a turn, pi's normal shape.
+    ///
+    /// `scrolledUp` keeps following off for the whole message (the user is
+    /// reading history while the agent works), and `peekAtTail` scrolls the
+    /// streaming row into view halfway through — the user glancing at the tail
+    /// without going all the way down, which materializes the cell.
+    private func streamAssistantThinking(_ vm: SessionViewModel, _ coordinator: Coordinator, id: String, text: String,
+                                         peekAtTail: Bool = false, sv: NSScrollView? = nil,
+                                         scrolledUp: Bool = false,
+                                         checkEachDelta: (() -> Void)? = nil) {
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"\(id)\",\"content\":[]}}"))
+        if scrolledUp { coordinator.isFollowing = false }
+        vm.onTranscriptChange?()
+        if scrolledUp { coordinator.isFollowing = false }
+        let chars = Array(text)
+        var sent = 0
+        while sent < chars.count {
+            let upto = min(sent + 8, chars.count)
+            let delta = String(chars[sent..<upto])
+            sent = upto
+            let json = try! String(data: JSONSerialization.data(withJSONObject: [
+                "type": "message_update",
+                "assistantMessageEvent": ["type": "thinking_delta", "delta": delta],
+            ]), encoding: .utf8)!
+            _ = vm.store.apply(frame(type: "message_update", json))
+            vm.onTranscriptChange?()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            if scrolledUp { coordinator.isFollowing = false }
+            checkEachDelta?()
+            if peekAtTail, sent >= chars.count / 2, let sv {
+                let doc = sv.documentView!.frame.height
+                let target = max(0, doc - sv.contentView.bounds.height - 30)
+                if abs(sv.documentVisibleRect.minY - target) > 1 {
+                    sv.contentView.scroll(to: NSPoint(x: 0, y: target))
+                    sv.reflectScrolledClipView(sv.contentView)
+                    coordinator.tableView.layoutSubtreeIfNeeded()
+                }
+            }
+        }
+        let endJSON = try! String(data: JSONSerialization.data(withJSONObject: [
+            "type": "message_end",
+            "message": ["role": "assistant", "id": id, "stopReason": "end",
+                        "content": [["type": "thinking", "thinking": text]]],
+        ]), encoding: .utf8)!
+        _ = vm.store.apply(frame(type: "message_end", endJSON))
+        vm.onTranscriptChange?()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+
     func testJumpDoesNotStealFocusWhileTheFindBarIsUp() {
         let (coordinator, sv, vm) = makeStreamingCoordinator(turns: 5)
         vm.isSearchVisible = true

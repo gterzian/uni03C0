@@ -91,6 +91,16 @@ public func XCTAssertGreaterThan<T: Comparable>(_ expression1: T, _ expression2:
 }
 
 @discardableResult
+public func XCTAssertGreaterThanOrEqual<T: Comparable>(_ expression1: T, _ expression2: T, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
+    guard expression1 >= expression2 else {
+        __testFailures += 1
+        print("FAIL: \(message.isEmpty ? "XCTAssertGreaterThanOrEqual failed" : message) — \(expression1) is not >= \(expression2) (\(file):\(line))")
+        return false
+    }
+    return true
+}
+
+@discardableResult
 public func XCTAssertLessThanOrEqual<T: Comparable>(_ expression1: T, _ expression2: T, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
     guard expression1 <= expression2 else {
         __testFailures += 1

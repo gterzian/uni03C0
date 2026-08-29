@@ -679,6 +679,33 @@ Behavior details that matter:
   re-frame a cell whose height changed (the width follows via autoresizing,
   the height does not), so a cell recycled from a shorter row would otherwise
   lay out at the stale short height and clip the message's top.
+- **Whoever renders a row owns telling the table its height changed.** The
+  CELL is authoritative: `makeCell` renders the store's CURRENT content, while
+  `heightOfRow` may just have served a height measured for OLDER content (a
+  streaming row materialized between two batched refreshes — the documented
+  "the table must match the cell" rule cuts the other way here). The row is
+  then shorter than the text it renders, and since the text view is
+  bottom-anchored in the (non-flipped) cell, the overflow leaves the row
+  UPWARD: the first line is painted behind the row above — the "top cut off"
+  symptom, persisting until some reload re-queried the height (the user-visible
+  tell: **switching tabs and back healed it**, because `reloadData` re-queries
+  every row). `noteHeightOfRows` is illegal inside the table's own view/height
+  request, so `makeCell` compares its height against `rect(ofRow:)` and, on a
+  mismatch, defers a coalesced re-query (`scheduleHeightRequery` →
+  `flushHeightRequery`, which re-verifies each row before noting it). Any new
+  code path that renders a row's content must either note the height itself or
+  schedule the re-query.
+- **The settle must find the row the CELLS show streaming, not the row the
+  gate last batched.** While the user is scrolled up nothing renders, so
+  `StreamingRefreshGate.lastStreamedID` is never advanced; in a multi-message
+  turn (thinking → tool call → more thinking, no user echo in between) it then
+  points at an EARLIER message than the one the cells actually show streaming.
+  The backward search for "the streaming row" stopped at that stale row, so
+  the newer one never got its final render: stale half-streamed text, an
+  immortal blinking caret, and a row height measured for the half-streamed
+  text (the clip above). The coordinator therefore tracks
+  `renderedStreamingRowID` — what a cell was last configured with as streaming
+  — and the search matches it too.
 - **Tool cards show their content, expandable.** One card per call: pi's RPC
   strips the cumulative `message` from `message_update`, so `toolcall_start`/
   `toolcall_delta` carry only a `contentIndex` — the card is created at
@@ -825,11 +852,20 @@ Three deterministic bundles (no pi process, no network, no live model):
   `TranscriptView.swift` + the renderer/measurement sources against the REAL
   Core framework and drives an offscreen `NSTableView` with a real store:
   the Cmd+Up/Down cycle, scroll geometry (top-anchored vs near-tail clamped),
-  follow state, key focus after a jump, and older-history materialization.
-  `SessionViewModel` is stubbed (spawns pi at init — see
+  follow state, key focus after a jump, older-history materialization, and the
+  **row-height/clipping invariant** (`assertNoClipping`: no materialized row
+  may render more content than its row rect is tall) across a streaming turn,
+  a window resize, and a message that streams + settles while the user is
+  scrolled up. `SessionViewModel` is stubbed (spawns pi at init — see
   CoordinatorTests/SessionViewModelStub.swift). Run from a terminal via
   `xcodebuild -scheme CoordinatorTests test`; in the sandbox via
-  `scripts/run-coordinator-tests.sh`.
+  `scripts/run-coordinator-tests.sh` (`TEST_FILTER=<substring>` runs a subset).
+  Notes for writing these: the clip view's bounds-change notification is
+  COALESCED (posted when idle), so a programmatic scroll needs a run-loop spin
+  before the coordinator sees it; a never-shown `NSWindow` reads as occluded,
+  so rows must be materialized before the window is created; and a folded user
+  message legitimately re-engages following (as sending a prompt does), so a
+  "scrolled up" scenario must turn following off AFTER the echo.
 
 ### Running inside the sandbox (the normal case for an agent)
 
