@@ -89,6 +89,7 @@
 		BEE38D3E755197661AC78F07 /* TranscriptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD2E0E1238AD9B7245123060 /* TranscriptView.swift */; };
 		C1C9CE675F4CABCEB8EE8E1D /* ResponseDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 42837EDFC262356516C95576 /* ResponseDecodingTests.swift */; };
 		C2CA21B73BB4C2548532AFD5 /* ToolCardExpansion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CA955A11D2F9C71C7EA073D /* ToolCardExpansion.swift */; };
+		C9AC6EEC13EEB1788C545E1F /* StreamingFadeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4BD9FDA171935C600EF3AC9 /* StreamingFadeTests.swift */; };
 		CB977320AF63AC1CFBE5C8C5 /* JSONLFramer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2C4869E90A77FE00ACB84EB /* JSONLFramer.swift */; };
 		CCFFE298C5CE59A62C4DEFF8 /* Core.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BC124C9BC1141DC93680F43A /* Core.framework */; };
 		CDDF147786676B234C7068A5 /* SessionContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2C6FBFD7626AE3CB8C9071B /* SessionContent.swift */; };
@@ -263,6 +264,7 @@
 		D9B90831DDDFAC4742C0CC30 /* TranscriptCycler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptCycler.swift; sourceTree = "<group>"; };
 		DD2E0E1238AD9B7245123060 /* TranscriptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptView.swift; sourceTree = "<group>"; };
 		E00A41C3109873692C0F0B82 /* TextRowViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextRowViewTests.swift; sourceTree = "<group>"; };
+		E4BD9FDA171935C600EF3AC9 /* StreamingFadeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingFadeTests.swift; sourceTree = "<group>"; };
 		E512CEE54BE52B85E61D96FD /* SandboxSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxSettings.swift; sourceTree = "<group>"; };
 		E5E182EAE1794E2D31A0CE8E /* StreamedPasteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamedPasteTests.swift; sourceTree = "<group>"; };
 		E5E874A878E044EBBA8E03F5 /* SandboxSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxSettingsModel.swift; sourceTree = "<group>"; };
@@ -453,6 +455,7 @@
 			children = (
 				358B0DF39A6770F58827945C /* CodeCopyButtonTests.swift */,
 				22B4EE74B2D2D1EE59089DD3 /* MarkdownTextTests.swift */,
+				E4BD9FDA171935C600EF3AC9 /* StreamingFadeTests.swift */,
 				F72CF67F97A642946B2B1649 /* StreamingStorageTests.swift */,
 				07A2126121F1475B011EF34E /* TestHelpers.swift */,
 				E00A41C3109873692C0F0B82 /* TextRowViewTests.swift */,
@@ -840,6 +843,7 @@
 				5D3E9224FDD0BD9BE3FB4E11 /* FontSettings.swift in Sources */,
 				7D9E09309A87708C314DCBBB /* MarkdownText.swift in Sources */,
 				B269E3750B656CDD05BB919C /* MarkdownTextTests.swift in Sources */,
+				C9AC6EEC13EEB1788C545E1F /* StreamingFadeTests.swift in Sources */,
 				7326B272EC349F03FE9845F0 /* StreamingStorageTests.swift in Sources */,
 				D442B4B5B683F690508C3F8F /* TestHelpers.swift in Sources */,
 				6F67A50FA3EFB42B040A4089 /* TextRowView.swift in Sources */,

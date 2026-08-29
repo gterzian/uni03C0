@@ -266,6 +266,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// Bumped on every fade so stale animation steps (superseded by a newer
     /// batch) are skipped.
     private var fadeGeneration = 0
+    /// The runs of the fade currently in flight, paired with their FINAL
+    /// colors, so a superseded fade can be settled to its end state instead of
+    /// freezing mid-fade (see `settlePendingFade`).
+    private var pendingFadeRuns: [(range: NSRange, color: NSColor)] = []
     /// Streaming caret: pulses light↔dark blue while a turn generates —
     /// including before any content has streamed back (the turn-start
     /// placeholder row shows just the caret).
@@ -343,6 +347,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
         let oldString = textView.string
         let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
         codeBlocks = result.codeBlocks
+        // A fade still in flight belongs to the text currently in the storage:
+        // settle it to its final colors BEFORE the new string lands, while its
+        // ranges still address the characters they were measured on.
+        settlePendingFade()
         applyAttributedString(result.string, previous: oldString)
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read
@@ -491,6 +499,35 @@ final class TextRowView: NSView, NSTextViewDelegate {
         fadeIn(range: NSRange(location: prefix, length: length))
     }
 
+    /// Settles the fade currently in flight: every one of its runs jumps to its
+    /// final color and the remaining animation steps are cancelled.
+    ///
+    /// Load-bearing, not cosmetic. Starting a fade bumps `fadeGeneration`,
+    /// which SKIPS the previous fade's remaining steps, and the incremental
+    /// storage path deliberately keeps the shared prefix's attributes (the
+    /// prefix equality check ignores `.foregroundColor`). So without settling,
+    /// a batch superseded before its 0.3s fade finished left its text frozen at
+    /// whatever alpha it had reached — and since every batch appends past the
+    /// last one, the frozen regions accumulated into a growing washed-out block
+    /// (lighter toward the tail) in the middle of the message, healed only by a
+    /// full re-render. The user-visible tell: switching tabs and back fixed it.
+    ///
+    /// Called from `configure` before the new string is applied, so the ranges
+    /// still address the text they were measured on (a recycled cell would
+    /// otherwise paint one row's fade colors onto another row's characters).
+    private func settlePendingFade() {
+        defer { pendingFadeRuns.removeAll() }
+        guard !pendingFadeRuns.isEmpty, let storage = textView.textStorage else { return }
+        // Cancel the in-flight steps: they would re-dim what we just settled.
+        fadeGeneration += 1
+        let current = NSRange(location: 0, length: storage.length)
+        for (range, color) in pendingFadeRuns {
+            let clipped = NSIntersectionRange(range, current)
+            guard clipped.length > 0 else { continue }
+            storage.addAttribute(.foregroundColor, value: color, range: clipped)
+        }
+    }
+
     /// Dims `range` to near-invisible, then steps it back to its final color
     /// over ~0.3s. The final color is captured per attribute run before the
     /// dimming (thinking/body/caret can differ).
@@ -512,11 +549,14 @@ final class TextRowView: NSView, NSTextViewDelegate {
         for (r, c) in runs {
             storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(0.12), range: r)
         }
+        pendingFadeRuns = runs.map { (range: $0.0, color: $0.1) }
         let steps = 6
         for step in 1...steps {
             let alpha = 0.12 + 0.88 * CGFloat(step) / CGFloat(steps)
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.05) { [weak self] in
                 guard let self, self.fadeGeneration == generation, let storage = self.textView.textStorage else { return }
+                let isLast = step == steps
+                if isLast { self.pendingFadeRuns.removeAll() }
                 for (r, c) in runs {
                     // The text may have been replaced/truncated since this fade
                     // was scheduled; clip the range to the current length so a
@@ -525,7 +565,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
                     let current = NSRange(location: 0, length: storage.length)
                     let clipped = NSIntersectionRange(r, current)
                     guard clipped.length > 0 else { continue }
-                    storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(alpha), range: clipped)
+                    // The last step restores the captured color OBJECT, never
+                    // `withAlphaComponent(1)`: the semantic colors are not
+                    // opaque (`labelColor` is alpha 0.85), so forcing alpha 1
+                    // left every faded-in run slightly DARKER than the text
+                    // around it — reading as stray bold until a full re-render.
+                    storage.addAttribute(.foregroundColor, value: isLast ? c : c.withAlphaComponent(alpha), range: clipped)
                 }
             }
         }

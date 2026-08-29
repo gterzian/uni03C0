@@ -63,7 +63,9 @@ final class TextRowViewTests: XCTestCase {
         row.layoutSubtreeIfNeeded()
         let ranges = row.searchHighlightRangesForTesting
         XCTAssertEqual(ranges.count, 3, "every occurrence is highlighted, not the row")
-        XCTAssertEqual(ranges.map(\.location), [0, 6, 18], "ranges sit exactly on each occurrence")
+        // "proxy windowproxy Proxy": the standalone word, the one INSIDE
+        // "windowproxy" (index 12, past "window"), and the capitalized one.
+        XCTAssertEqual(ranges.map(\.location), [0, 12, 18], "ranges sit exactly on each occurrence")
         XCTAssertEqual(ranges.map(\.length), [5, 5, 5])
     }
 

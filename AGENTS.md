@@ -356,10 +356,11 @@ Three targets (see `project.yml`):
   renderer sources directly alongside the tests. Covers inline/block styling,
   code-block ranges and cards/copy buttons, block spacing, soft/hard line
   breaks, the load-bearing measurement invariant (rendered height ==
-  measured height), and the append-only streaming storage regressions
-  (`StreamingStorageTests`). Run via `xcodebuild -scheme RenderingTests
-  test`; can also be run with plain `swiftc` + a tiny XCTest shim when the
-  sandbox blocks package resolution.
+  measured height), the append-only streaming storage regressions
+  (`StreamingStorageTests`) and the streaming crossfade
+  (`StreamingFadeTests`). Run via `xcodebuild -scheme RenderingTests
+  test`; in the sandbox via `scripts/run-rendering-tests.sh` (plain `swiftc` +
+  the stub XCTest module, `TEST_FILTER=<substring>` for a subset).
 - **CoordinatorTests** (unit-test bundle, XCTest, `MainActor`): end-to-end
   tests for the transcript `Coordinator`'s keyboard navigation — the
   Cmd+Up/Down user-message cycle, its scroll/focus/follow effects, and
@@ -634,6 +635,13 @@ Behavior details that matter:
   plus immediately on a new message's first chunk and on the streaming→final
   flag flip — and each batched chunk **crossfades in**, so the text
   materializes in word groups instead of popping character by character. The
+  crossfade writes colors INTO the shared text storage, so it must always end
+  where the string says: a batch superseded before its ~0.3s fade finished is
+  **settled** to its final colors (`TextRowView.settlePendingFade`, called from
+  `configure` before the new string lands), and the last fade step restores the
+  captured color OBJECT rather than `withAlphaComponent(1)`. Both are
+  load-bearing — see *Failed fixes*.
+  The
   streaming row's height comes from the cell's own layout manager
   (`TextRowView.contentHeight`), which lays out **incrementally** — only the
   newly-appended characters are typeset — never from a fresh CoreText
@@ -778,6 +786,24 @@ works around them, and reintroducing any of them breaks the fast-UI property.
   from the cell's own incremental layout, seeded into the cache, and the
   refresh is batched at 0.25s — see the Smooth streaming bullet.
 
+- **Letting the streaming crossfade write colors that nothing restores.** The
+  per-batch fade-in dims the appended range and steps it back over ~0.3s. Two
+  ways that drifted, both healed by a tab switch (a full re-render) and
+  therefore reported as "weird formatting only while streaming":
+  a batch superseded before its fade finished had its remaining steps skipped
+  by the generation guard, and since the incremental storage path keeps the
+  prefix's colors (`.foregroundColor` is excluded from the prefix equality
+  check on purpose), that text stayed frozen at whatever alpha it had reached —
+  every superseded batch adding another, lighter region, i.e. a growing
+  washed-out block mid-message; and the fade's last step wrote
+  `color.withAlphaComponent(1)`, which is NOT the color it captured (the
+  semantic colors are not opaque — `labelColor` is alpha ~0.85), so every
+  faded-in run ended slightly darker than its surroundings and read as stray
+  bold. `settlePendingFade` + restoring the captured color object fix both;
+  `RenderingTests/StreamingFadeTests.swift` pins them. Anything new that
+  animates attributes in the row's storage must settle to the built string's
+  values.
+
 Validation notes: a `sample` during a long streaming turn should show the main
 thread mostly idle in the event loop (the per-tick work is confined to the
 streaming row); a large-context session should scroll smoothly and open
@@ -907,7 +933,12 @@ xcodebuild -scheme RenderingTests test
 
 ### RenderingTests in the sandbox (swiftc + stub — do not "fix")
 
-RenderingTests are deliberately NOT in the `Package.swift` harness, and the
+**`scripts/run-rendering-tests.sh`** runs them (`TEST_FILTER=<substring>` for a
+subset). It reuses the coordinator harness's stub XCTest + FontSettings stub
+(`CoordinatorTests/Harness/`) and GENERATES the runner from the test sources on
+every run, so adding a test file needs no harness edit.
+
+Why the stub route is the only one: RenderingTests are deliberately NOT in the `Package.swift` harness, and the
 Xcode `RenderingTests` target cannot build either — under Swift 6 language
 mode, `-default-isolation MainActor` (which the renderer sources require)
 makes the `XCTestCase` subclasses' `override func setUp()` and the inherited
@@ -915,33 +946,21 @@ makes the `XCTestCase` subclasses' `override func setUp()` and the inherited
 XCTest's nonisolated ObjC declarations (even an explicit `@MainActor
 override` fails; verified). The working route is plain `swiftc` with a stub
 `XCTest` module compiled under the *same* default isolation, so the override
-isolation check passes by construction:
+isolation check passes by construction.
 
-```
-# build a stub XCTest module + library once (it provides XCTestCase + the
-# assertion functions the real test files import)
-swiftc -emit-library -module-name XCTest -swift-version 6 \
-  -default-isolation MainActor -target arm64-apple-macosx26.0 \
-  -emit-module -emit-module-path /tmp/xctest/mod XCTestStub.swift \
-  -o /tmp/xctest/libXCTest.dylib
-# compile the renderer + tests + a runner into one binary and run it
-swiftc -swift-version 6 -default-isolation MainActor \
-  -target arm64-apple-macosx26.0 -o /tmp/xctest/rendertests \
-  /tmp/xctest/main.swift Client/Views/MarkdownText.swift \
-  Client/Views/TextRowView.swift Client/Views/CodeCopyButton.swift \
-  Client/Accessibility/DisplayOptions.swift /tmp/Stubs/FontSettings.swift \
-  RenderingTests/*.swift -I /tmp/CoreStub -I /tmp/xctest/mod \
-  -L /tmp/xctest -lXCTest && DYLD_LIBRARY_PATH=/private/tmp/xctest \
-  /tmp/xctest/rendertests
-```
+What the script does (the essential pieces, if it ever needs rebuilding):
 
-(The exact flags live in the shell history / scratch space; the essential
-pieces are: the stub `XCTest` module must be compiled with
-`-default-isolation MainActor` so its `setUp`/`init` match the renderer's
-isolation, `FontSettings` must be stubbed because the `@Observable` macro's
-plugin server is blocked in the sandbox, `Core` needs an empty stub module
-for TextRowView's `import Core`, and the runner calls every `test*` method
-explicitly since pure-Swift methods are not ObjC-visible.)
+- the stub `XCTest` module is compiled with `-default-isolation MainActor` so
+  its `setUp`/`init` match the renderer's isolation;
+- `FontSettings` is stubbed because the `@Observable` macro's plugin server is
+  blocked in the sandbox;
+- `Core` is linked from the SwiftPM harness build (`swift test
+  --disable-sandbox` once, for `TextRowView`'s `import Core`);
+- the generated runner calls every `test*` method explicitly (pure-Swift
+  methods are not ObjC-visible), with `setUp`/`tearDown` around each, and
+  instantiates `NSApplication.shared` first — without an app instance
+  `NSButton.performClick` sends no action and the copy-button tests fail
+  spuriously.
 
 ### Adding a rendering test
 
@@ -967,7 +986,13 @@ the whole `RenderingTests` directory, so `xcodegen generate` picks it up
   preserved (newline collapse), and the streaming-storage behavior
   (`StreamingStorageTests`: a pure append keeps the prefix's text and
   attributes, closing markdown / a font-size change re-styles the prefix,
-  a changed search query drops stale highlights).
+  a changed search query drops stale highlights) and the streaming crossfade
+  (`StreamingFadeTests`: a superseded batch settles to its final colors, a
+  settled message has no dim text, a completed fade lands on the captured
+  color and is never forced opaque).
+- Nothing here spins the run loop unless it says so, so the fade's async steps
+  cannot interleave — keep new tests deterministic the same way (spin
+  explicitly with `RunLoop.current.run(until:)` when a timer must fire).
 
 ## Conventions
 
