@@ -24,10 +24,10 @@ import AppKit
 /// back to plain paragraphs.
 @MainActor
 enum MarkdownText {
-    /// The parse result: the styled string plus every fenced code block
-    /// (character range within `string`, and the raw content — trailing
-    /// newline included — that a copy should deliver).
-    final class MarkdownBody {
+    /// A plain immutable data holder; `nonisolated` so `build` and the
+    /// background pre-measurer (both of which create/read it) can do so from
+    /// any thread.
+    nonisolated final class MarkdownBody {
         let string: NSAttributedString
         let codeBlocks: [(range: NSRange, code: String)]
 
@@ -43,7 +43,14 @@ enum MarkdownText {
     /// streaming turn caches every intermediate prefix (each is used once),
     /// so the cache is cost-limited and evicts the oldest/smallest first;
     /// entries from an older font size also evict naturally.
-    private static let cache: NSCache<NSString, MarkdownBody> = {
+    ///
+    /// `nonisolated(unsafe)`: the whole point of this file being off-main
+    /// callable is that the background height pre-measurer parses markdown on
+    /// a worker thread. `NSCache` is explicitly documented thread-safe
+    /// (it is built for concurrent get/set), so sharing it across the main
+    /// thread and the pre-measure task is safe — the `(unsafe)` is only
+    /// satisfying the compiler's blanket non-Sendable rule.
+    nonisolated(unsafe) private static let cache: NSCache<NSString, MarkdownBody> = {
         let cache = NSCache<NSString, MarkdownBody>()
         cache.countLimit = 400
         cache.totalCostLimit = 16 * 1024 * 1024
@@ -54,10 +61,13 @@ enum MarkdownText {
     /// for the corner copy button — the block's text wraps early so the button
     /// never covers code. `TextRowView` positions the button in this strip and
     /// `CodeCopyButton.size` must fit inside it.
-    static let codeBlockRightReserve: CGFloat = 54
+    nonisolated static let codeBlockRightReserve: CGFloat = 54
 
     /// Renders `markdown` to an attributed string styled for the transcript.
-    static func body(text: String, bodySize: CGFloat) -> MarkdownBody {
+    /// `nonisolated`: called from the main thread for rendering AND from the
+    /// coordinator's background pre-measurer for height seeding — both must
+    /// produce byte-identical strings (they feed the same measurement).
+    nonisolated static func body(text: String, bodySize: CGFloat) -> MarkdownBody {
         guard !text.isEmpty else { return MarkdownBody(string: NSAttributedString(), codeBlocks: []) }
         let key = "\(bodySize)\u{1F}\(text)" as NSString
         if let cached = cache.object(forKey: key) { return cached }
@@ -66,7 +76,7 @@ enum MarkdownText {
         return built
     }
 
-    private static func build(text: String, bodySize: CGFloat) -> MarkdownBody {
+    nonisolated private static func build(text: String, bodySize: CGFloat) -> MarkdownBody {
         guard let parsed = try? AttributedString(markdown: text) else {
             // The parser is CommonMark-tolerant; on the off chance it refuses,
             // render the source verbatim (identical to the old plain path).
@@ -156,8 +166,8 @@ enum MarkdownText {
                 font = monoFont
             }
             if let inline = run.inlinePresentationIntent {
-                if inline.contains(.stronglyEmphasized) { font = withTrait(.boldFontMask, font) }
-                if inline.contains(.emphasized) { font = withTrait(.italicFontMask, font) }
+                if inline.contains(.stronglyEmphasized) { font = withTrait([.bold], font) }
+                if inline.contains(.emphasized) { font = withTrait([.italic], font) }
             }
 
             let paragraph = NSMutableParagraphStyle()
@@ -207,6 +217,19 @@ enum MarkdownText {
         return MarkdownBody(string: result, codeBlocks: codeBlocks)
     }
 
+    /// Applies a font trait (bold/italic) without `NSFontManager` — the
+    /// shared instance is not thread-safe, and this runs on the background
+    /// pre-measurer. The descriptor route (`withSymbolicTraits`) synthesizes
+    /// the same faces as `NSFontManager.convert(_:toHaveTrait:)` (verified on
+    /// this SDK: same font names, same symbolic traits) and merges into the
+    /// font's EXISTING traits, so a bold font gaining italic stays bold+italic
+    /// exactly like the old sequential `convert` calls.
+    nonisolated private static func withTrait(_ trait: NSFontDescriptor.SymbolicTraits, _ font: NSFont) -> NSFont {
+        let merged = font.fontDescriptor.symbolicTraits.union(trait)
+        let descriptor = font.fontDescriptor.withSymbolicTraits(merged)
+        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+    }
+
     /// The layout the current block imposes on its runs: header size, code
     /// styling, and the indent markers for list items / blockquotes.
     ///
@@ -215,7 +238,9 @@ enum MarkdownText {
     /// levels are collected in that order and reversed for outermost-first
     /// markers. Only the innermost marker is rendered as text; the outer
     /// markers contribute indentation so nested content lines up under it.
-    private struct BlockLayout {
+    /// A pure value type (no AppKit state) — `nonisolated` so `build` (which
+    /// runs on the background pre-measurer too) can construct it.
+    nonisolated private struct BlockLayout {
         var headerLevel = 0
         var isCodeBlock = false
         var isThematicBreak = false
@@ -279,7 +304,7 @@ enum MarkdownText {
 
     /// The vertical gap inserted between markdown blocks (as an empty spacer
     /// line whose font height equals the gap).
-    private static func blockGap(_ layout: BlockLayout) -> CGFloat {
+    nonisolated private static func blockGap(_ layout: BlockLayout) -> CGFloat {
         if layout.headerLevel > 0 { return 10 }
         if layout.isCodeBlock { return 8 }
         if layout.isThematicBreak { return 8 }
@@ -288,7 +313,7 @@ enum MarkdownText {
     }
 
     /// h1…h6 scale the body font by this much (all bold).
-    private static func headerBoost(_ level: Int) -> CGFloat {
+    nonisolated private static func headerBoost(_ level: Int) -> CGFloat {
         switch level {
         case 1: 6
         case 2: 4
@@ -297,15 +322,11 @@ enum MarkdownText {
         }
     }
 
-    private static func withTrait(_ trait: NSFontTraitMask, _ font: NSFont) -> NSFont {
-        NSFontManager.shared.convert(font, toHaveTrait: trait)
-    }
-
     /// Subtle gray behind code (inline pill and the full-width card the row
     /// draws over fenced blocks), a touch stronger with Increase Contrast.
     /// Dynamic so it adapts to dark/light mode; resolved per draw, so a
     /// mid-session appearance change applies without re-rendering rows.
-    static let codeBackground = NSColor(name: nil) { appearance in
+    nonisolated static let codeBackground = NSColor(name: nil) { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         if DisplayOptions.increaseContrast {
             return dark
@@ -317,7 +338,7 @@ enum MarkdownText {
             : NSColor(calibratedWhite: 0.93, alpha: 1.0)
     }
 
-    private static func plainParagraph() -> NSParagraphStyle {
+    nonisolated private static func plainParagraph() -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         p.lineSpacing = 2
         p.lineBreakMode = .byWordWrapping

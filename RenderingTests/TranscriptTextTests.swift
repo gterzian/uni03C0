@@ -24,7 +24,8 @@ final class TranscriptTextTests: XCTestCase {
             role: role,
             isStreaming: isStreaming,
             cacheHitRate: cacheHitRate,
-            cacheMiss: cacheMiss
+            cacheMiss: cacheMiss,
+            bodySize: FontSettings.shared.bodySize
         )
     }
 
@@ -101,7 +102,7 @@ final class TranscriptTextTests: XCTestCase {
         row.layoutSubtreeIfNeeded()
         let measured = TranscriptText.measuredHeight(
             text: md, thinking: "thinking", role: .assistant, isStreaming: false, width: 800,
-            cacheHitRate: 0.95, cacheMiss: false
+            cacheHitRate: 0.95, cacheMiss: false, bodySize: FontSettings.shared.bodySize
         )
         // contentHeight = usedRect + insets; measuredHeight adds 2pt slack.
         XCTAssertEqual(measured, row.contentHeight, accuracy: 3)
@@ -109,7 +110,7 @@ final class TranscriptTextTests: XCTestCase {
 
     func testMeasuredHeightIsPositiveForEmptyText() {
         XCTAssertGreaterThan(
-            TranscriptText.measuredHeight(text: "", thinking: nil, role: .assistant, isStreaming: false, width: 800),
+            TranscriptText.measuredHeight(text: "", thinking: nil, role: .assistant, isStreaming: false, width: 800, bodySize: FontSettings.shared.bodySize),
             0
         )
     }

@@ -143,4 +143,46 @@ final class HeightCacheTests: XCTestCase {
         XCTAssertEqual(height, 55)
         XCTAssertFalse(called)
     }
+
+    // MARK: - Thread safety
+
+    /// The off-main pre-measurer holds a cache reference across a task
+    /// boundary and stores into it (via the main-actor hop); the lock makes
+    /// the `@unchecked Sendable` claim real. Hammer the cache from many
+    /// threads at once: every id must survive intact and the count must be
+    /// exact — a data race would drop or corrupt entries.
+    func testConcurrentStoreAndReadIsSafe() {
+        let cache = HeightCache()
+        let count = 200
+        DispatchQueue.concurrentPerform(iterations: count) { i in
+            let id = "row-\(i)"
+            cache.store(id, width: 640, height: CGFloat(i), tag: "t\(i)")
+            _ = cache.heightIfPresent(for: id, width: 640)
+            _ = cache.cached(for: id, width: 640)
+            if i % 3 == 0 {
+                cache.invalidate(id)
+                cache.store(id, width: 640, height: CGFloat(i), tag: "t\(i)")
+            }
+        }
+        for i in 0..<count {
+            XCTAssertEqual(cache.heightIfPresent(for: "row-\(i)", width: 640), CGFloat(i),
+                "every concurrently-stored height must be intact")
+        }
+        XCTAssertEqual(cache.count, count)
+    }
+
+    /// Concurrent `height(for:width:tag:measure:)` misses: the measure
+    /// closure runs OUTSIDE the lock, so racing misses each measure and
+    /// store the same value — the cache stays consistent and a later query
+    /// hits.
+    func testConcurrentMeasureAndStoreIsSafe() {
+        let cache = HeightCache()
+        let count = 100
+        DispatchQueue.concurrentPerform(iterations: count) { i in
+            _ = cache.height(for: "shared", width: 640, tag: "t") { CGFloat(i) }
+        }
+        let final = cache.height(for: "shared", width: 640, tag: "t") { 999 }
+        XCTAssertEqual(final, cache.heightIfPresent(for: "shared", width: 640))
+        XCTAssertTrue(cache.hasHeight(for: "shared"))
+    }
 }

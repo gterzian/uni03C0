@@ -716,4 +716,68 @@ final class CoordinatorNavigationTests: XCTestCase {
         XCTAssertFalse(cell.isStreamingRowForTesting,
             "a settled streaming row must stop showing its caret even when not following")
     }
+
+    // MARK: - Off-main height pre-measurement
+
+    /// A settled row appended to the store must be scheduled for background
+    /// measurement and the result must land in the session's height cache
+    /// (so `heightOfRow` serves it instead of typesetting on the main
+    /// thread). The seeded height must equal the authoritative measure — the
+    /// "one measurement function" invariant.
+    func testAppendSchedulesAndSeedsOffMainPremeasure() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 800)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop() // let makeScrollView's deferred tail-scroll land
+
+        // Fold ONE settled user message (no assistant reply): the only row is
+        // a settled text row, so it is pre-measurable.
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u0\",\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}]}}"))
+        vm.onTranscriptChange?()
+
+        // The pump drains the queue into the in-flight task synchronously, so
+        // the observable signal is `premeasureInFlight`, not a non-empty queue.
+        XCTAssertTrue(coordinator.premeasureInFlight,
+            "an appended settled row starts the background pre-measure")
+
+        spinRunLoop() // let the detached measure task drain + store
+
+        XCTAssertFalse(coordinator.premeasureInFlight, "the pre-measure task completed")
+        XCTAssertTrue(coordinator.pendingPremeasure.isEmpty,
+            "the pre-measure queue drains")
+        let width = coordinator.tableView.tableColumns.first!.width
+        let cache = coordinator.heightCacheForTesting(vm)
+        let cached = cache?.heightIfPresent(for: "u0", width: width)
+        XCTAssertNotNil(cached, "the pre-measured height landed in the session cache")
+        guard let cached else { return }
+        let direct = vm.store.entry(at: 0)!.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+        XCTAssertEqual(cached, direct, accuracy: 0.01,
+            "the background-seeded height is the same value the main-thread measure produces")
+    }
+
+    /// A row appended in the STREAMING state must never be pre-measured — its
+    /// height comes from the cell's incremental layout (re-measuring the
+    /// growing text is the documented 100%-CPU regression). The queue must
+    /// stay empty for a streaming append.
+    func testStreamingAppendDoesNotSchedulePremeasure() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 800)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        // A streaming assistant row (no user echo — the message begins with
+        // the assistant, so the store appends it directly as streaming).
+        _ = vm.store.apply(frame(type: "message_start",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"id\":\"a1\",\"content\":[{\"type\":\"text\",\"text\":\"\"}]}}"))
+        vm.onTranscriptChange?()
+
+        XCTAssertTrue(coordinator.pendingPremeasure.isEmpty,
+            "a streaming row is measured by the cell's incremental layout, never pre-measured")
+        XCTAssertFalse(coordinator.premeasureInFlight, "nothing was scheduled")
+    }
 }

@@ -7,9 +7,9 @@ import Core
 /// space at the bottom of a streaming row, no clipping.
 enum TranscriptText {
     /// lineFragmentPadding 8 each side.
-    static let horizontalPadding: CGFloat = 16
+    nonisolated static let horizontalPadding: CGFloat = 16
     /// textContainerInset 6 top + 6 bottom.
-    static let verticalInset: CGFloat = 12
+    nonisolated static let verticalInset: CGFloat = 12
 
     /// A fenced code block within the row's full attributed string.
     struct CodeBlockInfo {
@@ -18,35 +18,45 @@ enum TranscriptText {
     }
 
     /// The row's attributed string plus its fenced code blocks (for the row's
-    /// card backgrounds and corner copy buttons).
-    struct AttributedResult {
+    /// card backgrounds and corner copy buttons). A plain immutable data
+    /// holder; `nonisolated` so the background pre-measurer can carry it.
+    nonisolated struct AttributedResult {
         var string: NSAttributedString
         var codeBlocks: [CodeBlockInfo]
     }
 
-    static func attributedString(
+    /// `nonisolated` (both this and `attributedResult`): the renderer calls
+    /// them on the main thread, and the coordinator's background
+    /// pre-measurer calls them on a worker thread to seed the height cache
+    /// ahead of the table. Both must produce byte-identical strings — they
+    /// feed the same measurement — so `bodySize` is passed explicitly (the
+    /// caller resolves `FontSettings` on the thread it owns) and nothing
+    /// touches MainActor state.
+    nonisolated static func attributedString(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> NSAttributedString {
-        attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss).string
+        attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize).string
     }
 
-    static func attributedResult(
+    nonisolated static func attributedResult(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> AttributedResult {
         let body = NSMutableParagraphStyle()
         body.lineSpacing = 2
         body.lineBreakMode = .byWordWrapping
-        let bodyFont = NSFont.systemFont(ofSize: FontSettings.shared.bodySize)
+        let bodyFont = NSFont.systemFont(ofSize: bodySize)
         // Notice/error rows (stream failures, aborts): hard failures render
         // red; user-initiated aborts render secondary (weaker).
         let bodyColor: NSColor = switch role {
@@ -62,7 +72,7 @@ enum TranscriptText {
             thinkStyle.lineSpacing = 1
             thinkStyle.lineBreakMode = .byWordWrapping
             result.append(NSAttributedString(string: "💭 " + thinking, attributes: [
-                .font: NSFont.systemFont(ofSize: FontSettings.shared.bodySize - 1),
+                .font: NSFont.systemFont(ofSize: bodySize - 1),
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: thinkStyle,
             ]))
@@ -83,7 +93,7 @@ enum TranscriptText {
             // the closing fence lands). Errors and aborts stay plain.
             let rendersMarkdown = (role == .user) || (role == .assistant)
             if rendersMarkdown {
-                let parsed = MarkdownText.body(text: text, bodySize: FontSettings.shared.bodySize)
+                let parsed = MarkdownText.body(text: text, bodySize: bodySize)
                 markdownBody = parsed
                 bodyStart = result.length
                 result.append(parsed.string)
@@ -124,7 +134,7 @@ enum TranscriptText {
             }
             let suffix = cacheMiss ? " · large miss" : ""
             result.append(NSAttributedString(string: "\n⚡ cache \(formatted)%\(suffix)", attributes: [
-                .font: NSFont.systemFont(ofSize: FontSettings.shared.bodySize - 2),
+                .font: NSFont.systemFont(ofSize: bodySize - 2),
                 .foregroundColor: color,
                 .paragraphStyle: body,
             ]))
@@ -143,16 +153,17 @@ enum TranscriptText {
         return AttributedResult(string: result, codeBlocks: codeBlocks)
     }
 
-    static func measuredHeight(
+    nonisolated static func measuredHeight(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         width: CGFloat,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> CGFloat {
-        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
+        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize)
         guard attributed.length > 0 else { return 30 }
         let usableWidth = max(width - horizontalPadding, 60)
         let bounds = attributed.boundingRect(
@@ -215,7 +226,11 @@ enum SearchMatchHighlight {
 /// supplies the row height via `TranscriptText.measuredHeight`, and `layout()`
 /// sizes the text view to match so content is never clipped.
 final class TextRowView: NSView, NSTextViewDelegate {
-    enum Role {
+    /// The role shapes the styling (and the VoiceOver label). A plain
+    /// Sendable value; `nonisolated` so the (now background-capable) height
+    /// measurer can switch on it — the synthesized Equatable conformance
+    /// would otherwise be MainActor-isolated.
+    nonisolated enum Role {
         case user
         case assistant
         /// A stream-failure row (network errors, aborts, truncation) — styled
@@ -287,6 +302,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
     }
 
     private func setup() {
+        // One layer per cell: the cell's raster is cached in its own backing
+        // store, so a streaming tail row's redraw never forces the window's
+        // shared backing store to re-rasterize every visible cell (the
+        // `CABackingStoreUpdate_` / IOSurface churn in samples). The text view
+        // draws into this layer like any subview.
+        wantsLayer = true
         textView.isEditable = false
         textView.isSelectable = true
         textView.delegate = self
@@ -320,21 +341,24 @@ final class TextRowView: NSView, NSTextViewDelegate {
         textView.setAccessibilityRole(.textArea)
         // If the user toggles Reduce Motion / Increase Contrast mid-session,
         // stop the caret pulse (or restart it) without waiting for the next
-        // streaming delta.
+        // streaming delta. The notification arrives on the main queue; the
+        // hop to the main actor keeps the row state on its own thread.
         reduceMotionObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: DisplayOptions.didChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            if DisplayOptions.reduceMotion {
-                self.stopCaretPulse()
-            } else if self.isStreamingRow {
-                if DisplayOptions.increaseContrast {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if DisplayOptions.reduceMotion {
                     self.stopCaretPulse()
-                    self.applyHighContrastCaret()
-                } else {
-                    self.startCaretPulse()
+                } else if self.isStreamingRow {
+                    if DisplayOptions.increaseContrast {
+                        self.stopCaretPulse()
+                        self.applyHighContrastCaret()
+                    } else {
+                        self.startCaretPulse()
+                    }
                 }
             }
         }
@@ -345,7 +369,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
         isStreamingRow = isStreaming
         textView.setAccessibilityLabel(role.accessibilityLabel)
         let oldString = textView.string
-        let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
+        let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: FontSettings.shared.bodySize)
         codeBlocks = result.codeBlocks
         // A fade still in flight belongs to the text currently in the storage:
         // settle it to its final colors BEFORE the new string lands, while its
@@ -778,6 +802,19 @@ final class TextRowView: NSView, NSTextViewDelegate {
 /// dynamic `TextRowView.userHighlight` color, so dark/light mode and Increase
 /// Contrast resolve at draw time.
 private final class UserHighlightView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // A flat fill is trivially thread-safe to rasterize; letting AppKit
+        // draw it on a background thread takes the fill out of the main
+        // thread's display pass.
+        canDrawConcurrently = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        canDrawConcurrently = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         TextRowView.userHighlight.setFill()
         dirtyRect.fill()
@@ -788,6 +825,16 @@ private final class UserHighlightView: NSView {
 /// dynamic `MarkdownText.codeBackground` color; the row positions it over the
 /// block's line rects (below the text, so glyphs stay crisp on top).
 private final class CodeBlockCardView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        canDrawConcurrently = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        canDrawConcurrently = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         MarkdownText.codeBackground.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()

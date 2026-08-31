@@ -16,7 +16,16 @@ import Foundation
 ///
 /// Pure data (no AppKit): the measure closure is supplied by the caller (the
 /// transcript coordinator), so this lives in Core and is unit-testable.
-public final class HeightCache {
+///
+/// Thread safety: the coordinator mutates the cache on the MAIN thread only
+/// (the off-main pre-measurer measures plain values and hops to the main actor
+/// to store), but the class is lock-guarded and `@unchecked Sendable` so the
+/// pre-measurer can hold a cache reference across a task boundary and a future
+/// path that stores off-main stays safe rather than silently corrupting the
+/// dictionary. The lock is uncontended in the hot path (`heightOfRow` runs on
+/// one thread); the measure closure is deliberately run OUTSIDE the lock so a
+/// slow `boundingRect` never blocks a concurrent store.
+public final class HeightCache: @unchecked Sendable {
     private struct Entry {
         var width: CGFloat
         var height: CGFloat
@@ -26,6 +35,7 @@ public final class HeightCache {
     }
 
     private var cache: [String: Entry] = [:]
+    private let lock = NSLock()
 
     public init() {}
 
@@ -34,11 +44,21 @@ public final class HeightCache {
     /// ever matches a nil-tag entry. Otherwise runs `measure`, caches the
     /// result under `tag`, and returns it.
     public func height(for id: String, width: CGFloat, tag: String? = nil, measure: () -> CGFloat) -> CGFloat {
+        lock.lock()
         if let cached = cache[id], abs(cached.width - width) < 0.5, cached.tag == tag {
-            return cached.height
+            let height = cached.height
+            lock.unlock()
+            return height
         }
+        lock.unlock()
+        // The measure closure can be a full CoreText `boundingRect` — never
+        // hold the lock across it (a concurrent store would block for the
+        // whole measure; and on the main thread both paths are serialized
+        // anyway). A measure racing a store just computes the same value.
         let height = measure()
+        lock.lock()
         cache[id] = Entry(width: width, height: height, tag: tag)
+        lock.unlock()
         return height
     }
 
@@ -48,8 +68,10 @@ public final class HeightCache {
     /// renders, which is the last batched refresh the renderer seeded — never
     /// the store's newer, not-yet-rendered content.
     public func heightIfPresent(for id: String, width: CGFloat) -> CGFloat? {
-        guard let cached = cache[id], abs(cached.width - width) < 0.5 else { return nil }
-        return cached.height
+        lock.withLock {
+            guard let cached = cache[id], abs(cached.width - width) < 0.5 else { return nil }
+            return cached.height
+        }
     }
 
     /// The cached entry for `id` at `width` (height + content tag), or nil when
@@ -57,28 +79,40 @@ public final class HeightCache {
     /// configure+layout when the content is unchanged since the last render
     /// (a scroll re-entering the row with the same text must not re-measure).
     public func cached(for id: String, width: CGFloat) -> (height: CGFloat, tag: String?)? {
-        guard let cached = cache[id], abs(cached.width - width) < 0.5 else { return nil }
-        return (cached.height, cached.tag)
+        lock.withLock {
+            guard let cached = cache[id], abs(cached.width - width) < 0.5 else { return nil }
+            return (cached.height, cached.tag)
+        }
     }
 
     public func invalidate(_ id: String) {
-        cache.removeValue(forKey: id)
+        lock.withLock {
+            cache.removeValue(forKey: id)
+        }
     }
 
     /// Drops every cached height (e.g. after a font-size change).
     public func clear() {
-        cache.removeAll()
+        lock.withLock {
+            cache.removeAll()
+        }
     }
 
     /// Pre-seeds the cache from an authoritative source (e.g. the visible
     /// cell's own layout) so later `height(for:width:tag:measure:)` calls hit
     /// without running the measure closure.
     public func store(_ id: String, width: CGFloat, height: CGFloat, tag: String? = nil) {
-        cache[id] = Entry(width: width, height: height, tag: tag)
+        lock.withLock {
+            cache[id] = Entry(width: width, height: height, tag: tag)
+        }
     }
 
     /// Test/observation helper: whether an id has a cached height.
-    public func hasHeight(for id: String) -> Bool { cache[id] != nil }
+    public func hasHeight(for id: String) -> Bool {
+        lock.withLock { cache[id] != nil }
+    }
 
-    public var count: Int { cache.count }
+    public var count: Int {
+        lock.withLock { cache.count }
+    }
 }
