@@ -36,8 +36,10 @@ enum SessionToolbar {
                 Label {
                     Text("Stop")
                 } icon: {
-                    ProgressView()
-                        .controlSize(.small)
+                    // AppKit spinner, not SwiftUI `ProgressView`: a SwiftUI
+                    // spinner animates the toolbar hosting view's graph every
+                    // frame for the whole turn (see `SpinnerView`).
+                    SpinnerView()
                 }
             } else {
                 Label("Stop", systemImage: "stop")
@@ -184,8 +186,7 @@ enum SessionToolbar {
                             } else {
                                 Text("\(vm.searchCurrentIndex + 1) of")
                             }
-                            ProgressView()
-                                .controlSize(.mini)
+                            SpinnerView(controlSize: .mini)
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)

@@ -31,18 +31,25 @@ struct SessionContent: View {
                 if vm.isReloading {
                     // In-app spinner while the store rebuilds the whole
                     // history off the main thread (no system beachball).
-                    ProgressView("Reloading session…")
-                        .controlSize(.small)
-                        .padding(12)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    // AppKit spinner (see `SpinnerView`), never SwiftUI's
+                    // animated `ProgressView` — this overlay sits inside the
+                    // window content hosting view, so a SwiftUI spinner would
+                    // keep the whole shell graph invalidating per frame for
+                    // the entire rebuild.
+                    HStack(spacing: 6) {
+                        SpinnerView()
+                        Text("Reloading session…")
+                            .font(.system(size: 11))
+                    }
+                    .padding(12)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                 }
                 if vm.isFetchingOlder {
                     // Small spinner pinned to the top of the conversation
                     // while the coordinator fetches a block of older
-                    // history (scrolling up).
+                    // history (scrolling up). AppKit spinner, as above.
                     VStack {
-                        ProgressView()
-                            .controlSize(.small)
+                        SpinnerView()
                             .padding(6)
                             .background(.regularMaterial, in: Capsule())
                         Spacer()

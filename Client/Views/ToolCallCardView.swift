@@ -537,20 +537,37 @@ struct EditDiffView: View {
     }
 }
 
-/// An animated spinner for the running-tool indicator. Deliberately NOT
-/// SwiftUI's `ProgressView`: an animated SwiftUI spinner inside an
-/// `NSHostingView` keeps its (child) SwiftUI graph invalidating every frame
-/// for the whole tool run (and the row's `sizeThatFits` measurement with it).
+/// An animated spinner for the running-tool indicator and any always-animated
+/// chrome (toolbar Stop button, tab status, in-progress overlays).
+/// Deliberately NOT SwiftUI's `ProgressView`: an animated SwiftUI spinner
+/// inside an `NSHostingView` keeps its (child) SwiftUI graph invalidating
+/// every frame for the whole time it is visible — during a long stream that
+/// is the entire turn, sweeping the hosting views' layout into every display
+/// cycle (the shell-relayout cost seen in main-thread samples: hosting
+/// `layout()` cascades + `sizeThatFits` re-measures per streaming commit).
 /// `NSProgressIndicator` animates on its own AppKit timer and never touches
-/// the SwiftUI graph.
+/// the SwiftUI graph — the row/card height and the surrounding layout stay
+/// static, so nothing re-lays out while it spins.
 struct SpinnerView: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSProgressIndicator {
-        let indicator = NSProgressIndicator()
+    /// Size to match the replaced `ProgressView().controlSize(...)`.
+    var controlSize: NSControl.ControlSize = .small
+
+    func makeNSView(context: Context) -> ClickTransparentIndicator {
+        let indicator = ClickTransparentIndicator()
         indicator.style = .spinning
-        indicator.controlSize = .small
+        indicator.controlSize = controlSize
         indicator.startAnimation(nil)
         return indicator
     }
 
-    func updateNSView(_ nsView: NSProgressIndicator, context: Context) {}
+    func updateNSView(_ nsView: ClickTransparentIndicator, context: Context) {}
+
+    /// The indicator is decoration inside a SwiftUI `Button` (toolbar Stop,
+    /// tab pill) and must never consume the click that should reach the
+    /// button; it never needs mouse events itself.
+    final class ClickTransparentIndicator: NSProgressIndicator {
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            nil
+        }
+    }
 }
