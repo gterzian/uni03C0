@@ -48,6 +48,7 @@ swiftc -swift-version 6 -default-isolation MainActor \
   Client/Accessibility/DisplayOptions.swift \
   Client/Views/CodeCopyButton.swift \
   Client/Views/MarkdownText.swift \
+  Client/Views/RowMeasurement.swift \
   Client/Views/TextRowView.swift \
   Client/Views/ToolCallCardView.swift \
   Client/Views/TranscriptEntry+Measurement.swift \

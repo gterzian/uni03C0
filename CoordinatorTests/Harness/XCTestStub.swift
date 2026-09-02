@@ -13,6 +13,10 @@ public nonisolated(unsafe) var __testFailures: Int = 0
 
 open class XCTestCase {
     public init() {}
+    /// Real XCTest calls these around each test method; the plain-swiftc
+    /// runners do the same, so test files can override them either way.
+    open func setUp() {}
+    open func tearDown() {}
 }
 
 public func XCTFail(_ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
@@ -61,6 +65,16 @@ public func XCTAssertEqual<T: FloatingPoint>(_ expression1: T, _ expression2: T,
 }
 
 @discardableResult
+public func XCTAssertNotEqual<T: Equatable>(_ expression1: T, _ expression2: T, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
+    guard expression1 != expression2 else {
+        __testFailures += 1
+        print("FAIL: \(message.isEmpty ? "XCTAssertNotEqual failed" : message) — both are \(expression1) (\(file):\(line))")
+        return false
+    }
+    return true
+}
+
+@discardableResult
 public func XCTAssertNil<T>(_ expression: @autoclosure () -> T?, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
     guard expression() == nil else {
         __testFailures += 1
@@ -85,6 +99,26 @@ public func XCTAssertGreaterThan<T: Comparable>(_ expression1: T, _ expression2:
     guard expression1 > expression2 else {
         __testFailures += 1
         print("FAIL: \(message.isEmpty ? "XCTAssertGreaterThan failed" : message) — \(expression1) is not > \(expression2) (\(file):\(line))")
+        return false
+    }
+    return true
+}
+
+@discardableResult
+public func XCTAssertGreaterThanOrEqual<T: Comparable>(_ expression1: T, _ expression2: T, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
+    guard expression1 >= expression2 else {
+        __testFailures += 1
+        print("FAIL: \(message.isEmpty ? "XCTAssertGreaterThanOrEqual failed" : message) — \(expression1) is not >= \(expression2) (\(file):\(line))")
+        return false
+    }
+    return true
+}
+
+@discardableResult
+public func XCTAssertLessThan<T: Comparable>(_ expression1: T, _ expression2: T, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) -> Bool {
+    guard expression1 < expression2 else {
+        __testFailures += 1
+        print("FAIL: \(message.isEmpty ? "XCTAssertLessThan failed" : message) — \(expression1) is not < \(expression2) (\(file):\(line))")
         return false
     }
     return true

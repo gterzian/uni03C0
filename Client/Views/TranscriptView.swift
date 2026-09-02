@@ -125,6 +125,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var heightsBySession: [ObjectIdentifier: HeightCache] = [:]
     private var sessionLRU: [ObjectIdentifier] = []
     private let maxCachedSessions = 6
+    /// The session key whose cache `heights` currently points at (kept in
+    /// sync by `activateSessionCache`). Pre-measure batches record it at
+    /// schedule time so their results land in that session's cache even if
+    /// the active tab changed while the task was in flight.
+    private var activeSessionKey: ObjectIdentifier?
     weak var viewModel: SessionViewModel?
     private var isApplying = false
     /// Streaming batching: the tail row is refreshed at most every
@@ -202,6 +207,27 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// whose width actually changed).
     private var lastRowWidth: CGFloat = 0
 
+    /// Store indices whose row height the TABLE may no longer agree with. The
+    /// cell is authoritative: a cell is rendered from the store's CURRENT
+    /// content (`makeCell`), while the table's row rect can still hold a
+    /// height measured for older content — the row is then shorter than the
+    /// text it renders, and because the cell's text view is bottom-anchored in
+    /// the (non-flipped) cell, the overflow leaves the row UPWARD: the top of
+    /// the message is clipped by the row above. `noteHeightOfRows` cannot be
+    /// called from inside the table's own view/height request, so the rows are
+    /// collected here and re-queried once on the next run-loop turn.
+    private var pendingHeightRequery: Set<Int> = []
+    private var heightRequeryScheduled = false
+
+    /// The row id a cell was last configured with as STREAMING. While the user
+    /// is scrolled up the refresh gate is not consulted (no rendering happens),
+    /// so `streamGate.lastStreamedID` goes stale and can point at an OLDER
+    /// message than the one the cells actually show streaming; the settle
+    /// refresh would then stop at that older row and leave the newer one
+    /// rendering its half-streamed text (and its blinking caret) forever.
+    /// Tracking what was really rendered makes the settle find that row.
+    private var renderedStreamingRowID: String?
+
     /// The store row ids that currently contain a search match, and the id of
     /// the current match — drive the yellow term backdrops. Rebuilt whenever
     /// the view model's match list changes (`onSearchResultsChanged`). The
@@ -219,6 +245,27 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// final highlights are never stale. Same cadence as the streaming gate.
     private static let searchHighlightRefreshInterval: TimeInterval = 0.25
     private var lastSearchHighlightRefresh: TimeInterval = 0
+
+    // MARK: Off-main height pre-measurement
+
+    /// Batches of settled text rows waiting to be measured on a background
+    /// thread. Each batch carries the SESSION KEY the heights belong to plus
+    /// the rows' `RowMeasureSpec`s — plain Sendable values, built on the main
+    /// actor at schedule time. Nothing crossing the task boundary references
+    /// a `HeightCache`, the row model, or any coordinator state: on
+    /// completion the results are stored into `heightsBySession[key]` on the
+    /// main actor, so a batch started before a tab switch still lands in the
+    /// right session's cache. Internal (not private) so CoordinatorTests can
+    /// observe the queue.
+    var pendingPremeasure: [(key: ObjectIdentifier, specs: [RowMeasureSpec])] = []
+    /// True while a pre-measure task is in flight — at most one at a time;
+    /// batches scheduled in the meantime are drained by the running task's
+    /// completion (`pumpPremeasure`). Internal for the same reason.
+    var premeasureInFlight = false
+    /// Bumped on every font-size change. A pre-measure seeded before the
+    /// change measured at the OLD size; the store hop discards those results
+    /// so a stale height can never re-enter the freshly-cleared cache.
+    private var fontSizeGeneration = 0
 
     /// How many rows currently fit in the viewport (or a sane default).
     private func viewportRows() -> Int {
@@ -253,6 +300,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.backgroundColor = .clear
         tv.rowHeight = 24
         tv.allowsColumnReordering = false
+        // Layer-back the table so each row cell's raster is cached in its own
+        // backing store instead of repainting through the window's shared
+        // store on every delta (the backing-store churn in samples).
+        tv.wantsLayer = true
 
         let column = NSTableColumn(identifier: .init("main"))
         column.resizingMask = .autoresizingMask
@@ -518,6 +569,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// reload that follows never re-measures a row whose content is unchanged.
     private func activateSessionCache(_ session: SessionViewModel) {
         let key = ObjectIdentifier(session)
+        activeSessionKey = key
+        // Row-height bookkeeping is per session: the pending re-queries and the
+        // streaming-row marker belong to the session being left, and a reload
+        // rebuilds every cell anyway.
+        pendingHeightRequery.removeAll()
+        renderedStreamingRowID = nil
         sessionLRU.removeAll { $0 == key }
         sessionLRU.append(key)
         if let cached = heightsBySession[key] {
@@ -534,6 +591,111 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
+    // MARK: - Off-main height pre-measurement
+
+    /// Builds the measure spec for a row the background measurer can handle:
+    /// SETTLED text rows. Streaming rows are excluded — their heights come
+    /// from the cell's incremental layout (never a full CoreText measure) and
+    /// re-measuring them per delta is the documented 100%-CPU regression.
+    /// Tool cards are excluded — their height needs a real SwiftUI
+    /// `NSHostingController` layout, which must run on the main thread. Runs
+    /// on the MAIN actor at schedule time, so the spec (and its cache tag)
+    /// capture the content exactly as the main-thread path would key it; only
+    /// the spec — a plain Sendable value — crosses into the worker.
+    private func measureSpec(for entry: TranscriptEntry) -> RowMeasureSpec? {
+        switch entry.kind {
+        case .userMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .user, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .assistantMessage(let text, let thinking, let isStreaming):
+            guard !isStreaming else { return nil }
+            return RowMeasureSpec(id: entry.id, text: text, thinking: thinking, role: .assistant, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, tag: Self.contentTag(for: entry))
+        case .errorMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .error, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .abortedMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .aborted, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .toolCall:
+            return nil
+        }
+    }
+
+    /// Schedules off-main measurement of `entries` so `heightOfRow`'s cache
+    /// misses — the synchronous full markdown parse + CoreText `boundingRect`
+    /// on the main thread during table layout — shrink to rows the background
+    /// pass hasn't reached yet. Called when rows enter the materialized
+    /// window (appends, history prepends, post-reload windows, font-size
+    /// changes). Converts each row to a `RowMeasureSpec` on the main actor,
+    /// then hands ONLY the Sendable specs to the worker; the worker runs the
+    /// SAME `TranscriptText.measuredHeight` as the main-thread path, so a
+    /// seeded height is indistinguishable from a synchronously measured one —
+    /// the "one measurement function" invariant is preserved.
+    private func schedulePremeasure(entries: [TranscriptEntry]) {
+        guard let key = activeSessionKey else { return }
+        let specs = entries.compactMap { measureSpec(for: $0) }
+        guard !specs.isEmpty else { return }
+        pendingPremeasure.append((key, specs))
+        pumpPremeasure()
+    }
+
+    /// Drains the pending pre-measure queue: one detached task measures the
+    /// whole batch off the main thread (markdown parse + glyph layout), then
+    /// hops back once to store every result into the session cache the batch
+    /// was scheduled for — resolved by key on the main actor, so a batch that
+    /// started before a tab switch lands in the right session even if the
+    /// active session changed mid-flight; results for an LRU-evicted session
+    /// are dropped. The task boundary is all plain Sendable values
+    /// (`RowMeasureSpec` in, `RowMeasurement` out) — no `HeightCache`, row
+    /// model, or coordinator state crosses it. At most one task is in flight
+    /// — its completion pumps the next batch, so a streaming burst coalesces
+    /// into a single task.
+    private func pumpPremeasure() {
+        guard !premeasureInFlight, !pendingPremeasure.isEmpty else { return }
+        premeasureInFlight = true
+        let batch = pendingPremeasure
+        pendingPremeasure.removeAll()
+        let width = rowWidth(in: tableView)
+        let bodySize = FontSettings.shared.bodySize
+        let generation = fontSizeGeneration
+        Task.detached(priority: .utility) { [batch, width, bodySize, generation] in
+            var results: [(key: ObjectIdentifier, measurements: [RowMeasurement])] = []
+            results.reserveCapacity(batch.count)
+            for (key, specs) in batch {
+                var measurements: [RowMeasurement] = []
+                measurements.reserveCapacity(specs.count)
+                for spec in specs {
+                    measurements.append(RowMeasurer.measure(spec, width: width, bodySize: bodySize))
+                }
+                results.append((key, measurements))
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.premeasureInFlight = false
+                guard generation == self.fontSizeGeneration else {
+                    // A font-size change cleared every cache while we were
+                    // measuring: these heights are for the OLD size — drop
+                    // them (the change's own window pre-measure re-seeds).
+                    self.pumpPremeasure()
+                    return
+                }
+                for (key, measurements) in results {
+                    // The cache the batch was scheduled for may have been
+                    // LRU-evicted (a 7th session opened) while we measured;
+                    // its re-created cache re-measures rows on demand.
+                    guard let cache = self.heightsBySession[key] else { continue }
+                    for r in measurements {
+                        cache.store(r.id, width: r.width, height: r.height, tag: r.tag)
+                    }
+                }
+                self.pumpPremeasure()
+            }
+        }
+    }
+
+    /// Test hook: the height cache the background pre-measurer seeds for
+    /// `session` (CoordinatorTests assert the append-time pre-measure landed).
+    func heightCacheForTesting(_ session: SessionViewModel) -> HeightCache? {
+        heightsBySession[ObjectIdentifier(session)]
+    }
+
     // MARK: - NSTableViewDataSource / Delegate
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -543,7 +705,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let storeIndex = windowStart + row
         guard let entry = viewModel?.store.entry(at: storeIndex) else { return nil }
-        return makeCell(for: entry, in: tableView)
+        return makeCell(for: entry, row: row, in: tableView)
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
@@ -569,12 +731,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if let cached = heights.heightIfPresent(for: entry.id, width: width) {
                 return cached
             }
-            let height = entry.measuredHeight(forWidth: width)
+            let height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
             heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
             return height
         }
         return heights.height(for: entry.id, width: width, tag: Self.contentTag(for: entry)) {
-            entry.measuredHeight(forWidth: width)
+            entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
         }
     }
 
@@ -585,6 +747,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// and re-measure only on genuine change. Includes the cache-line fields
     /// (they render under the final message, so they affect the height) and the
     /// streaming flag (the caret adds a line's worth of width pressure).
+    /// Main-thread only: the pre-measure specs compute their tag here at
+    /// schedule time (on the main actor), so the heights the worker seeds are
+    /// keyed identically to the synchronous ones by construction.
     private static func contentTag(for entry: TranscriptEntry) -> String? {
         switch entry.kind {
         case .userMessage(let text):
@@ -653,15 +818,24 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             let oldEnd = windowEnd
             windowEnd = newCount
             var appendedUserMessage = false
+            var appended: [TranscriptEntry] = []
             let tableRange = (oldEnd - windowStart)..<(newCount - windowStart)
             for i in oldEnd..<newCount {
                 if let entry = store.entry(at: i) {
                     heights.invalidate(entry.id)
+                    appended.append(entry)
                     if case .userMessage = entry.kind { appendedUserMessage = true }
                 }
             }
             tableView.insertRows(at: IndexSet(integersIn: tableRange), withAnimation: [])
             didAppend = true
+            // Seed the new rows' heights off the main thread (settled text
+            // rows only — the streaming assistant row and tool cards keep
+            // their own paths). The rows' FIRST render still measures on
+            // main when they're visible right now, but anything appended
+            // below the viewport (the user is scrolled up reading history) is
+            // measured here before it is ever scrolled to.
+            schedulePremeasure(entries: appended)
             // A freshly sent prompt (or a queued-steering flush) echoes the
             // user's message into the store: jump to the tail and re-engage
             // following so the response streams into view. The followTail
@@ -725,11 +899,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
         // 1. The last streaming assistant row. Once the message settles it
         // stays matched by `lastStreamedID`, so its final text is rendered
-        // even when it is no longer the tail.
+        // even when it is no longer the tail. `renderedStreamingRowID` covers
+        // the case the gate cannot: while the user is scrolled up nothing
+        // renders, so the gate never sees the message and `lastStreamedID`
+        // still points at an OLDER row — the search would stop there and the
+        // row the cells actually show streaming would never get its final
+        // render (stale text, immortal caret, and a row height measured for
+        // the half-streamed text: the top-clip).
         var streamingRow = -1
         var streamingEntry: TranscriptEntry?
         for i in (windowStart..<windowEnd).reversed() {
-            if let e = store.entry(at: i), e.kind.isStreaming || e.id == streamGate.lastStreamedID {
+            if let e = store.entry(at: i),
+               e.kind.isStreaming || e.id == streamGate.lastStreamedID || e.id == renderedStreamingRowID {
                 streamingRow = i - windowStart
                 streamingEntry = e
                 break
@@ -1005,9 +1186,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// re-anchors the viewport to the same store row at the same pixel offset.
     private func prependHistory(_ fetched: Int, anchorStore: Int, anchorOffset: CGFloat) {
         guard fetched > 0 else { return }
-        windowStart -= fetched
+        let newStart = windowStart - fetched
+        windowStart = newStart
+        let prepended = (newStart..<(newStart + fetched)).compactMap { viewModel?.store.entry(at: $0) }
         tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
         tableView.tile()
+        // Measure the materialized block off the main thread: the visible
+        // rows' heights are queried synchronously by the insert/tile (they
+        // hit the cache or measure on main as today), but the rows further
+        // up — scrolled to on the next scroll-up — are covered here before
+        // the viewport ever reaches them.
+        schedulePremeasure(entries: prepended)
         let row = anchorStore - windowStart
         guard row >= 0, row < (windowEnd - windowStart) else { return }
         let rowY = tableView.rect(ofRow: row).origin.y
@@ -1066,6 +1255,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         lastSearchQuery = nil
         cycleAnchor = nil
         tableView.reloadData()
+        // A visited session's rows are mostly unchanged since it left — the
+        // reload re-measures only content-changed rows on the main thread, and
+        // the rest of the materialized window (rows below the viewport) gets
+        // its heights seeded off the main thread here, so scrolling down
+        // within the window never re-typesets.
+        schedulePremeasure(entries: (windowStart..<windowEnd).compactMap { store.entry(at: $0) })
         if saved.isFollowing {
             scheduleScrollToBottom()
         } else {
@@ -1133,6 +1328,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         currentSearchRowID = nil
         lastSearchQuery = nil
         tableView.reloadData()
+        // Same-session reloads keep their cache, but a FIRST visit's cache is
+        // fresh: the reload measured the visible rows on the main thread, and
+        // this pass covers the rest of the window off the main thread so
+        // scrolling down from the tail never hits a cache miss.
+        schedulePremeasure(entries: (windowStart..<windowEnd).compactMap { store.entry(at: $0) })
         scheduleScrollToBottom()
     }
 
@@ -1167,6 +1367,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard row >= 0, row < tableView.numberOfRows else { return false }
         guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) else { return false }
         let width = rowWidth(in: tableView)
+        if entry.kind.isStreaming {
+            renderedStreamingRowID = entry.id
+        } else if renderedStreamingRowID == entry.id {
+            renderedStreamingRowID = nil
+        }
 
         if cell is TextRowView {
             let tag = Self.contentTag(for: entry)
@@ -1209,7 +1414,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             // content-aware (cached once per content — re-measured only on
             // genuine change, never per table query).
             let measured = heights.height(for: entry.id, width: width, tag: tag) {
-                entry.measuredHeight(forWidth: width)
+                entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
             }
 
             // A reused cell can still hold a stale (wider) frame after a
@@ -1244,6 +1449,44 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         return true
     }
 
+    /// Marks a row's height as possibly out of date in the TABLE (the cell
+    /// renders content the row rect was not measured for) and flushes the
+    /// re-query once on the next run-loop turn. Deferred because the callers
+    /// run inside the table's own view/height request, where
+    /// `noteHeightOfRows` is not allowed; coalesced because a scroll can
+    /// materialize a whole viewport of rows in one pass.
+    private func scheduleHeightRequery(storeIndex: Int) {
+        pendingHeightRequery.insert(storeIndex)
+        guard !heightRequeryScheduled else { return }
+        heightRequeryScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.flushHeightRequery()
+        }
+    }
+
+    /// Re-queries the collected rows' heights, but only those that still
+    /// disagree with the table (the row may have been noted in the meantime by
+    /// the streaming refresh or a reload). Rows that left the window are
+    /// dropped.
+    private func flushHeightRequery() {
+        heightRequeryScheduled = false
+        let pending = pendingHeightRequery
+        pendingHeightRequery.removeAll()
+        guard let tableView, let store = viewModel?.store, !pending.isEmpty else { return }
+        let width = rowWidth(in: tableView)
+        var rows = IndexSet()
+        for storeIndex in pending {
+            let row = storeIndex - windowStart
+            guard row >= 0, row < tableView.numberOfRows, let entry = store.entry(at: storeIndex) else { continue }
+            let height = rowHeight(for: entry, width: width)
+            if abs(tableView.rect(ofRow: row).height - height) > 0.5 {
+                rows.insert(row)
+            }
+        }
+        guard !rows.isEmpty else { return }
+        tableView.noteHeightOfRows(withIndexesChanged: rows)
+    }
+
     /// Recomputes whether the window is on screen. When it transitions from
     /// invisible → visible, performs a single catch-up render pass for anything
     /// that streamed while hidden.
@@ -1275,10 +1518,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     @objc private func fontSizeDidChange() {
         // Font size is app-wide: every session's cached heights were measured
         // at the old size, so every cache must go.
+        fontSizeGeneration &+= 1 // stale in-flight pre-measures are dropped
         for cache in heightsBySession.values {
             cache.clear()
         }
         tableView.reloadData()
+        // The reload re-measures the visible rows on the main thread; seed the
+        // rest of the window at the NEW size off the main thread so scrolling
+        // down from the viewport doesn't re-typeset row by row.
+        if let store = viewModel?.store {
+            schedulePremeasure(entries: (windowStart..<windowEnd).compactMap { store.entry(at: $0) })
+        }
     }
 
     /// Anchors the bottom of the last (streaming) row to the bottom of the
@@ -1374,8 +1624,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// above the viewport never shift it) and restarts the compounding block.
     private func prependMaterialized(targetStart: Int, fetched: Int) {
         windowStart = targetStart
+        let prepended = (targetStart..<(targetStart + fetched)).compactMap { viewModel?.store.entry(at: $0) }
         tableView.insertRows(at: IndexSet(integersIn: 0..<fetched), withAnimation: [])
         tableView.tile()
+        schedulePremeasure(entries: prepended)
         // The compounding block restarts small: this fetch covered the gap.
         fetchBlock = max(initialChunkRows() / 2, 20)
     }
@@ -1422,18 +1674,23 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Re-renders the yellow search-term highlights after the match list, the
     /// current match, or the query changed. Term backgrounds don't change
-    /// heights, so a plain reload of the materialized window suffices (heights
-    /// stay cached and the scroll position is preserved).
+    /// heights, so only the AFFECTED rows are reloaded — never the whole
+    /// materialized window (a `reloadData` per batch re-typesets every
+    /// visible row's markdown, which saturates the main thread while the
+    /// spinner is up). A row needs a re-render exactly when its highlight
+    /// membership changed (a match entered or left the set), its
+    /// current-match status changed (the strong shade moved), or the query
+    /// changed (the highlighted RANGES differ even when the matched rows are
+    /// identical). Rows not materialized are skipped — their highlights are
+    /// applied by `makeCell` when they materialize.
     private func refreshSearchHighlight() {
         guard let viewModel else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if viewModel.isSearching {
-            // Coalesce while the search runs: a reloadData per batch
-            // re-typesets every visible row's markdown (and deriving the match
-            // id set is O(matches)), which saturates the main thread and
-            // freezes scrolling. Inside the window, skip even the set
-            // derivation; the completion (isSearching false, below) always
-            // flushes the final state.
+            // Coalesce while the search runs: each batch derives the match id
+            // set (O(matches)) and reloads the changed rows. Inside the
+            // window, skip even that; the completion (isSearching false,
+            // below) always flushes the final state.
             if now - lastSearchHighlightRefresh < Self.searchHighlightRefreshInterval {
                 return
             }
@@ -1444,18 +1701,42 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             : nil
         let query = viewModel.searchQuery
         guard ids != searchMatchRowIDs || current != currentSearchRowID || query != lastSearchQuery else { return }
+
+        // The rows whose rendered highlights changed.
+        var changed = searchMatchRowIDs.symmetricDifference(ids)
+        if query != lastSearchQuery {
+            // A query change re-renders every previously- AND newly-matched row
+            // (the term ranges are recomputed for the new query).
+            changed.formUnion(searchMatchRowIDs)
+            changed.formUnion(ids)
+        }
+        if current != currentSearchRowID {
+            // The strong "current match" shade moved.
+            if let old = currentSearchRowID { changed.insert(old) }
+            if let new = current { changed.insert(new) }
+        }
+
         searchMatchRowIDs = ids
         currentSearchRowID = current
         lastSearchQuery = query
         if viewModel.isSearching {
             lastSearchHighlightRefresh = now
         }
-        tableView.reloadData()
+
+        guard !changed.isEmpty else { return }
+        var rows = IndexSet()
+        for i in windowStart..<windowEnd {
+            if let entry = viewModel.store.entry(at: i), changed.contains(entry.id) {
+                rows.insert(i - windowStart)
+            }
+        }
+        guard !rows.isEmpty else { return }
+        tableView.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
     }
 
     // MARK: - Cells
 
-    private func makeCell(for entry: TranscriptEntry, in tableView: NSTableView) -> NSView {
+    private func makeCell(for entry: TranscriptEntry, row: Int, in tableView: NSTableView) -> NSView {
         // Search state for this row: the live query (nil when the find bar is
         // closed or this row has no match) drives the yellow term highlight;
         // the current match uses a stronger shade. Matches are tracked by row
@@ -1526,12 +1807,28 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 height = textRow.contentHeight + 2
                 heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
             } else {
-                height = entry.measuredHeight(forWidth: width)
+                height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
             }
         } else {
             height = rowHeight(for: entry, width: width)
         }
         view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        if entry.kind.isStreaming {
+            renderedStreamingRowID = entry.id
+        } else if renderedStreamingRowID == entry.id {
+            renderedStreamingRowID = nil
+        }
+        // The cell now renders the store's CURRENT content, which can be
+        // taller than the height the table is still using for this row (a row
+        // materialized mid-stream: `heightOfRow` served the last height the
+        // renderer seeded, then this cell rendered newer, taller text). The
+        // table cannot be told from inside its own view request, so the row is
+        // re-queried on the next run-loop turn — otherwise the cell's text
+        // overflows the short row upward and the message's top stays clipped
+        // until the next reload (the "switch tabs and back" heal).
+        if abs(tableView.rect(ofRow: row).height - height) > 0.5 {
+            scheduleHeightRequery(storeIndex: windowStart + row)
+        }
         return view
     }
 

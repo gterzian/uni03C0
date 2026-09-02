@@ -17,15 +17,25 @@ import Foundation
 /// deltas simply wait for the next batch.
 public struct StreamingRefreshGate {
     public let batchInterval: TimeInterval
+    /// Running tool cards (bash output streaming into the tail card) refresh
+    /// on their own timer, independent of the text gate: the text and the
+    /// card never stream at the same time (a tool runs while the model is
+    /// idle), so sharing the text gate's `lastStreamedAt` let the card
+    /// re-render on EVERY delta during a tool run — `lastStreamedAt` is only
+    /// advanced by text refreshes, which stop the moment the tool starts.
+    public let toolCardBatchInterval: TimeInterval
 
     public private(set) var lastStreamedID: String?
     public private(set) var lastStreamedContent: (text: String, thinking: String)?
     public private(set) var lastStreamedWasStreaming = false
     /// Wall-clock (systemUptime) of the last refresh; drives the interval gate.
     public private(set) var lastStreamedAt: TimeInterval = 0
+    /// Wall-clock of the last running-tool-card refresh; drives the card gate.
+    public private(set) var lastToolCardAt: TimeInterval = 0
 
-    public init(batchInterval: TimeInterval = 0.25) {
+    public init(batchInterval: TimeInterval = 0.25, toolCardBatchInterval: TimeInterval = 0.25) {
         self.batchInterval = batchInterval
+        self.toolCardBatchInterval = toolCardBatchInterval
     }
 
     /// Decides whether the streaming assistant row's current content should be
@@ -56,9 +66,14 @@ public struct StreamingRefreshGate {
     }
 
     /// The batched refresh decision for a RUNNING tool card at the tail (its
-    /// output streams into the card; refresh at the same hard interval so bash
-    /// output doesn't repaint per delta).
-    public func shouldRefreshRunningToolCard(now: TimeInterval) -> Bool {
-        now - lastStreamedAt >= batchInterval
+    /// output streams into the card; refresh at the hard interval so bash
+    /// output doesn't repaint per delta). Advances `lastToolCardAt` on an
+    /// approved refresh, mirroring `shouldRefresh`'s side-effect pattern — the
+    /// coordinator calls this once per delta batch and re-renders only when it
+    /// returns true.
+    public mutating func shouldRefreshRunningToolCard(now: TimeInterval) -> Bool {
+        guard now - lastToolCardAt >= toolCardBatchInterval else { return false }
+        lastToolCardAt = now
+        return true
     }
 }

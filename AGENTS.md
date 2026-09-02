@@ -356,10 +356,11 @@ Three targets (see `project.yml`):
   renderer sources directly alongside the tests. Covers inline/block styling,
   code-block ranges and cards/copy buttons, block spacing, soft/hard line
   breaks, the load-bearing measurement invariant (rendered height ==
-  measured height), and the append-only streaming storage regressions
-  (`StreamingStorageTests`). Run via `xcodebuild -scheme RenderingTests
-  test`; can also be run with plain `swiftc` + a tiny XCTest shim when the
-  sandbox blocks package resolution.
+  measured height), the append-only streaming storage regressions
+  (`StreamingStorageTests`) and the streaming crossfade
+  (`StreamingFadeTests`). Run via `xcodebuild -scheme RenderingTests
+  test`; in the sandbox via `scripts/run-rendering-tests.sh` (plain `swiftc` +
+  the stub XCTest module, `TEST_FILTER=<substring>` for a subset).
 - **CoordinatorTests** (unit-test bundle, XCTest, `MainActor`): end-to-end
   tests for the transcript `Coordinator`'s keyboard navigation — the
   Cmd+Up/Down user-message cycle, its scroll/focus/follow effects, and
@@ -420,7 +421,14 @@ concurrency.
   assistant message with thinking, tool call card).
 - `ToolCardExpansion` / `HeightCache` — the per-card expand registry and the
   (id, width) → height cache; pure data, moved into Core so both are
-  unit-testable from `ClientTests` (which links Core only).
+  unit-testable from `ClientTests` (which links Core only). The height cache
+  is lock-guarded and `@unchecked Sendable`, its thread-safety exercised by
+  `HeightCacheTests`; the coordinator mutates it on the main thread and never
+  hands it across a task boundary — the off-main pre-measurer works on
+  explicit `Sendable` value structs (`RowMeasureSpec` in, `RowMeasurement`
+  out, see `Client/Views/RowMeasurement.swift`), and the results are stored
+  into the right session's cache (resolved by key) on a main-actor hop. The
+  lock stays as insurance against accidental concurrent use.
 - `TextDiff` / `EditToolArgs` — the pure line diff (prefix/suffix trim +
   bounded LCS, GitHub removed-then-added ordering) and the edit-tool
   arguments decoder behind the tool card's red/green diff view.
@@ -624,16 +632,25 @@ Behavior details that matter:
   scan over the tail's huge tool outputs can't freeze scrolling (the first
   batch is the worst offender) — while `apply`/`rebuild` mutations take the
   exclusive WRITE lock and wait for any scan to finish. Highlight refreshes
-  are coalesced to one `reloadData` per 0.25s while the search runs (the
-  match list grows every batch; a reload per batch re-typesets every visible
-  row's markdown and freezes scrolling); the search completion always
-  flushes, so the final highlights are never stale.
+  are coalesced to one per 0.25s while the search runs, and each refresh is a
+  SELECTIVE reload — `reloadData(forRowIndexes:columnIndexes:)` on only the
+  rows whose highlight membership, current-match shade, or query changed (a
+  full `reloadData` per batch re-typesets every visible row's markdown and
+  freezes scrolling); the search completion always flushes, so the final
+  highlights are never stale.
 - **Smooth streaming (no bounce).** Rows stay full-height (no inner scroll
   views). Streaming text is **batched** by `StreamingRefreshGate` (Core): the
   tail row updates at most every 0.25s (a hard cap, never per character-delta),
   plus immediately on a new message's first chunk and on the streaming→final
   flag flip — and each batched chunk **crossfades in**, so the text
   materializes in word groups instead of popping character by character. The
+  crossfade writes colors INTO the shared text storage, so it must always end
+  where the string says: a batch superseded before its ~0.3s fade finished is
+  **settled** to its final colors (`TextRowView.settlePendingFade`, called from
+  `configure` before the new string lands), and the last fade step restores the
+  captured color OBJECT rather than `withAlphaComponent(1)`. Both are
+  load-bearing — see *Failed fixes*.
+  The
   streaming row's height comes from the cell's own layout manager
   (`TextRowView.contentHeight`), which lays out **incrementally** — only the
   newly-appended characters are typeset — never from a fresh CoreText
@@ -660,9 +677,24 @@ Behavior details that matter:
   reuses its cached heights; only rows whose content genuinely changed
   re-measure (the content tag catches that). Same-session reloads reuse the
   cache too; a font-size change is app-wide and clears every session's cache.
-  ONE measurement function — `entry.measuredHeight(forWidth:)` — feeds both
-  `heightOfRow` (on cache miss) and the visible-cell refresh
-  (`updateVisibleCell`), so the two paths agree by construction. Streaming
+  ONE measurement function — `TranscriptText.measuredHeight` — feeds both
+  `heightOfRow` (on cache miss, via `entry.measuredHeight`) and the
+  pre-measurer (via `RowMeasurer`), so the two paths agree by construction.
+  Settled
+  rows' heights are ALSO seeded **off the main thread**: when rows enter the
+  materialized window (appends, history prepends, post-reload windows,
+  font-size changes), the coordinator builds a `RowMeasureSpec` per row on
+  the main actor — content + cache tag + session key, all plain `Sendable`
+  values, so the worker never touches the row model, a `HeightCache`, or
+  view state — and schedules a background task that runs the SAME
+  `measuredHeight` (markdown parse + CoreText `boundingRect` — both
+  thread-safe; `NSFontManager` is avoided in favor of descriptor trait
+  synthesis) and stores the results into the session's cache (resolved by
+  key) via one
+  main-actor hop, so `heightOfRow` degrades to an O(1) lookup for rows the
+  background pass reached before the table asked. A font-size change bumps a
+  generation counter that discards in-flight results measured at the old
+  size. Streaming
   rows carry a **content tag** (text/thinking/streaming-flag fingerprint):
   `heightOfRow` serves whatever the renderer seeded (the table must match the
   cell, not the store's newer unrendered content) and
@@ -671,14 +703,49 @@ Behavior details that matter:
   (`contentHeight` + the 2pt slack, so the settled-row `measuredHeight` lands
   on the same height — no jump at settle); the full CoreText measure runs once
   per message (on the settle refresh, then cached). Tool-card heights are
-  invalidated on every content update (they grow in place); text rows are
+  invalidated on every content update (they grow in place) and measured by
+  ONE reused `NSHostingController` (a per-query controller built a fresh
+  SwiftUI graph per measurement — the `StackLayout`/`ViewLayoutEngine` cost in
+  samples); the card cell also skips the SwiftUI `rootView` swap on a
+  scroll re-entry whose card content is identical. Text rows are
   invalidated on genuine change and when their rows are evicted from the
-  window (so the cache tracks the window, not the conversation).
+  window (so the cache tracks the window, not the conversation). Rows are
+  layer-backed (`wantsLayer` on the table and cells; the flat-fill overlay
+  views opt into `canDrawConcurrently`), so each cell's raster lives in its
+  own backing store instead of repainting through the window's shared store
+  on every delta.
 - **Cells are pre-sized at creation.** `makeCell` frames every cell to its
   row's measured height before returning it — NSTableView does not reliably
   re-frame a cell whose height changed (the width follows via autoresizing,
   the height does not), so a cell recycled from a shorter row would otherwise
   lay out at the stale short height and clip the message's top.
+- **Whoever renders a row owns telling the table its height changed.** The
+  CELL is authoritative: `makeCell` renders the store's CURRENT content, while
+  `heightOfRow` may just have served a height measured for OLDER content (a
+  streaming row materialized between two batched refreshes — the documented
+  "the table must match the cell" rule cuts the other way here). The row is
+  then shorter than the text it renders, and since the text view is
+  bottom-anchored in the (non-flipped) cell, the overflow leaves the row
+  UPWARD: the first line is painted behind the row above — the "top cut off"
+  symptom, persisting until some reload re-queried the height (the user-visible
+  tell: **switching tabs and back healed it**, because `reloadData` re-queries
+  every row). `noteHeightOfRows` is illegal inside the table's own view/height
+  request, so `makeCell` compares its height against `rect(ofRow:)` and, on a
+  mismatch, defers a coalesced re-query (`scheduleHeightRequery` →
+  `flushHeightRequery`, which re-verifies each row before noting it). Any new
+  code path that renders a row's content must either note the height itself or
+  schedule the re-query.
+- **The settle must find the row the CELLS show streaming, not the row the
+  gate last batched.** While the user is scrolled up nothing renders, so
+  `StreamingRefreshGate.lastStreamedID` is never advanced; in a multi-message
+  turn (thinking → tool call → more thinking, no user echo in between) it then
+  points at an EARLIER message than the one the cells actually show streaming.
+  The backward search for "the streaming row" stopped at that stale row, so
+  the newer one never got its final render: stale half-streamed text, an
+  immortal blinking caret, and a row height measured for the half-streamed
+  text (the clip above). The coordinator therefore tracks
+  `renderedStreamingRowID` — what a cell was last configured with as streaming
+  — and the search matches it too.
 - **Tool cards show their content, expandable.** One card per call: pi's RPC
   strips the cumulative `message` from `message_update`, so `toolcall_start`/
   `toolcall_delta` carry only a `contentIndex` — the card is created at
@@ -750,6 +817,24 @@ works around them, and reintroducing any of them breaks the fast-UI property.
   newline-heavy markdown stream both reproduced it). Streaming heights come
   from the cell's own incremental layout, seeded into the cache, and the
   refresh is batched at 0.25s — see the Smooth streaming bullet.
+
+- **Letting the streaming crossfade write colors that nothing restores.** The
+  per-batch fade-in dims the appended range and steps it back over ~0.3s. Two
+  ways that drifted, both healed by a tab switch (a full re-render) and
+  therefore reported as "weird formatting only while streaming":
+  a batch superseded before its fade finished had its remaining steps skipped
+  by the generation guard, and since the incremental storage path keeps the
+  prefix's colors (`.foregroundColor` is excluded from the prefix equality
+  check on purpose), that text stayed frozen at whatever alpha it had reached —
+  every superseded batch adding another, lighter region, i.e. a growing
+  washed-out block mid-message; and the fade's last step wrote
+  `color.withAlphaComponent(1)`, which is NOT the color it captured (the
+  semantic colors are not opaque — `labelColor` is alpha ~0.85), so every
+  faded-in run ended slightly darker than its surroundings and read as stray
+  bold. `settlePendingFade` + restoring the captured color object fix both;
+  `RenderingTests/StreamingFadeTests.swift` pins them. Anything new that
+  animates attributes in the row's storage must settle to the built string's
+  values.
 
 Validation notes: a `sample` during a long streaming turn should show the main
 thread mostly idle in the event loop (the per-tick work is confined to the
@@ -825,11 +910,20 @@ Three deterministic bundles (no pi process, no network, no live model):
   `TranscriptView.swift` + the renderer/measurement sources against the REAL
   Core framework and drives an offscreen `NSTableView` with a real store:
   the Cmd+Up/Down cycle, scroll geometry (top-anchored vs near-tail clamped),
-  follow state, key focus after a jump, and older-history materialization.
-  `SessionViewModel` is stubbed (spawns pi at init — see
+  follow state, key focus after a jump, older-history materialization, and the
+  **row-height/clipping invariant** (`assertNoClipping`: no materialized row
+  may render more content than its row rect is tall) across a streaming turn,
+  a window resize, and a message that streams + settles while the user is
+  scrolled up. `SessionViewModel` is stubbed (spawns pi at init — see
   CoordinatorTests/SessionViewModelStub.swift). Run from a terminal via
   `xcodebuild -scheme CoordinatorTests test`; in the sandbox via
-  `scripts/run-coordinator-tests.sh`.
+  `scripts/run-coordinator-tests.sh` (`TEST_FILTER=<substring>` runs a subset).
+  Notes for writing these: the clip view's bounds-change notification is
+  COALESCED (posted when idle), so a programmatic scroll needs a run-loop spin
+  before the coordinator sees it; a never-shown `NSWindow` reads as occluded,
+  so rows must be materialized before the window is created; and a folded user
+  message legitimately re-engages following (as sending a prompt does), so a
+  "scrolled up" scenario must turn following off AFTER the echo.
 
 ### Running inside the sandbox (the normal case for an agent)
 
@@ -871,7 +965,12 @@ xcodebuild -scheme RenderingTests test
 
 ### RenderingTests in the sandbox (swiftc + stub — do not "fix")
 
-RenderingTests are deliberately NOT in the `Package.swift` harness, and the
+**`scripts/run-rendering-tests.sh`** runs them (`TEST_FILTER=<substring>` for a
+subset). It reuses the coordinator harness's stub XCTest + FontSettings stub
+(`CoordinatorTests/Harness/`) and GENERATES the runner from the test sources on
+every run, so adding a test file needs no harness edit.
+
+Why the stub route is the only one: RenderingTests are deliberately NOT in the `Package.swift` harness, and the
 Xcode `RenderingTests` target cannot build either — under Swift 6 language
 mode, `-default-isolation MainActor` (which the renderer sources require)
 makes the `XCTestCase` subclasses' `override func setUp()` and the inherited
@@ -879,33 +978,21 @@ makes the `XCTestCase` subclasses' `override func setUp()` and the inherited
 XCTest's nonisolated ObjC declarations (even an explicit `@MainActor
 override` fails; verified). The working route is plain `swiftc` with a stub
 `XCTest` module compiled under the *same* default isolation, so the override
-isolation check passes by construction:
+isolation check passes by construction.
 
-```
-# build a stub XCTest module + library once (it provides XCTestCase + the
-# assertion functions the real test files import)
-swiftc -emit-library -module-name XCTest -swift-version 6 \
-  -default-isolation MainActor -target arm64-apple-macosx26.0 \
-  -emit-module -emit-module-path /tmp/xctest/mod XCTestStub.swift \
-  -o /tmp/xctest/libXCTest.dylib
-# compile the renderer + tests + a runner into one binary and run it
-swiftc -swift-version 6 -default-isolation MainActor \
-  -target arm64-apple-macosx26.0 -o /tmp/xctest/rendertests \
-  /tmp/xctest/main.swift Client/Views/MarkdownText.swift \
-  Client/Views/TextRowView.swift Client/Views/CodeCopyButton.swift \
-  Client/Accessibility/DisplayOptions.swift /tmp/Stubs/FontSettings.swift \
-  RenderingTests/*.swift -I /tmp/CoreStub -I /tmp/xctest/mod \
-  -L /tmp/xctest -lXCTest && DYLD_LIBRARY_PATH=/private/tmp/xctest \
-  /tmp/xctest/rendertests
-```
+What the script does (the essential pieces, if it ever needs rebuilding):
 
-(The exact flags live in the shell history / scratch space; the essential
-pieces are: the stub `XCTest` module must be compiled with
-`-default-isolation MainActor` so its `setUp`/`init` match the renderer's
-isolation, `FontSettings` must be stubbed because the `@Observable` macro's
-plugin server is blocked in the sandbox, `Core` needs an empty stub module
-for TextRowView's `import Core`, and the runner calls every `test*` method
-explicitly since pure-Swift methods are not ObjC-visible.)
+- the stub `XCTest` module is compiled with `-default-isolation MainActor` so
+  its `setUp`/`init` match the renderer's isolation;
+- `FontSettings` is stubbed because the `@Observable` macro's plugin server is
+  blocked in the sandbox;
+- `Core` is linked from the SwiftPM harness build (`swift test
+  --disable-sandbox` once, for `TextRowView`'s `import Core`);
+- the generated runner calls every `test*` method explicitly (pure-Swift
+  methods are not ObjC-visible), with `setUp`/`tearDown` around each, and
+  instantiates `NSApplication.shared` first — without an app instance
+  `NSButton.performClick` sends no action and the copy-button tests fail
+  spuriously.
 
 ### Adding a rendering test
 
@@ -931,7 +1018,13 @@ the whole `RenderingTests` directory, so `xcodegen generate` picks it up
   preserved (newline collapse), and the streaming-storage behavior
   (`StreamingStorageTests`: a pure append keeps the prefix's text and
   attributes, closing markdown / a font-size change re-styles the prefix,
-  a changed search query drops stale highlights).
+  a changed search query drops stale highlights) and the streaming crossfade
+  (`StreamingFadeTests`: a superseded batch settles to its final colors, a
+  settled message has no dim text, a completed fade lands on the captured
+  color and is never forced opaque).
+- Nothing here spins the run loop unless it says so, so the fade's async steps
+  cannot interleave — keep new tests deterministic the same way (spin
+  explicitly with `RunLoop.current.run(until:)` when a timer must fire).
 
 ## Conventions
 

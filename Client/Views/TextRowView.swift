@@ -7,9 +7,9 @@ import Core
 /// space at the bottom of a streaming row, no clipping.
 enum TranscriptText {
     /// lineFragmentPadding 8 each side.
-    static let horizontalPadding: CGFloat = 16
+    nonisolated static let horizontalPadding: CGFloat = 16
     /// textContainerInset 6 top + 6 bottom.
-    static let verticalInset: CGFloat = 12
+    nonisolated static let verticalInset: CGFloat = 12
 
     /// A fenced code block within the row's full attributed string.
     struct CodeBlockInfo {
@@ -18,35 +18,45 @@ enum TranscriptText {
     }
 
     /// The row's attributed string plus its fenced code blocks (for the row's
-    /// card backgrounds and corner copy buttons).
-    struct AttributedResult {
+    /// card backgrounds and corner copy buttons). A plain immutable data
+    /// holder; `nonisolated` so the background pre-measurer can carry it.
+    nonisolated struct AttributedResult {
         var string: NSAttributedString
         var codeBlocks: [CodeBlockInfo]
     }
 
-    static func attributedString(
+    /// `nonisolated` (both this and `attributedResult`): the renderer calls
+    /// them on the main thread, and the coordinator's background
+    /// pre-measurer calls them on a worker thread to seed the height cache
+    /// ahead of the table. Both must produce byte-identical strings — they
+    /// feed the same measurement — so `bodySize` is passed explicitly (the
+    /// caller resolves `FontSettings` on the thread it owns) and nothing
+    /// touches MainActor state.
+    nonisolated static func attributedString(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> NSAttributedString {
-        attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss).string
+        attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize).string
     }
 
-    static func attributedResult(
+    nonisolated static func attributedResult(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> AttributedResult {
         let body = NSMutableParagraphStyle()
         body.lineSpacing = 2
         body.lineBreakMode = .byWordWrapping
-        let bodyFont = NSFont.systemFont(ofSize: FontSettings.shared.bodySize)
+        let bodyFont = NSFont.systemFont(ofSize: bodySize)
         // Notice/error rows (stream failures, aborts): hard failures render
         // red; user-initiated aborts render secondary (weaker).
         let bodyColor: NSColor = switch role {
@@ -62,7 +72,7 @@ enum TranscriptText {
             thinkStyle.lineSpacing = 1
             thinkStyle.lineBreakMode = .byWordWrapping
             result.append(NSAttributedString(string: "💭 " + thinking, attributes: [
-                .font: NSFont.systemFont(ofSize: FontSettings.shared.bodySize - 1),
+                .font: NSFont.systemFont(ofSize: bodySize - 1),
                 .foregroundColor: NSColor.secondaryLabelColor,
                 .paragraphStyle: thinkStyle,
             ]))
@@ -83,7 +93,7 @@ enum TranscriptText {
             // the closing fence lands). Errors and aborts stay plain.
             let rendersMarkdown = (role == .user) || (role == .assistant)
             if rendersMarkdown {
-                let parsed = MarkdownText.body(text: text, bodySize: FontSettings.shared.bodySize)
+                let parsed = MarkdownText.body(text: text, bodySize: bodySize)
                 markdownBody = parsed
                 bodyStart = result.length
                 result.append(parsed.string)
@@ -124,7 +134,7 @@ enum TranscriptText {
             }
             let suffix = cacheMiss ? " · large miss" : ""
             result.append(NSAttributedString(string: "\n⚡ cache \(formatted)%\(suffix)", attributes: [
-                .font: NSFont.systemFont(ofSize: FontSettings.shared.bodySize - 2),
+                .font: NSFont.systemFont(ofSize: bodySize - 2),
                 .foregroundColor: color,
                 .paragraphStyle: body,
             ]))
@@ -143,16 +153,17 @@ enum TranscriptText {
         return AttributedResult(string: result, codeBlocks: codeBlocks)
     }
 
-    static func measuredHeight(
+    nonisolated static func measuredHeight(
         text: String,
         thinking: String?,
         role: TextRowView.Role,
         isStreaming: Bool,
         width: CGFloat,
         cacheHitRate: Double? = nil,
-        cacheMiss: Bool = false
+        cacheMiss: Bool = false,
+        bodySize: CGFloat
     ) -> CGFloat {
-        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
+        let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize)
         guard attributed.length > 0 else { return 30 }
         let usableWidth = max(width - horizontalPadding, 60)
         let bounds = attributed.boundingRect(
@@ -215,7 +226,11 @@ enum SearchMatchHighlight {
 /// supplies the row height via `TranscriptText.measuredHeight`, and `layout()`
 /// sizes the text view to match so content is never clipped.
 final class TextRowView: NSView, NSTextViewDelegate {
-    enum Role {
+    /// The role shapes the styling (and the VoiceOver label). A plain
+    /// Sendable value; `nonisolated` so the (now background-capable) height
+    /// measurer can switch on it — the synthesized Equatable conformance
+    /// would otherwise be MainActor-isolated.
+    nonisolated enum Role {
         case user
         case assistant
         /// A stream-failure row (network errors, aborts, truncation) — styled
@@ -266,6 +281,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// Bumped on every fade so stale animation steps (superseded by a newer
     /// batch) are skipped.
     private var fadeGeneration = 0
+    /// The runs of the fade currently in flight, paired with their FINAL
+    /// colors, so a superseded fade can be settled to its end state instead of
+    /// freezing mid-fade (see `settlePendingFade`).
+    private var pendingFadeRuns: [(range: NSRange, color: NSColor)] = []
     /// Streaming caret: pulses light↔dark blue while a turn generates —
     /// including before any content has streamed back (the turn-start
     /// placeholder row shows just the caret).
@@ -283,6 +302,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
     }
 
     private func setup() {
+        // One layer per cell: the cell's raster is cached in its own backing
+        // store, so a streaming tail row's redraw never forces the window's
+        // shared backing store to re-rasterize every visible cell (the
+        // `CABackingStoreUpdate_` / IOSurface churn in samples). The text view
+        // draws into this layer like any subview.
+        wantsLayer = true
         textView.isEditable = false
         textView.isSelectable = true
         textView.delegate = self
@@ -316,21 +341,24 @@ final class TextRowView: NSView, NSTextViewDelegate {
         textView.setAccessibilityRole(.textArea)
         // If the user toggles Reduce Motion / Increase Contrast mid-session,
         // stop the caret pulse (or restart it) without waiting for the next
-        // streaming delta.
+        // streaming delta. The notification arrives on the main queue; the
+        // hop to the main actor keeps the row state on its own thread.
         reduceMotionObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: DisplayOptions.didChange,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            if DisplayOptions.reduceMotion {
-                self.stopCaretPulse()
-            } else if self.isStreamingRow {
-                if DisplayOptions.increaseContrast {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if DisplayOptions.reduceMotion {
                     self.stopCaretPulse()
-                    self.applyHighContrastCaret()
-                } else {
-                    self.startCaretPulse()
+                } else if self.isStreamingRow {
+                    if DisplayOptions.increaseContrast {
+                        self.stopCaretPulse()
+                        self.applyHighContrastCaret()
+                    } else {
+                        self.startCaretPulse()
+                    }
                 }
             }
         }
@@ -341,8 +369,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
         isStreamingRow = isStreaming
         textView.setAccessibilityLabel(role.accessibilityLabel)
         let oldString = textView.string
-        let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss)
+        let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: FontSettings.shared.bodySize)
         codeBlocks = result.codeBlocks
+        // A fade still in flight belongs to the text currently in the storage:
+        // settle it to its final colors BEFORE the new string lands, while its
+        // ranges still address the characters they were measured on.
+        settlePendingFade()
         applyAttributedString(result.string, previous: oldString)
         // Only the incoming text animates — the old text stays rock-solid.
         // (The whole-row CATransition used to crossfade everything, which read
@@ -402,12 +434,15 @@ final class TextRowView: NSView, NSTextViewDelegate {
         // touch nothing — even a no-op edit would broadcast textDidChange and
         // dirty the layout for no reason.
         if prefix == old.length, prefix == new.length {
+            lastStorageApplyWasIncremental = false
             return
         }
         guard prefix > 0, prefixAttributesMatch(storage, newString, upTo: prefix) else {
+            lastStorageApplyWasIncremental = false
             storage.setAttributedString(newString)
             return
         }
+        lastStorageApplyWasIncremental = true
         let oldDelta = NSRange(location: prefix, length: old.length - prefix)
         let newDelta = NSRange(location: prefix, length: new.length - prefix)
         storage.replaceCharacters(in: oldDelta, with: newString.attributedSubstring(from: newDelta))
@@ -435,6 +470,11 @@ final class TextRowView: NSView, NSTextViewDelegate {
         return true
     }
 
+    nonisolated private static func layoutAffectingFontTraits(of font: NSFont) -> UInt32 {
+        // italic | bold | expanded | condensed | monoSpace
+        font.fontDescriptor.symbolicTraits.rawValue & 0x463
+    }
+
     private func attributeDictionariesEqualIgnoringDynamic(
         _ a: [NSAttributedString.Key: Any],
         _ b: [NSAttributedString.Key: Any]
@@ -445,6 +485,36 @@ final class TextRowView: NSView, NSTextViewDelegate {
         var bb = b
         bb.removeValue(forKey: .foregroundColor)
         bb.removeValue(forKey: .backgroundColor)
+        // NSTextView writes `NSOriginalFont` into the text storage (the font
+        // it substituted for a fallback glyph) so an edit can restore the
+        // user's original typing font. It never appears in a freshly-built
+        // string, so it must not drive the incremental decision — its presence
+        // would fail the comparison for every emoji run.
+        let originalFont = NSAttributedString.Key("NSOriginalFont")
+        aa.removeValue(forKey: originalFont)
+        bb.removeValue(forKey: originalFont)
+        // `.font`: the text STORAGE resolves emoji (and other fallback glyphs)
+        // to their color/fallback font (`AppleColorEmojiUI`) while the built
+        // string keeps the source system font — the same logical font, two
+        // different objects. Comparing `NSFont.isEqual` then fails at the
+        // emoji run, the row falls back to a full `setAttributedString` on
+        // EVERY streaming batch, and the layout manager re-typesets the whole
+        // (possibly huge) message instead of just the appended tail — the
+        // linear per-batch cost in samples, hidden behind the "incremental"
+        // comment. Compare fonts by (point size, layout-affecting traits):
+        // the app's transcript fonts (body, thinking, mono, bold/italic,
+        // header sizes) are all distinct under that key, a font-size change
+        // differs by size, and the emoji fallback differs from its source
+        // font only in family + decorative traits — which never matter for
+        // line layout here.
+        if let fa = aa[.font] as? NSFont, let fb = bb[.font] as? NSFont {
+            if fa.pointSize != fb.pointSize
+                || Self.layoutAffectingFontTraits(of: fa) != Self.layoutAffectingFontTraits(of: fb) {
+                return false
+            }
+            aa.removeValue(forKey: .font)
+            bb.removeValue(forKey: .font)
+        }
         return NSDictionary(dictionary: aa).isEqual(to: bb)
     }
 
@@ -491,6 +561,35 @@ final class TextRowView: NSView, NSTextViewDelegate {
         fadeIn(range: NSRange(location: prefix, length: length))
     }
 
+    /// Settles the fade currently in flight: every one of its runs jumps to its
+    /// final color and the remaining animation steps are cancelled.
+    ///
+    /// Load-bearing, not cosmetic. Starting a fade bumps `fadeGeneration`,
+    /// which SKIPS the previous fade's remaining steps, and the incremental
+    /// storage path deliberately keeps the shared prefix's attributes (the
+    /// prefix equality check ignores `.foregroundColor`). So without settling,
+    /// a batch superseded before its 0.3s fade finished left its text frozen at
+    /// whatever alpha it had reached — and since every batch appends past the
+    /// last one, the frozen regions accumulated into a growing washed-out block
+    /// (lighter toward the tail) in the middle of the message, healed only by a
+    /// full re-render. The user-visible tell: switching tabs and back fixed it.
+    ///
+    /// Called from `configure` before the new string is applied, so the ranges
+    /// still address the text they were measured on (a recycled cell would
+    /// otherwise paint one row's fade colors onto another row's characters).
+    private func settlePendingFade() {
+        defer { pendingFadeRuns.removeAll() }
+        guard !pendingFadeRuns.isEmpty, let storage = textView.textStorage else { return }
+        // Cancel the in-flight steps: they would re-dim what we just settled.
+        fadeGeneration += 1
+        let current = NSRange(location: 0, length: storage.length)
+        for (range, color) in pendingFadeRuns {
+            let clipped = NSIntersectionRange(range, current)
+            guard clipped.length > 0 else { continue }
+            storage.addAttribute(.foregroundColor, value: color, range: clipped)
+        }
+    }
+
     /// Dims `range` to near-invisible, then steps it back to its final color
     /// over ~0.3s. The final color is captured per attribute run before the
     /// dimming (thinking/body/caret can differ).
@@ -512,11 +611,14 @@ final class TextRowView: NSView, NSTextViewDelegate {
         for (r, c) in runs {
             storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(0.12), range: r)
         }
+        pendingFadeRuns = runs.map { (range: $0.0, color: $0.1) }
         let steps = 6
         for step in 1...steps {
             let alpha = 0.12 + 0.88 * CGFloat(step) / CGFloat(steps)
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.05) { [weak self] in
                 guard let self, self.fadeGeneration == generation, let storage = self.textView.textStorage else { return }
+                let isLast = step == steps
+                if isLast { self.pendingFadeRuns.removeAll() }
                 for (r, c) in runs {
                     // The text may have been replaced/truncated since this fade
                     // was scheduled; clip the range to the current length so a
@@ -525,7 +627,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
                     let current = NSRange(location: 0, length: storage.length)
                     let clipped = NSIntersectionRange(r, current)
                     guard clipped.length > 0 else { continue }
-                    storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(alpha), range: clipped)
+                    // The last step restores the captured color OBJECT, never
+                    // `withAlphaComponent(1)`: the semantic colors are not
+                    // opaque (`labelColor` is alpha 0.85), so forcing alpha 1
+                    // left every faded-in run slightly DARKER than the text
+                    // around it — reading as stray bold until a full re-render.
+                    storage.addAttribute(.foregroundColor, value: isLast ? c : c.withAlphaComponent(alpha), range: clipped)
                 }
             }
         }
@@ -649,6 +756,16 @@ final class TextRowView: NSView, NSTextViewDelegate {
 
     // MARK: - Test hooks (internal read-only access for RenderingTests)
 
+    /// Whether the most recent `applyAttributedString` took the incremental
+    /// (append-only tail) path rather than the full-replace fallback. Test
+    /// hook: no rendered geometry distinguishes the two paths (both end with
+    /// the same string and attributes — `NSFont` objects are cached and
+    /// `NSTextStorage` dedupes paragraph styles), so StreamingStorageTests
+    /// asserts the PATH directly: an emoji-prefixed thinking stream must
+    /// append incrementally, because the full-replace fallback re-typesets
+    /// the whole (huge) block on every batch.
+    private(set) var lastStorageApplyWasIncremental = false
+
     /// Number of code-card backgrounds currently placed (one per fenced block).
     var renderedCodeBlockCount: Int { codeCardViews.count }
     /// The ranges in the current string that carry the search-match background
@@ -733,6 +850,19 @@ final class TextRowView: NSView, NSTextViewDelegate {
 /// dynamic `TextRowView.userHighlight` color, so dark/light mode and Increase
 /// Contrast resolve at draw time.
 private final class UserHighlightView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // A flat fill is trivially thread-safe to rasterize; letting AppKit
+        // draw it on a background thread takes the fill out of the main
+        // thread's display pass.
+        canDrawConcurrently = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        canDrawConcurrently = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         TextRowView.userHighlight.setFill()
         dirtyRect.fill()
@@ -743,6 +873,16 @@ private final class UserHighlightView: NSView {
 /// dynamic `MarkdownText.codeBackground` color; the row positions it over the
 /// block's line rects (below the text, so glyphs stay crisp on top).
 private final class CodeBlockCardView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        canDrawConcurrently = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        canDrawConcurrently = true
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         MarkdownText.codeBackground.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()

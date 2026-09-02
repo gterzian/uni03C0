@@ -8,24 +8,31 @@ import AppKit
 /// All three are thin wrappers over one AppKit API family
 /// (`NSWorkspace`'s accessibility display options), so a change to that API
 /// lands in exactly one place.
+///
+/// `nonisolated`: the dynamic colors that adapt to contrast/ appearance
+/// (`MarkdownText.codeBackground`, `SearchMatchHighlight`, …) capture these
+/// inside their `NSColor(name:dynamicProvider:)` closures, and those colors
+/// are created on the background pre-measurer as well as the main thread.
+/// Reading `NSWorkspace`'s accessibility display options is a thread-safe
+/// property read.
 enum DisplayOptions {
     /// Reduce Motion: streaming animation (caret pulse, text fade) is purely
     /// decorative and is skipped.
-    static var reduceMotion: Bool {
+    nonisolated static var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
 
     /// Increase Contrast: subtle color is strengthened so color alone never
     /// carries information (caret, user-message highlight, status readout,
     /// failed-card border).
-    static var increaseContrast: Bool {
+    nonisolated static var increaseContrast: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
     }
 
     /// Posted to `NSWorkspace.shared.notificationCenter` when any of the
     /// accessibility display options change (Reduce Motion, Increase Contrast,
     /// …).
-    static var didChange: Notification.Name {
+    nonisolated static var didChange: Notification.Name {
         NSWorkspace.accessibilityDisplayOptionsDidChangeNotification
     }
 }

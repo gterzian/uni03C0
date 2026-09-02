@@ -117,6 +117,7 @@ targets:
       # a real NSTableView). `SessionViewModel` is a member-compatible stand-in
       # (the real one spawns pi at init; tests never spawn pi).
       - Client/Views/MarkdownText.swift
+      - Client/Views/RowMeasurement.swift
       - Client/Views/TextRowView.swift
       - Client/Views/CodeCopyButton.swift
       - Client/Views/ToolCallCardView.swift

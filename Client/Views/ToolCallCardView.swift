@@ -14,10 +14,53 @@ final class ToolCallHostView: NSView {
     /// reconfigured even when their row isn't the tail.
     private(set) var renderedCardID: String?
     private(set) var renderedCardState: ToolCallState?
+    /// The last configured card content + search state, so a scroll re-entry
+    /// that re-configures the cell with IDENTICAL inputs can skip the SwiftUI
+    /// rootView swap (which would otherwise run a full card layout pass for
+    /// nothing). `ToolCallCard` is Equatable, so the comparison is exact.
+    private var lastConfiguredCard: ToolCallCard?
+    private var lastConfiguredQuery: String?
+    private var lastConfiguredCaseSensitive = false
+    private var lastConfiguredIsCurrent = false
+    private var lastConfiguredExpanded = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // One layer per cell: the card's raster is cached in its own backing
+        // store, so updating one card never re-rasterizes the others (the
+        // `CABackingStoreUpdate_` churn in samples).
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+    }
 
     func configure(card: ToolCallCard, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, onToggleExpand: @escaping () -> Void) {
         renderedCardID = card.id
         renderedCardState = card.state
+        // Identical inputs (a scroll re-entry rendering the same card): the
+        // hosting view already shows it — swapping rootView would re-run the
+        // whole SwiftUI layout for no visible change. The card's own @State
+        // (expansion) lives inside `ToolCallCardView` and `.id(card.id)` keeps
+        // it across swaps, so skipping the swap preserves it exactly like a
+        // swap would. The expansion registry is read below, so a state change
+        // there (a user tap) always differs from `lastConfiguredCard`'s
+        // initial-expansion input.
+        let expanded = ToolCardExpansion.shared.isExpanded(card.id)
+        if card == lastConfiguredCard,
+           searchQuery == lastConfiguredQuery,
+           searchCaseSensitive == lastConfiguredCaseSensitive,
+           isCurrentSearchMatch == lastConfiguredIsCurrent,
+           expanded == lastConfiguredExpanded {
+            return
+        }
+        lastConfiguredCard = card
+        lastConfiguredQuery = searchQuery
+        lastConfiguredCaseSensitive = searchCaseSensitive
+        lastConfiguredIsCurrent = isCurrentSearchMatch
+        lastConfiguredExpanded = expanded
         // `.id(card.id)` keeps the card's own expansion state alive across
         // output updates for the same call, but resets it when a recycled cell
         // is reused for a different call.
@@ -25,7 +68,7 @@ final class ToolCallHostView: NSView {
             ToolCallCardView(
                 card: card,
                 onToggleExpand: onToggleExpand,
-                isInitiallyExpanded: ToolCardExpansion.shared.isExpanded(card.id),
+                isInitiallyExpanded: expanded,
                 searchQuery: searchQuery,
                 searchCaseSensitive: searchCaseSensitive,
                 isCurrentSearchMatch: isCurrentSearchMatch
@@ -494,20 +537,37 @@ struct EditDiffView: View {
     }
 }
 
-/// An animated spinner for the running-tool indicator. Deliberately NOT
-/// SwiftUI's `ProgressView`: an animated SwiftUI spinner inside an
-/// `NSHostingView` keeps its (child) SwiftUI graph invalidating every frame
-/// for the whole tool run (and the row's `sizeThatFits` measurement with it).
+/// An animated spinner for the running-tool indicator and any always-animated
+/// chrome (toolbar Stop button, tab status, in-progress overlays).
+/// Deliberately NOT SwiftUI's `ProgressView`: an animated SwiftUI spinner
+/// inside an `NSHostingView` keeps its (child) SwiftUI graph invalidating
+/// every frame for the whole time it is visible — during a long stream that
+/// is the entire turn, sweeping the hosting views' layout into every display
+/// cycle (the shell-relayout cost seen in main-thread samples: hosting
+/// `layout()` cascades + `sizeThatFits` re-measures per streaming commit).
 /// `NSProgressIndicator` animates on its own AppKit timer and never touches
-/// the SwiftUI graph.
+/// the SwiftUI graph — the row/card height and the surrounding layout stay
+/// static, so nothing re-lays out while it spins.
 struct SpinnerView: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSProgressIndicator {
-        let indicator = NSProgressIndicator()
+    /// Size to match the replaced `ProgressView().controlSize(...)`.
+    var controlSize: NSControl.ControlSize = .small
+
+    func makeNSView(context: Context) -> ClickTransparentIndicator {
+        let indicator = ClickTransparentIndicator()
         indicator.style = .spinning
-        indicator.controlSize = .small
+        indicator.controlSize = controlSize
         indicator.startAnimation(nil)
         return indicator
     }
 
-    func updateNSView(_ nsView: NSProgressIndicator, context: Context) {}
+    func updateNSView(_ nsView: ClickTransparentIndicator, context: Context) {}
+
+    /// The indicator is decoration inside a SwiftUI `Button` (toolbar Stop,
+    /// tab pill) and must never consume the click that should reach the
+    /// button; it never needs mouse events itself.
+    final class ClickTransparentIndicator: NSProgressIndicator {
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            nil
+        }
+    }
 }

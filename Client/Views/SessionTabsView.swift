@@ -207,12 +207,15 @@ struct SessionTabsView: View {
     }
 
     /// The same status icons as the toolbar's Stop button: a spinner while the
-    /// session is working, the stop glyph when idle.
+    /// session is working, the stop glyph when idle. The spinner is the AppKit
+    /// `NSProgressIndicator` (see `SpinnerView`), never SwiftUI's animated
+    /// `ProgressView` — a SwiftUI spinner in the tab bar would keep the whole
+    /// window content graph invalidating every frame for the entire stream.
     @ViewBuilder
     private func statusIcon(_ tab: SessionTab) -> some View {
         if tab.viewModel.isStreaming {
-            ProgressView()
-                .controlSize(.mini)
+            SpinnerView(controlSize: .mini)
+                .frame(width: 16)
         } else {
             Image(systemName: "stop")
                 .font(.system(size: 9, weight: .semibold))

@@ -63,7 +63,9 @@ final class TextRowViewTests: XCTestCase {
         row.layoutSubtreeIfNeeded()
         let ranges = row.searchHighlightRangesForTesting
         XCTAssertEqual(ranges.count, 3, "every occurrence is highlighted, not the row")
-        XCTAssertEqual(ranges.map(\.location), [0, 6, 18], "ranges sit exactly on each occurrence")
+        // "proxy windowproxy Proxy": the standalone word, the one INSIDE
+        // "windowproxy" (index 12, past "window"), and the capitalized one.
+        XCTAssertEqual(ranges.map(\.location), [0, 12, 18], "ranges sit exactly on each occurrence")
         XCTAssertEqual(ranges.map(\.length), [5, 5, 5])
     }
 
@@ -141,7 +143,7 @@ final class TextRowViewTests: XCTestCase {
 
     func testRowHeightMatchesMeasurement() {
         let row = makeRow(text: codeMarkdown, role: .assistant)
-        let measured = TranscriptText.measuredHeight(text: codeMarkdown, thinking: nil, role: .assistant, isStreaming: false, width: 800)
+        let measured = TranscriptText.measuredHeight(text: codeMarkdown, thinking: nil, role: .assistant, isStreaming: false, width: 800, bodySize: FontSettings.shared.bodySize)
         XCTAssertEqual(row.contentHeight, measured, accuracy: 3)
     }
 
@@ -156,11 +158,11 @@ final class TextRowViewTests: XCTestCase {
         row.layoutSubtreeIfNeeded()
 
         let at400 = row.contentHeight(atWidth: 400)
-        let measured400 = TranscriptText.measuredHeight(text: msg, thinking: nil, role: .user, isStreaming: false, width: 400)
+        let measured400 = TranscriptText.measuredHeight(text: msg, thinking: nil, role: .user, isStreaming: false, width: 400, bodySize: FontSettings.shared.bodySize)
         XCTAssertEqual(at400, measured400, accuracy: 3, "measure at the real width, not the stale frame")
 
         let at800 = row.contentHeight(atWidth: 800)
-        let measured800 = TranscriptText.measuredHeight(text: msg, thinking: nil, role: .user, isStreaming: false, width: 800)
+        let measured800 = TranscriptText.measuredHeight(text: msg, thinking: nil, role: .user, isStreaming: false, width: 800, bodySize: FontSettings.shared.bodySize)
         XCTAssertEqual(at800, measured800, accuracy: 3)
     }
 }
