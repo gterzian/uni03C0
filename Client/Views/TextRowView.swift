@@ -434,12 +434,15 @@ final class TextRowView: NSView, NSTextViewDelegate {
         // touch nothing — even a no-op edit would broadcast textDidChange and
         // dirty the layout for no reason.
         if prefix == old.length, prefix == new.length {
+            lastStorageApplyWasIncremental = false
             return
         }
         guard prefix > 0, prefixAttributesMatch(storage, newString, upTo: prefix) else {
+            lastStorageApplyWasIncremental = false
             storage.setAttributedString(newString)
             return
         }
+        lastStorageApplyWasIncremental = true
         let oldDelta = NSRange(location: prefix, length: old.length - prefix)
         let newDelta = NSRange(location: prefix, length: new.length - prefix)
         storage.replaceCharacters(in: oldDelta, with: newString.attributedSubstring(from: newDelta))
@@ -467,6 +470,11 @@ final class TextRowView: NSView, NSTextViewDelegate {
         return true
     }
 
+    nonisolated private static func layoutAffectingFontTraits(of font: NSFont) -> UInt32 {
+        // italic | bold | expanded | condensed | monoSpace
+        font.fontDescriptor.symbolicTraits.rawValue & 0x463
+    }
+
     private func attributeDictionariesEqualIgnoringDynamic(
         _ a: [NSAttributedString.Key: Any],
         _ b: [NSAttributedString.Key: Any]
@@ -477,6 +485,36 @@ final class TextRowView: NSView, NSTextViewDelegate {
         var bb = b
         bb.removeValue(forKey: .foregroundColor)
         bb.removeValue(forKey: .backgroundColor)
+        // NSTextView writes `NSOriginalFont` into the text storage (the font
+        // it substituted for a fallback glyph) so an edit can restore the
+        // user's original typing font. It never appears in a freshly-built
+        // string, so it must not drive the incremental decision — its presence
+        // would fail the comparison for every emoji run.
+        let originalFont = NSAttributedString.Key("NSOriginalFont")
+        aa.removeValue(forKey: originalFont)
+        bb.removeValue(forKey: originalFont)
+        // `.font`: the text STORAGE resolves emoji (and other fallback glyphs)
+        // to their color/fallback font (`AppleColorEmojiUI`) while the built
+        // string keeps the source system font — the same logical font, two
+        // different objects. Comparing `NSFont.isEqual` then fails at the
+        // emoji run, the row falls back to a full `setAttributedString` on
+        // EVERY streaming batch, and the layout manager re-typesets the whole
+        // (possibly huge) message instead of just the appended tail — the
+        // linear per-batch cost in samples, hidden behind the "incremental"
+        // comment. Compare fonts by (point size, layout-affecting traits):
+        // the app's transcript fonts (body, thinking, mono, bold/italic,
+        // header sizes) are all distinct under that key, a font-size change
+        // differs by size, and the emoji fallback differs from its source
+        // font only in family + decorative traits — which never matter for
+        // line layout here.
+        if let fa = aa[.font] as? NSFont, let fb = bb[.font] as? NSFont {
+            if fa.pointSize != fb.pointSize
+                || Self.layoutAffectingFontTraits(of: fa) != Self.layoutAffectingFontTraits(of: fb) {
+                return false
+            }
+            aa.removeValue(forKey: .font)
+            bb.removeValue(forKey: .font)
+        }
         return NSDictionary(dictionary: aa).isEqual(to: bb)
     }
 
@@ -717,6 +755,16 @@ final class TextRowView: NSView, NSTextViewDelegate {
     }
 
     // MARK: - Test hooks (internal read-only access for RenderingTests)
+
+    /// Whether the most recent `applyAttributedString` took the incremental
+    /// (append-only tail) path rather than the full-replace fallback. Test
+    /// hook: no rendered geometry distinguishes the two paths (both end with
+    /// the same string and attributes — `NSFont` objects are cached and
+    /// `NSTextStorage` dedupes paragraph styles), so StreamingStorageTests
+    /// asserts the PATH directly: an emoji-prefixed thinking stream must
+    /// append incrementally, because the full-replace fallback re-typesets
+    /// the whole (huge) block on every batch.
+    private(set) var lastStorageApplyWasIncremental = false
 
     /// Number of code-card backgrounds currently placed (one per fenced block).
     var renderedCodeBlockCount: Int { codeCardViews.count }

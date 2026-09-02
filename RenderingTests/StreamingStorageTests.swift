@@ -56,6 +56,36 @@ final class StreamingStorageTests: XCTestCase {
         XCTAssertEqual(RenderTestHelper.font(tv.textStorage!, at: 4)?.pointSize, FontSettings.shared.bodySize - 1)
     }
 
+    /// The regression behind the thinking-stream hotspot in samples: the text
+    /// STORAGE resolves the "💭 " emoji run to `AppleColorEmojiUI` (recording
+    /// the source font in `NSOriginalFont`), while the freshly-built string
+    /// keeps the plain system font. `prefixAttributesMatch` compared fonts
+    /// with `NSFont.isEqual` and the full attribute dictionaries, so it failed
+    /// at the emoji run and the row fell back to a FULL `setAttributedString`
+    /// on every streaming batch — the layout manager then re-typeset the whole
+    /// growing thinking block per batch (the linear per-batch layout cost in
+    /// samples, hidden behind the "incremental" comment). The emoji-prefixed
+    /// append must take the incremental path.
+    func testEmojiPrefixedThinkingAppendIsIncremental() {
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: "", thinking: "Let me think", role: .assistant, isStreaming: true)
+        // First batch: the storage was empty, so a full replace is correct.
+        XCTAssertFalse(row.lastStorageApplyWasIncremental)
+        // The coordinator lays out after every configure — and the layout pass
+        // is what makes the storage RESOLVE the emoji run to AppleColorEmojiUI
+        // (recording NSOriginalFont). Without it the storage still holds the
+        // plain system font and the bug stays hidden: the test must reproduce
+        // the real streaming path.
+        row.layoutSubtreeIfNeeded()
+
+        row.configure(text: "", thinking: "Let me think harder", role: .assistant, isStreaming: true)
+        XCTAssertTrue(
+            row.lastStorageApplyWasIncremental,
+            "an emoji-prefixed thinking stream must append incrementally — " +
+            "the full-replace fallback re-typesets the whole block every batch"
+        )
+    }
+
     // MARK: - Full-replace fallbacks (prefix genuinely changed)
 
     func testClosingBoldReStylesThePrefix() {

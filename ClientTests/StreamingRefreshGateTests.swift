@@ -57,6 +57,40 @@ final class StreamingRefreshGateTests: XCTestCase {
         XCTAssertTrue(gate.shouldRefreshRunningToolCard(now: 0.26))
     }
 
+    /// The regression behind the per-delta tool-card refreshes in samples:
+    /// the card gate used to test `now - lastStreamedAt`, and `lastStreamedAt`
+    /// is only advanced by TEXT refreshes — which stop the moment the tool
+    /// starts. A running bash card then re-rendered (SwiftUI layout + height
+    /// re-measure) on EVERY tool output delta instead of at the 0.25s cap.
+    /// The card gate must own its own timestamp.
+    func testRunningToolCardDoesNotRefreshPerDeltaAfterTextStops() {
+        var gate = StreamingRefreshGate(batchInterval: 0.25)
+        _ = gate.shouldRefresh(entryID: "m1", text: "thinking", thinking: "", isStreaming: true, now: 0)
+        // Text stopped (the tool started): successive deltas must NOT each
+        // approve a card refresh — the interval hasn't elapsed.
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.05))
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.10))
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.15))
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.20))
+        XCTAssertTrue(gate.shouldRefreshRunningToolCard(now: 0.26))
+        // After an approved refresh, the next deltas batch away again.
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.27))
+        XCTAssertFalse(gate.shouldRefreshRunningToolCard(now: 0.30))
+        XCTAssertTrue(gate.shouldRefreshRunningToolCard(now: 0.52))
+    }
+
+    /// The text and card gates are independent: a card refresh advances only
+    /// the card timestamp, so it cannot delay (or spuriously allow) the next
+    /// text refresh, and vice versa.
+    func testCardAndTextGatesAreIndependent() {
+        var gate = StreamingRefreshGate(batchInterval: 0.25)
+        _ = gate.shouldRefresh(entryID: "m1", text: "a", thinking: "", isStreaming: true, now: 0)
+        _ = gate.shouldRefreshRunningToolCard(now: 0.1) // card refresh: card-only state
+        // Text still gates on ITS last refresh (now=0), unaffected by the card.
+        XCTAssertFalse(gate.shouldRefresh(entryID: "m1", text: "ab", thinking: "", isStreaming: true, now: 0.15))
+        XCTAssertTrue(gate.shouldRefresh(entryID: "m1", text: "abc", thinking: "", isStreaming: true, now: 0.26))
+    }
+
     // MARK: - Full pipeline repro (store + gate)
 
     /// Replays a realistic thinking stream through the real store folding and
