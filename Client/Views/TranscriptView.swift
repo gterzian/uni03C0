@@ -125,6 +125,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private var heightsBySession: [ObjectIdentifier: HeightCache] = [:]
     private var sessionLRU: [ObjectIdentifier] = []
     private let maxCachedSessions = 6
+    /// The session key whose cache `heights` currently points at (kept in
+    /// sync by `activateSessionCache`). Pre-measure batches record it at
+    /// schedule time so their results land in that session's cache even if
+    /// the active tab changed while the task was in flight.
+    private var activeSessionKey: ObjectIdentifier?
     weak var viewModel: SessionViewModel?
     private var isApplying = false
     /// Streaming batching: the tail row is refreshed at most every
@@ -244,13 +249,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     // MARK: Off-main height pre-measurement
 
     /// Batches of settled text rows waiting to be measured on a background
-    /// thread. Each batch carries the session's `HeightCache` OBJECT (not an
-    /// identifier): the pre-measurer holds a strong reference to exactly the
-    /// cache it will seed, so a batch started before a tab switch still lands
-    /// in the right session's cache, and a session that deallocates
-    /// mid-flight can never have its identity recycled onto a new session.
-    /// Internal (not private) so CoordinatorTests can observe the queue.
-    var pendingPremeasure: [(cache: HeightCache, entries: [TranscriptEntry])] = []
+    /// thread. Each batch carries the SESSION KEY the heights belong to plus
+    /// the rows' `RowMeasureSpec`s — plain Sendable values, built on the main
+    /// actor at schedule time. Nothing crossing the task boundary references
+    /// a `HeightCache`, the row model, or any coordinator state: on
+    /// completion the results are stored into `heightsBySession[key]` on the
+    /// main actor, so a batch started before a tab switch still lands in the
+    /// right session's cache. Internal (not private) so CoordinatorTests can
+    /// observe the queue.
+    var pendingPremeasure: [(key: ObjectIdentifier, specs: [RowMeasureSpec])] = []
     /// True while a pre-measure task is in flight — at most one at a time;
     /// batches scheduled in the meantime are drained by the running task's
     /// completion (`pumpPremeasure`). Internal for the same reason.
@@ -562,6 +569,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// reload that follows never re-measures a row whose content is unchanged.
     private func activateSessionCache(_ session: SessionViewModel) {
         let key = ObjectIdentifier(session)
+        activeSessionKey = key
         // Row-height bookkeeping is per session: the pending re-queries and the
         // streaming-row marker belong to the session being left, and a reload
         // rebuilds every cell anyway.
@@ -585,16 +593,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: - Off-main height pre-measurement
 
-    /// Rows the background measurer can handle: SETTLED text rows. Streaming
-    /// rows are excluded — their heights come from the cell's incremental
-    /// layout (never a full CoreText measure) and re-measuring them per
-    /// delta is the documented 100%-CPU regression. Tool cards are excluded
-    /// — their height needs a real SwiftUI `NSHostingController` layout,
-    /// which must run on the main thread.
-    private func isPremeasurable(_ entry: TranscriptEntry) -> Bool {
-        if entry.kind.isStreaming { return false }
-        if case .toolCall = entry.kind { return false }
-        return true
+    /// Builds the measure spec for a row the background measurer can handle:
+    /// SETTLED text rows. Streaming rows are excluded — their heights come
+    /// from the cell's incremental layout (never a full CoreText measure) and
+    /// re-measuring them per delta is the documented 100%-CPU regression.
+    /// Tool cards are excluded — their height needs a real SwiftUI
+    /// `NSHostingController` layout, which must run on the main thread. Runs
+    /// on the MAIN actor at schedule time, so the spec (and its cache tag)
+    /// capture the content exactly as the main-thread path would key it; only
+    /// the spec — a plain Sendable value — crosses into the worker.
+    private func measureSpec(for entry: TranscriptEntry) -> RowMeasureSpec? {
+        switch entry.kind {
+        case .userMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .user, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .assistantMessage(let text, let thinking, let isStreaming):
+            guard !isStreaming else { return nil }
+            return RowMeasureSpec(id: entry.id, text: text, thinking: thinking, role: .assistant, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, tag: Self.contentTag(for: entry))
+        case .errorMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .error, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .abortedMessage(let text):
+            return RowMeasureSpec(id: entry.id, text: text, thinking: nil, role: .aborted, cacheHitRate: nil, cacheMiss: false, tag: Self.contentTag(for: entry))
+        case .toolCall:
+            return nil
+        }
     }
 
     /// Schedules off-main measurement of `entries` so `heightOfRow`'s cache
@@ -602,28 +623,29 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// on the main thread during table layout — shrink to rows the background
     /// pass hasn't reached yet. Called when rows enter the materialized
     /// window (appends, history prepends, post-reload windows, font-size
-    /// changes). The measurement runs the SAME
-    /// `measuredHeight(forWidth:bodySize:)` as the main-thread path (which is
-    /// `nonisolated` for exactly this), so a seeded height is
-    /// indistinguishable from a synchronously measured one — the "one
-    /// measurement function" invariant is preserved. Results are stored on
-    /// the main thread into the session cache the batch was scheduled for.
+    /// changes). Converts each row to a `RowMeasureSpec` on the main actor,
+    /// then hands ONLY the Sendable specs to the worker; the worker runs the
+    /// SAME `TranscriptText.measuredHeight` as the main-thread path, so a
+    /// seeded height is indistinguishable from a synchronously measured one —
+    /// the "one measurement function" invariant is preserved.
     private func schedulePremeasure(entries: [TranscriptEntry]) {
-        let candidates = entries.filter(isPremeasurable)
-        guard !candidates.isEmpty else { return }
-        pendingPremeasure.append((heights, candidates))
+        guard let key = activeSessionKey else { return }
+        let specs = entries.compactMap { measureSpec(for: $0) }
+        guard !specs.isEmpty else { return }
+        pendingPremeasure.append((key, specs))
         pumpPremeasure()
     }
 
     /// Drains the pending pre-measure queue: one detached task measures the
     /// whole batch off the main thread (markdown parse + glyph layout), then
-    /// hops back once to store every result into the right session's
-    /// `HeightCache` (the cache object the batch was scheduled with — a
-    /// strong reference, so the identity can never be recycled onto another
-    /// session). The store hop runs on the main thread; `HeightCache` is
-    /// additionally lock-guarded (`@unchecked Sendable`), so even a future
-    /// off-main store could not corrupt it. At most one task is in flight —
-    /// its completion pumps the next batch, so a streaming burst coalesces
+    /// hops back once to store every result into the session cache the batch
+    /// was scheduled for — resolved by key on the main actor, so a batch that
+    /// started before a tab switch lands in the right session even if the
+    /// active session changed mid-flight; results for an LRU-evicted session
+    /// are dropped. The task boundary is all plain Sendable values
+    /// (`RowMeasureSpec` in, `RowMeasurement` out) — no `HeightCache`, row
+    /// model, or coordinator state crosses it. At most one task is in flight
+    /// — its completion pumps the next batch, so a streaming burst coalesces
     /// into a single task.
     private func pumpPremeasure() {
         guard !premeasureInFlight, !pendingPremeasure.isEmpty else { return }
@@ -634,16 +656,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let bodySize = FontSettings.shared.bodySize
         let generation = fontSizeGeneration
         Task.detached(priority: .utility) { [batch, width, bodySize, generation] in
-            var results: [(cache: HeightCache, id: String, width: CGFloat, height: CGFloat, tag: String?)] = []
-            results.reserveCapacity(batch.reduce(0) { $0 + $1.entries.count })
-            for (cache, entries) in batch {
-                for entry in entries {
-                    // `contentTag` is nonisolated (a pure fingerprint) so the
-                    // seeded entries are keyed exactly like main-thread ones.
-                    let tag = Coordinator.contentTag(for: entry)
-                    let height = entry.measuredHeight(forWidth: width, bodySize: bodySize)
-                    results.append((cache, entry.id, width, height, tag))
+            var results: [(key: ObjectIdentifier, measurements: [RowMeasurement])] = []
+            results.reserveCapacity(batch.count)
+            for (key, specs) in batch {
+                var measurements: [RowMeasurement] = []
+                measurements.reserveCapacity(specs.count)
+                for spec in specs {
+                    measurements.append(RowMeasurer.measure(spec, width: width, bodySize: bodySize))
                 }
+                results.append((key, measurements))
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -655,10 +676,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                     self.pumpPremeasure()
                     return
                 }
-                for r in results {
-                    // On the main thread, serialized with the coordinator's
-                    // own cache access; the internal lock covers everything.
-                    r.cache.store(r.id, width: r.width, height: r.height, tag: r.tag)
+                for (key, measurements) in results {
+                    // The cache the batch was scheduled for may have been
+                    // LRU-evicted (a 7th session opened) while we measured;
+                    // its re-created cache re-measures rows on demand.
+                    guard let cache = self.heightsBySession[key] else { continue }
+                    for r in measurements {
+                        cache.store(r.id, width: r.width, height: r.height, tag: r.tag)
+                    }
                 }
                 self.pumpPremeasure()
             }
@@ -722,9 +747,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// and re-measure only on genuine change. Includes the cache-line fields
     /// (they render under the final message, so they affect the height) and the
     /// streaming flag (the caret adds a line's worth of width pressure).
-    /// `nonisolated`: the background pre-measurer computes the same tag so the
-    /// heights it seeds are keyed identically to the main-thread ones.
-    nonisolated private static func contentTag(for entry: TranscriptEntry) -> String? {
+    /// Main-thread only: the pre-measure specs compute their tag here at
+    /// schedule time (on the main actor), so the heights the worker seeds are
+    /// keyed identically to the synchronous ones by construction.
+    private static func contentTag(for entry: TranscriptEntry) -> String? {
         switch entry.kind {
         case .userMessage(let text):
             return "u\u{1F}\(text)"

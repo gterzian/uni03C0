@@ -422,11 +422,13 @@ concurrency.
 - `ToolCardExpansion` / `HeightCache` — the per-card expand registry and the
   (id, width) → height cache; pure data, moved into Core so both are
   unit-testable from `ClientTests` (which links Core only). The height cache
-  is lock-guarded and `@unchecked Sendable`: the coordinator mutates it on
-  the main thread, while the background pre-measurer holds a reference to
-  the session's cache across the task boundary (and stores via a main-actor
-  hop) — the lock makes that sharing safe even if a future path stores
-  off-main.
+  is lock-guarded and `@unchecked Sendable`, its thread-safety exercised by
+  `HeightCacheTests`; the coordinator mutates it on the main thread and never
+  hands it across a task boundary — the off-main pre-measurer works on
+  explicit `Sendable` value structs (`RowMeasureSpec` in, `RowMeasurement`
+  out, see `Client/Views/RowMeasurement.swift`), and the results are stored
+  into the right session's cache (resolved by key) on a main-actor hop. The
+  lock stays as insurance against accidental concurrent use.
 - `TextDiff` / `EditToolArgs` — the pure line diff (prefix/suffix trim +
   bounded LCS, GitHub removed-then-added ordering) and the edit-tool
   arguments decoder behind the tool card's red/green diff view.
@@ -675,15 +677,20 @@ Behavior details that matter:
   reuses its cached heights; only rows whose content genuinely changed
   re-measure (the content tag catches that). Same-session reloads reuse the
   cache too; a font-size change is app-wide and clears every session's cache.
-  ONE measurement function — `entry.measuredHeight(forWidth:)` — feeds both
-  `heightOfRow` (on cache miss) and the visible-cell refresh
-  (`updateVisibleCell`), so the two paths agree by construction. Settled
+  ONE measurement function — `TranscriptText.measuredHeight` — feeds both
+  `heightOfRow` (on cache miss, via `entry.measuredHeight`) and the
+  pre-measurer (via `RowMeasurer`), so the two paths agree by construction.
+  Settled
   rows' heights are ALSO seeded **off the main thread**: when rows enter the
   materialized window (appends, history prepends, post-reload windows,
-  font-size changes), the coordinator schedules a background task that runs
-  the SAME `measuredHeight` (markdown parse + CoreText `boundingRect` — both
+  font-size changes), the coordinator builds a `RowMeasureSpec` per row on
+  the main actor — content + cache tag + session key, all plain `Sendable`
+  values, so the worker never touches the row model, a `HeightCache`, or
+  view state — and schedules a background task that runs the SAME
+  `measuredHeight` (markdown parse + CoreText `boundingRect` — both
   thread-safe; `NSFontManager` is avoided in favor of descriptor trait
-  synthesis) and stores the results into the per-session cache via one
+  synthesis) and stores the results into the session's cache (resolved by
+  key) via one
   main-actor hop, so `heightOfRow` degrades to an O(1) lookup for rows the
   background pass reached before the table asked. A font-size change bumps a
   generation counter that discards in-flight results measured at the old
