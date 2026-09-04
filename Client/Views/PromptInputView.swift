@@ -142,8 +142,14 @@ final class PromptContainerView: NSView {
     /// Small spinner shown while a windowed paste is active.
     let streamingIndicator = NSProgressIndicator()
     /// Dismisses a windowed paste (✕ next to the spinner): empties the input
-    /// and exits windowed mode.
+    /// and exits windowed mode. Undoable — Cmd+Z restores the discarded text.
     let pasteClearButton = NSButton()
+    /// Transient hint shown in the top-right after a discard (Ctrl+C / ✕ /
+    /// Esc-with-paste): the input was cleared and Cmd+Z brings it back.
+    /// Click-through (it floats over the input) and auto-hidden on the next
+    /// edit or after a few seconds. In the same slot the paste spinner uses,
+    /// so a paste can never be active while the hint is visible.
+    let restoreHintLabel = ClickThroughLabel(labelWithString: "")
     let scrollView = NSScrollView()
 
     override init(frame frameRect: NSRect) {
@@ -205,7 +211,7 @@ final class PromptContainerView: NSView {
         textView.setAccessibilityElement(true)
         textView.setAccessibilityRole(.textArea)
         textView.setAccessibilityLabel("Message")
-        textView.setAccessibilityHelp("Enter a message for the agent. Tab completes file paths; Escape aborts the current operation.")
+        textView.setAccessibilityHelp("Enter a message for the agent. Tab completes file paths; Escape aborts the current operation. Control-C clears the input — Command-Z restores it.")
 
         statusLabel.font = .systemFont(ofSize: 10)
         // Very-light-gray readout normally; strengthened under Increase
@@ -232,12 +238,20 @@ final class PromptContainerView: NSView {
         pasteClearButton.contentTintColor = .secondaryLabelColor
         pasteClearButton.isHidden = true
         pasteClearButton.translatesAutoresizingMaskIntoConstraints = false
-        pasteClearButton.toolTip = "Discard the pasted text"
+        pasteClearButton.toolTip = "Discard the pasted text (⌘Z restores it)"
+
+        restoreHintLabel.font = .systemFont(ofSize: 10)
+        restoreHintLabel.textColor = .secondaryLabelColor
+        restoreHintLabel.lineBreakMode = .byTruncatingTail
+        restoreHintLabel.isHidden = true
+        restoreHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        restoreHintLabel.setAccessibilityElement(false)
 
         addSubview(scrollView)
         addSubview(statusLabel)
         addSubview(streamingIndicator)
         addSubview(pasteClearButton)
+        addSubview(restoreHintLabel)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -249,6 +263,8 @@ final class PromptContainerView: NSView {
             streamingIndicator.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             pasteClearButton.trailingAnchor.constraint(equalTo: streamingIndicator.leadingAnchor, constant: -6),
             pasteClearButton.centerYAnchor.constraint(equalTo: streamingIndicator.centerYAnchor),
+            restoreHintLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            restoreHintLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
         ])
         applyInputAppearance()
     }
@@ -281,11 +297,36 @@ final class PromptContainerView: NSView {
 final class PromptTextView: NSTextView {
     weak var promptHandler: PromptCoordinator?
 
+    /// The input's undo manager. `NSTextView`'s own `undoManager` is nil by
+    /// default (nothing is undoable in the input — not even ordinary typing,
+    /// so Cmd+Z was a no-op), so the text view vends a per-instance manager.
+    /// This makes plain typing undoable AND gives the coordinator a stack to
+    /// register discards on: an accidental Ctrl+C / ✕ / Esc-with-windowed-paste
+    /// is undone with Cmd+Z (the discard is registered as a normal undo
+    /// operation that restores the exact prior input state, windowed mode
+    /// included). AppKit has no responder-chain `undo:` handling for plain
+    /// text views, so Cmd+Z / ⇧Cmd+Z are delivered by the coordinator's local
+    /// key monitor while the input is focused (see `installCmdZMonitor`); the
+    /// stack is cleared on submit, on session switch, and when a windowed
+    /// paste begins (see the coordinator).
+    let textUndo = UndoManager()
+
+    override var undoManager: UndoManager? { textUndo }
+
     override func keyDown(with event: NSEvent) {
         if let handler = promptHandler, handler.handleKey(event, in: self) {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+/// An `NSTextField` that never participates in hit-testing, so a label that
+/// floats over the prompt input (the transient "⌘Z restores" hint after a
+/// discard) can never swallow a click meant for the text view underneath.
+final class ClickThroughLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
     }
 }
 
@@ -354,6 +395,18 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// interrupt for the input itself. Deferred to the text view's own Ctrl+C
     /// handling when it has focus, so nothing double-fires.
     private nonisolated(unsafe) var pasteAbortMonitor: Any?
+    /// Local key monitor making Cmd+Z / ⇧Cmd+Z undo / redo the prompt input's
+    /// OWN undo manager while the input is being edited. AppKit routes Cmd+Z
+    /// to a text view only through Edit-menu plumbing (`undo:` on the
+    /// responder chain) that neither NSTextView nor this app implements — a
+    /// plain ⌘Z would be a no-op even with an undo registered, so a Ctrl+C'd
+    /// draft could never be restored. The monitor consumes the key ONLY when
+    /// the prompt input is the first responder, so the discard-restore (Cmd+Z
+    /// after an accidental Ctrl+C / ✕ / Esc-with-paste) and ordinary typing
+    /// undo/redo are deterministic and never double-fire with menu routing
+    /// (a local monitor runs before key equivalents; when the input is not
+    /// focused the event passes through untouched).
+    private nonisolated(unsafe) var cmdZMonitor: Any?
 
     init(
         cwd: URL,
@@ -420,6 +473,9 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         if let pasteAbortMonitor {
             NSEvent.removeMonitor(pasteAbortMonitor)
         }
+        if let cmdZMonitor {
+            NSEvent.removeMonitor(cmdZMonitor)
+        }
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -430,6 +486,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         completionWindow?.parentView = container
         installEscapeMonitor()
         installPasteAbortMonitor()
+        installCmdZMonitor()
         // The view model is already set (from the init), but the `didSet` was
         // skipped there (Swift doesn't run observers during init), so wire the
         // status readout now that the container exists.
@@ -462,20 +519,196 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         }
     }
 
-    /// Discards a windowed paste if one is active (the Ctrl+C / Esc abort
+    /// Discards the windowed paste if one is active (the Ctrl+C / Esc / ✕
     /// paths): empties the input and exits windowed mode. Returns true when a
-    /// paste was active and was cleared. Callers are event handlers and the
-    /// key monitors — never a text-system or layout callback, so the string
-    /// setter here cannot reenter a layout pass.
+    /// paste was active and was cleared. The discard is undoable — Cmd+Z
+    /// restores the full pasted document in windowed mode (see
+    /// `discardInput`). Callers are event handlers and the key monitors —
+    /// never a text-system or layout callback, so the string setter here
+    /// cannot reenter a layout pass.
     @discardableResult
     private func abortWindowedPasteIfAny() -> Bool {
-        guard pasteActive, let textView = container?.textView else { return false }
+        discardInput(onlyWindowedPaste: true)
+    }
+
+    /// The pre-discard state of the input, captured so an accidental discard
+    /// can be undone EXACTLY: a windowed paste is restored in full windowed
+    /// mode (store + window + viewport), an ordinary draft as plain text.
+    private struct DiscardSnapshot {
+        var sessionID: UUID?
+        var windowed: Bool
+        var fullText: String?        // the windowed-paste store
+        var windowStart: Int         // the window's offset into the store
+        var plainText: String        // the ordinary draft
+        var topVisibleOffset: CGFloat // document Y of the viewport top
+    }
+
+    /// Discards the current input — a windowed paste (`onlyWindowedPaste`
+    /// true, or plain Ctrl+C / Esc / ✕ while one is active) or, with
+    /// `onlyWindowedPaste` false, an ordinary draft (in-focus Ctrl+C, the
+    /// terminal-style interrupt). The prior state is registered on the input's
+    /// undo manager BEFORE the clear, so Cmd+Z restores it exactly — an
+    /// accidental Ctrl+C is never destructive. The restore registers its own
+    /// inverse, so Cmd+Shift+Z redoes the clear; and a short "⌘Z restores"
+    /// hint is shown while the input stays empty.
+    ///
+    /// Never called from a text-system or layout callback: the clear mutates
+    /// the storage, which must not happen reentrantly inside one (the
+    /// windowed-paste safety rules). Event handlers and key monitors only.
+    @discardableResult
+    private func discardInput(onlyWindowedPaste: Bool) -> Bool {
+        guard let container else { return false }
+        let textView = container.textView
+        let windowed = pasteActive
+        if windowed {
+            guard pasteFullText != nil else { return false }
+        } else if onlyWindowedPaste || textView.string.isEmpty {
+            return false
+        }
+        // Close any open typing-undo group FIRST: NSTextView coalesces
+        // keystrokes into one undo group until it breaks, and a discard
+        // landing inside that group would undo the typed characters together
+        // with the restore — the typing inverse then deletes from the
+        // restored text by stale ranges. Own event, own group, own undo.
+        textView.breakUndoCoalescing()
+        if let snapshot = inputSnapshot(), let undo = textView.undoManager {
+            undo.registerUndo(withTarget: self) { target in
+                target.restoreDiscardedInput(snapshot)
+            }
+            undo.setActionName("Discard Input")
+        }
+        // Empty the input and exit windowed mode.
         textView.string = ""
-        clearPasteWindow()
+        if windowed { clearPasteWindow() }
         onDraftChange("")
         lastMirroredDraft = ""
         onContentHeightChange(0)
+        showRestoreHint(windowed: windowed)
         return true
+    }
+
+    /// Captures the input's current state for undo (see `DiscardSnapshot`).
+    private func inputSnapshot() -> DiscardSnapshot? {
+        guard let container else { return nil }
+        let textView = container.textView
+        if pasteActive, let full = pasteFullText {
+            return DiscardSnapshot(
+                sessionID: sessionID,
+                windowed: true,
+                fullText: full,
+                windowStart: pasteWindowStart,
+                plainText: "",
+                topVisibleOffset: container.scrollView.contentView.bounds.minY
+            )
+        }
+        return DiscardSnapshot(
+            sessionID: sessionID,
+            windowed: false,
+            fullText: nil,
+            windowStart: 0,
+            plainText: textView.string,
+            topVisibleOffset: container.scrollView.contentView.bounds.minY
+        )
+    }
+
+    /// Undo target of a discard (Cmd+Z): restores the input exactly as it was
+    /// before the clear — an ordinary draft, or full windowed-paste mode with
+    /// the store, the window, and the viewport position. Registers the
+    /// inverse (a fresh discard) so Cmd+Shift+Z redoes the clear. Runs on the
+    /// main thread from the undo manager in response to a key event — never
+    /// from a text-system or layout callback.
+    private func restoreDiscardedInput(_ snapshot: DiscardSnapshot) {
+        guard snapshot.sessionID == sessionID, let container else { return }
+        let textView = container.textView
+        dismissCompletion()
+        hideRestoreHint()
+        container.window?.makeFirstResponder(textView)
+        if snapshot.windowed, let full = snapshot.fullText {
+            // Re-enter windowed mode with the same store and window.
+            let window = StreamedPaste.windowText(fullText: full, windowStart: snapshot.windowStart, budget: Self.pasteWindowBudget)
+            pasteFullText = full
+            pasteWindowStart = snapshot.windowStart
+            pasteActive = true
+            updateEditableState()
+            textView.textStorage?.setAttributedString(NSAttributedString(string: window))
+            textView.setSelectedRange(NSRange(location: (window as NSString).length, length: 0))
+            restoreScroll(to: snapshot.topVisibleOffset)
+            let mirrored = full
+            onDraftChange(mirrored)
+            lastMirroredDraft = mirrored
+            onContentHeightChange(PromptBarMetrics.maxHeight)
+            updateStreamingIndicator()
+        } else {
+            textView.string = snapshot.plainText
+            textView.setSelectedRange(NSRange(location: (snapshot.plainText as NSString).length, length: 0))
+            restoreScroll(to: snapshot.topVisibleOffset)
+            onDraftChange(snapshot.plainText)
+            lastMirroredDraft = snapshot.plainText
+            onContentHeightChange(contentHeight(of: textView))
+        }
+        if let undo = textView.undoManager {
+            undo.registerUndo(withTarget: self) { target in
+                target.discardInput(onlyWindowedPaste: snapshot.windowed)
+            }
+            undo.setActionName("Discard Input")
+        }
+    }
+
+    /// Restores the viewport to the document Y the user was looking at before
+    /// the discard. Best effort: the restored content lays out identically
+    /// (same store, same window, same width), so the recorded offset is valid;
+    /// it is clamped to the laid-out document. The text view's frame is grown
+    /// to the content first — a programmatic storage set does not resize a
+    /// vertically-resizable text view synchronously, and without the full
+    /// document the clip view cannot scroll to the offset. The scroll-driven
+    /// paste-window slide is suppressed afterwards (the same cooldown the
+    /// slide itself uses) so re-seeding at an edge cannot immediately page
+    /// away from the restored position.
+    private func restoreScroll(to offset: CGFloat) {
+        guard let container else { return }
+        let textView = container.textView
+        let scrollView = container.scrollView
+        guard let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let contentHeight = layoutManager.usedRect(for: textContainer).height + textView.textContainerInset.height * 2
+        if textView.frame.height < contentHeight {
+            var frame = textView.frame
+            frame.size.height = contentHeight
+            textView.frame = frame
+        }
+        let visibleHeight = scrollView.contentView.bounds.height
+        let target = min(max(0, offset), max(0, contentHeight - visibleHeight))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        lastSlideTime = ProcessInfo.processInfo.systemUptime
+    }
+
+    /// The auto-hide task for the transient "⌘Z restores" hint.
+    private var hintHideWorkItem: DispatchWorkItem?
+
+    /// Shows the hint that a discard is undoable with Cmd+Z, top-right inside
+    /// the input (the slot the paste spinner uses — a paste cannot be active
+    /// while the hint is up). Auto-hides after a few seconds; any subsequent
+    /// edit hides it too (the user moved on), and submit / session switch
+    /// clear it along with the undo stack.
+    private func showRestoreHint(windowed: Bool) {
+        guard let container else { return }
+        container.restoreHintLabel.stringValue = windowed
+            ? "Paste discarded · ⌘Z to undo"
+            : "Input cleared · ⌘Z to undo"
+        container.restoreHintLabel.isHidden = false
+        hintHideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.hideRestoreHint()
+        }
+        hintHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    private func hideRestoreHint() {
+        hintHideWorkItem?.cancel()
+        hintHideWorkItem = nil
+        container?.restoreHintLabel.isHidden = true
     }
 
     /// Called when the representable is re-targeted to a different session
@@ -488,6 +721,13 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// upward (the reused text view keeps first responder across the switch).
     func prepareForSessionSwitch(draft: String, in container: PromptContainerView) {
         dismissCompletion()
+        hideRestoreHint()
+        // The previous session's input history must not leak into the new
+        // session's input: close the typing group and drop the WHOLE undo
+        // stack (typed text AND any registered discard-restore) — undoing
+        // across a session switch would resurrect another session's text.
+        container.textView.breakUndoCoalescing()
+        container.textView.undoManager?.removeAllActions()
         if pasteActive {
             container.textView.string = ""
             clearPasteWindow()
@@ -545,8 +785,9 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// terminal-style interrupt for the input itself (clears the draft / drops
     /// the paste), so from non-editing focus it only ever discards a windowed
     /// paste — never aborts the turn and never clears a draft the user is not
-    /// looking at. Deferred to the text view's own Ctrl+C handling when the
-    /// prompt input has focus, so nothing double-fires.
+    /// looking at. The discard is undoable (Cmd+Z restores it — see
+    /// `discardInput`). Deferred to the text view's own Ctrl+C handling when
+    /// the prompt input has focus, so nothing double-fires.
     private func installPasteAbortMonitor() {
         pasteAbortMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.keyCode == 8, // C
@@ -564,6 +805,42 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             }
             let cleared = self.abortWindowedPasteIfAny()
             return cleared ? nil : event
+        }
+    }
+
+    /// Local key monitor making Cmd+Z / ⇧Cmd+Z undo / redo the prompt input's
+    /// own undo manager while the input is being edited — see `cmdZMonitor`.
+    /// Cmd+Z after an accidental Ctrl+C / ✕ / Esc-with-paste pops the
+    /// discard-restore registered by `discardInput` and restores the input
+    /// exactly; ⇧Cmd+Z redoes the clear. When the input has nothing to
+    /// undo/redo, or focus is elsewhere, the event passes through untouched
+    /// (menus, other responders).
+    private func installCmdZMonitor() {
+        cmdZMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard event.keyCode == 6, // Z
+                  event.modifierFlags.contains(.command),
+                  !event.modifierFlags.contains(.control),
+                  !event.modifierFlags.contains(.option) else { return event }
+            guard let self, let container = self.container, let window = container.window else { return event }
+            // Window not front (or a sheet is up): let the key window handle it.
+            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
+            // A visible popup-menu-level window (a dropdown / the completion
+            // list) is tracking: don't steal the key from it.
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
+            // Only while the prompt input itself is being edited: undo/redo is
+            // scoped to the focused input, exactly like a text field's.
+            guard let editor = window.firstResponder as? NSTextView, editor === container.textView else { return event }
+            guard let undo = editor.undoManager else { return event }
+            let wantsRedo = event.modifierFlags.contains(.shift)
+            if wantsRedo ? undo.canRedo : undo.canUndo {
+                if wantsRedo {
+                    undo.redo()
+                } else {
+                    undo.undo()
+                }
+                return nil
+            }
+            return event
         }
     }
 
@@ -630,11 +907,13 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             // draft is the FULL pasted document — clearing it must also exit
             // windowed mode (spinner off, input editable again), or the
             // spinner would keep running and Enter would still submit the
-            // discarded paste.
+            // discarded paste. Both clears are undoable: the prior input state
+            // is registered on the undo manager first, so Cmd+Z restores it
+            // exactly (windowed mode included) — an accidental Ctrl+C is
+            // never destructive.
             if event.modifierFlags.contains(.control), !event.modifierFlags.contains(.command) {
                 if !abortWindowedPasteIfAny() {
-                    textView.string = ""
-                    onDraftChange("")
+                    discardInput(onlyWindowedPaste: false)
                 }
                 return true
             }
@@ -787,6 +1066,12 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
         onDraftChange("")
         lastMirroredDraft = ""
+        hideRestoreHint()
+        // The prompt was sent: clear the undo stack. The text is gone for
+        // good (it was submitted), so Cmd+Z must not resurrect it into a
+        // re-send; typing undo resumes fresh on the next edit.
+        textView.breakUndoCoalescing()
+        textView.undoManager?.removeAllActions()
         // The prompt cleared: report an empty content height so the bar snaps
         // back to its minimum (unless the user has pinned it).
         onContentHeightChange(0)
@@ -847,6 +1132,12 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     private func beginWindowedPaste(prefix: String, suffix: String, replacement: String, in textView: NSTextView) {
         guard let storage = textView.textStorage else { return }
         dismissCompletion()
+        // The input's content is replaced by a window of the paste store:
+        // drop the undo history (close any typing group first) — the old
+        // text's typing undo operations carry stale character ranges that
+        // would corrupt the windowed slice if Cmd+Z were pressed mid-paste.
+        textView.breakUndoCoalescing()
+        textView.undoManager?.removeAllActions()
         let full = prefix + replacement + suffix
 
         let start = StreamedPaste.initialWindowStart(
@@ -1011,14 +1302,14 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     }
 
     /// Dismisses a windowed paste (the ✕ next to the spinner): empties the
-    /// input and exits windowed mode.
+    /// input and exits windowed mode. Undoable — Cmd+Z restores the full
+    /// pasted document in windowed mode (the ✕ is an easy misclick), so focus
+    /// returns to the input where Cmd+Z lands on its undo manager.
     @objc private func clearPasteButtonClicked() {
-        guard pasteActive, let textView = container?.textView else { return }
-        textView.string = ""
-        clearPasteWindow()
-        onDraftChange("")
-        lastMirroredDraft = ""
-        onContentHeightChange(0)
+        guard pasteActive else { return }
+        if discardInput(onlyWindowedPaste: true), let window = container?.window, let textView = container?.textView {
+            window.makeFirstResponder(textView)
+        }
     }
 
     // MARK: - NSTextViewDelegate
@@ -1070,6 +1361,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
                 // report. The draft already holds the full store.
                 return
             }
+            // Any edit means the user has moved on — drop the "⌘Z restores"
+            // hint (a typing undo also lands here and re-hides it, which is
+            // fine: the hint was about the discard, not the typing).
+            hideRestoreHint()
             textView.scrollRangeToVisible(textView.selectedRange())
             // Mirror the draft up so "edit queued steering" can restore it.
             // The same String value feeds onDraftChange and

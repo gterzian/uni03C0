@@ -536,6 +536,33 @@ concurrency.
     through `abortWindowedPasteIfAny`, which empties the input, exits
     windowed mode, and reports the height reset — a paste that stays
     windowed silently keeps its store and submits on Enter.
+  - **Every discard is undoable (⌘Z).** `PromptTextView` vends a real
+    per-instance undo manager (`NSTextView`'s own `undoManager` is nil by
+    default, so nothing in the input was undoable before — not even typing,
+    Cmd+Z was a no-op). An accidental Ctrl+C / ✕ / Esc-with-paste is never
+    destructive: `discardInput` snapshots the input state FIRST and registers
+    it as an undo operation, so Cmd+Z restores it exactly — an ordinary
+    draft as text, a windowed paste in FULL windowed mode (store + window +
+    viewport position, spinner + ✕ back). The restore registers its own
+    inverse so Cmd+Shift+Z redoes the clear, and a transient top-right
+    "⌘Z to undo" hint (click-through, auto-hidden on the next edit or after
+    ~4s) makes the recovery discoverable. AppKit has no responder-chain
+    `undo:` handling for plain text views (even stock NSTextFields don't
+    respond to it — the Edit menu item auto-disables), so ⌘Z / ⇧⌘Z are
+    delivered by a LOCAL KEY MONITOR like the Esc/Ctrl+C ones: it undoes /
+    redoes the input's own manager only while the input is the first
+    responder, and passes the event through otherwise (no double-firing with
+    menu routing — the monitor runs before key equivalents). Three invariants
+    keep the undo stack honest: NSTextView coalesces keystrokes into one undo
+    group until it breaks, so `discardInput` calls `breakUndoCoalescing()`
+    first — a discard landing INSIDE the open typing group would undo typed
+    characters together with the restore (the typing inverse then deletes
+    from restored text by stale ranges); and the stack is cleared on submit
+    (the text was sent, Cmd+Z must not resurrect it into a re-send), on
+    session switch (`prepareForSessionSwitch` — undo must never cross
+    sessions), and when a windowed paste begins (`beginWindowedPaste` — the
+    old text's typing-undo ops carry stale ranges that would corrupt the
+    windowed slice).
 - `FontSettings` / `FontSizeCommands` — app-wide conversation font size
   (View → Font Size menu, persisted). `TranscriptText` and the prompt bar
   read it; the transcript coordinator observes the change, clears every
