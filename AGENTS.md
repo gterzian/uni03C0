@@ -546,11 +546,16 @@ concurrency.
     viewport position, spinner + ✕ back). The restore registers its own
     inverse so Cmd+Shift+Z redoes the clear, and a transient top-right
     "⌘Z to undo" hint (click-through, auto-hidden on the next edit or after
-    ~4s) makes the recovery discoverable. AppKit has no responder-chain
-    `undo:` handling for plain text views (even stock NSTextFields don't
-    respond to it — the Edit menu item auto-disables), so ⌘Z / ⇧⌘Z are
-    delivered by a LOCAL KEY MONITOR like the Esc/Ctrl+C ones: it undoes /
-    redoes the input's own manager only while the input is the first
+    ~4s) makes the recovery discoverable. AppKit declares no public
+    `undo:`/`redo:` responder action — not even stock NSTextViews answer the
+    Edit menu's nil-targeted Undo/Redo items, so they used to auto-disable —
+    hence `PromptTextView` implements `undo:`/`redo:` plus both validation
+    overrides itself: while the input is the first responder the Edit-menu
+    items resolve to it, enable/disable from `canUndo`/`canRedo`, and perform
+    the same undo/redo as the keyboard (see `PromptInputView.swift`). The
+    ⌘Z / ⇧⌘Z LOCAL KEY MONITOR (like the Esc/Ctrl+C ones) remains the
+    primary key path: it undoes / redoes the input's own manager only while
+    the input is the first
     responder, and passes the event through otherwise (no double-firing with
     menu routing — the monitor runs before key equivalents). Three invariants
     keep the undo stack honest: NSTextView coalesces keystrokes into one undo

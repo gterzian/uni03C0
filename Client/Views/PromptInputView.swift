@@ -304,14 +304,62 @@ final class PromptTextView: NSTextView {
     /// register discards on: an accidental Ctrl+C / ✕ / Esc-with-windowed-paste
     /// is undone with Cmd+Z (the discard is registered as a normal undo
     /// operation that restores the exact prior input state, windowed mode
-    /// included). AppKit has no responder-chain `undo:` handling for plain
-    /// text views, so Cmd+Z / ⇧Cmd+Z are delivered by the coordinator's local
-    /// key monitor while the input is focused (see `installCmdZMonitor`); the
-    /// stack is cleared on submit, on session switch, and when a windowed
-    /// paste begins (see the coordinator).
+    /// included). AppKit declares no public `undo:`/`redo:` responder action
+    /// (see `undo(_:)` below), so Cmd+Z / ⇧Cmd+Z are delivered by the
+    /// coordinator's local key monitor while the input is focused (see
+    /// `installCmdZMonitor`); the stack is cleared on submit, on session
+    /// switch, and when a windowed paste begins (see the coordinator).
     let textUndo = UndoManager()
 
     override var undoManager: UndoManager? { textUndo }
+
+    // MARK: - Edit-menu undo/redo (responder chain)
+
+    /// AppKit declares `cut:`/`copy:`/`paste:`/`selectAll:` on `NSText`, so a
+    /// focused text view answers those standard Edit-menu items — but NO
+    /// public AppKit class declares `undo:`/`redo:`, so a plain `NSTextView`
+    /// never answers the Edit menu's nil-targeted Undo/Redo items and they
+    /// auto-disable even while the input has a full undo stack (keyboard ⌘Z
+    /// worked only through the coordinator's local key monitor). These two
+    /// actions make the INPUT answer the responder chain like any other
+    /// editing command: while the input is the first responder, Edit ▸ Undo /
+    /// Redo resolve here, validate from `textUndo` (see below), and perform
+    /// the exact same undo/redo the ⌘Z monitor drives — a discard registered
+    /// on `textUndo` is restored from the menu just as from the keyboard.
+    /// When focus is elsewhere no responder answers `undo:`/`redo:`, and the
+    /// items disable — the standard text-field semantics.
+    @objc func undo(_ sender: Any?) {
+        textUndo.undo()
+    }
+
+    @objc func redo(_ sender: Any?) {
+        textUndo.redo()
+    }
+
+    /// Enables/disables the standard Edit-menu Undo/Redo items while the
+    /// input is focused. `NSTextView` conforms to BOTH validation protocols
+    /// (`NSUserInterfaceValidations` and `NSMenuItemValidation`), and AppKit
+    /// consults one of them per item against the resolved target, so
+    /// intercept undo/redo in each and defer everything else (cut/copy/
+    /// paste/selectAll…) to NSTextView's own validation. The local ⌘Z monitor
+    /// consumes the keys before menu-key-equivalent dispatch when the input is
+    /// focused, so these run from a menu CLICK (no double-fire: a click is not
+    /// a key event the monitor sees).
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        switch item.action {
+        case #selector(undo(_:)): return textUndo.canUndo
+        case #selector(redo(_:)): return textUndo.canRedo
+        default: return super.validateUserInterfaceItem(item)
+        }
+    }
+
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(undo(_:)): return textUndo.canUndo
+        case #selector(redo(_:)): return textUndo.canRedo
+        default: return super.validateMenuItem(menuItem)
+        }
+    }
 
     override func keyDown(with event: NSEvent) {
         if let handler = promptHandler, handler.handleKey(event, in: self) {
@@ -396,16 +444,16 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// handling when it has focus, so nothing double-fires.
     private nonisolated(unsafe) var pasteAbortMonitor: Any?
     /// Local key monitor making Cmd+Z / ⇧Cmd+Z undo / redo the prompt input's
-    /// OWN undo manager while the input is being edited. AppKit routes Cmd+Z
-    /// to a text view only through Edit-menu plumbing (`undo:` on the
-    /// responder chain) that neither NSTextView nor this app implements — a
-    /// plain ⌘Z would be a no-op even with an undo registered, so a Ctrl+C'd
-    /// draft could never be restored. The monitor consumes the key ONLY when
-    /// the prompt input is the first responder, so the discard-restore (Cmd+Z
-    /// after an accidental Ctrl+C / ✕ / Esc-with-paste) and ordinary typing
-    /// undo/redo are deterministic and never double-fire with menu routing
-    /// (a local monitor runs before key equivalents; when the input is not
-    /// focused the event passes through untouched).
+    /// OWN undo manager while the input is being edited — the deterministic
+    /// key path (a plain ⌘Z would otherwise be a no-op: see `PromptTextView`'s
+    /// `undo(_:)` for why AppKit has no responder-chain `undo:` handling). The
+    /// monitor consumes the key ONLY when the prompt input is the first
+    /// responder, so the discard-restore (Cmd+Z after an accidental Ctrl+C, ✕
+    /// or Esc-with-paste) and ordinary typing undo/redo are deterministic and
+    /// never double-fire with menu routing (a local monitor runs before key
+    /// equivalents; when the input is not focused the event passes through
+    /// untouched, and the Edit-menu Undo/Redo items handle a click via
+    /// `PromptTextView`'s responder-chain `undo:`/`redo:`).
     private nonisolated(unsafe) var cmdZMonitor: Any?
 
     init(
