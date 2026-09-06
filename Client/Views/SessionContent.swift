@@ -25,57 +25,28 @@ struct SessionContent: View {
     var body: some View {
         let vm = tab.viewModel
         VStack(spacing: 0) {
+            // Both pages stay mounted so switching between them is a pure
+            // visibility flip, never a rebuild:
+            //  - The transcript must NOT be torn down on a page switch: a
+            //    re-created transcript used to show a blank conversation until
+            //    a tab switch forced a reload (the reported bug). It stays
+            //    alive and hidden while the Files page is up; `isPageActive`
+            //    gates its per-delta work (zero while hidden, one catch-up
+            //    pass on return — the occlusion machinery).
+            //  - The file browser is kept alive the same way so its state
+            //    (expansion, selection) survives page switches, and its warm
+            //    listing starts as soon as the session does; it defers its git
+            //    refreshes while hidden behind the conversation.
             ZStack {
-                TranscriptView(viewModel: vm)
-                    .background(Color(nsColor: .textBackgroundColor))
-                if vm.isReloading {
-                    // In-app spinner while the store rebuilds the whole
-                    // history off the main thread (no system beachball).
-                    // AppKit spinner (see `SpinnerView`), never SwiftUI's
-                    // animated `ProgressView` — this overlay sits inside the
-                    // window content hosting view, so a SwiftUI spinner would
-                    // keep the whole shell graph invalidating per frame for
-                    // the entire rebuild.
-                    HStack(spacing: 6) {
-                        SpinnerView()
-                        Text("Reloading session…")
-                            .font(.system(size: 11))
-                    }
-                    .padding(12)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                }
-                if vm.isFetchingOlder {
-                    // Small spinner pinned to the top of the conversation
-                    // while the coordinator fetches a block of older
-                    // history (scrolling up). AppKit spinner, as above.
-                    VStack {
-                        SpinnerView()
-                            .padding(6)
-                            .background(.regularMaterial, in: Capsule())
-                        Spacer()
-                    }
-                    .padding(.top, 8)
-                    .frame(maxWidth: .infinity, alignment: .center)
-                }
-                // The session-bound command shortcuts (Cmd+F find, Cmd+G /
-                // Shift+Cmd+G cycling, Cmd+R reload) are handled by the
-                // transcript coordinator's local key monitor, which reads the
-                // ACTIVE tab's view model at event time — hidden SwiftUI
-                // shortcut buttons captured the first tab's vm and kept firing
-                // it after a tab switch. Only app-wide shortcuts (no per-tab
-                // state) stay here. The find bar itself lives in the window
-                // toolbar, left of the Stop button — never over the transcript,
-                // so it can't block content.
-                // Cmd+= increases the conversation font — Apple lists
-                // Command-= as equivalent to Shift-Command-+ for "increase
-                // size" (the View menu carries the visible item).
-                Button("") {
-                    FontSettings.shared.bodySize = min(FontSettings.shared.bodySize + 1, 28)
-                }
-                    .keyboardShortcut("=", modifiers: .command)
-                    .opacity(0)
-                    .frame(width: 0, height: 0)
-                    .accessibilityHidden(true)
+                conversationPage
+                    .opacity(tab.page == .conversation ? 1 : 0)
+                    .allowsHitTesting(tab.page == .conversation)
+                    .accessibilityHidden(tab.page != .conversation)
+                FileBrowserView(store: tab.fileBrowser)
+                    .id(tab.id)
+                    .opacity(tab.page == .files ? 1 : 0)
+                    .allowsHitTesting(tab.page == .files)
+                    .accessibilityHidden(tab.page != .files)
             }
 
             Divider()
@@ -138,6 +109,69 @@ struct SessionContent: View {
                 AccessibilityNotification.Announcement(Announcements.disconnected(message)).post()
             }
         }
+    }
+
+    /// The conversation page: transcript (AppKit) + its in-page overlays.
+    /// Kept mounted across page switches (hidden while the Files page is up)
+    /// so the transcript's coordinator, per-session height caches, and scroll
+    /// position survive — rebuilding it per switch was the blank-transcript
+    /// bug (a fresh table was never told to render already-stored rows until a
+    /// tab switch forced a reload).
+    private var conversationPage: some View {
+        let vm = tab.viewModel
+        return ZStack {
+            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation)
+                .background(Color(nsColor: .textBackgroundColor))
+            if vm.isReloading {
+                // In-app spinner while the store rebuilds the whole
+                // history off the main thread (no system beachball).
+                // AppKit spinner (see `SpinnerView`), never SwiftUI's
+                // animated `ProgressView` — this overlay sits inside the
+                // window content hosting view, so a SwiftUI spinner would
+                // keep the whole shell graph invalidating per frame for
+                // the entire rebuild.
+                HStack(spacing: 6) {
+                    SpinnerView()
+                    Text("Reloading session…")
+                        .font(.system(size: 11))
+                }
+                .padding(12)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            }
+            if vm.isFetchingOlder {
+                // Small spinner pinned to the top of the conversation
+                // while the coordinator fetches a block of older
+                // history (scrolling up). AppKit spinner, as above.
+                VStack {
+                    SpinnerView()
+                        .padding(6)
+                        .background(.regularMaterial, in: Capsule())
+                    Spacer()
+                }
+                .padding(.top, 8)
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            // The session-bound command shortcuts (Cmd+F find, Cmd+G /
+            // Shift+Cmd+G cycling, Cmd+R reload) are handled by the
+            // transcript coordinator's local key monitor, which reads the
+            // ACTIVE tab's view model at event time — hidden SwiftUI
+            // shortcut buttons captured the first tab's vm and kept firing
+            // it after a tab switch. Only app-wide shortcuts (no per-tab
+            // state) stay here. The find bar itself lives in the window
+            // toolbar, left of the Stop button — never over the transcript,
+            // so it can't block content.
+            // Cmd+= increases the conversation font — Apple lists
+            // Command-= as equivalent to Shift-Command-+ for "increase
+            // size" (the View menu carries the visible item).
+            Button("") {
+                FontSettings.shared.bodySize = min(FontSettings.shared.bodySize + 1, 28)
+            }
+            .keyboardShortcut("=", modifiers: .command)
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func inputEnabled(_ vm: SessionViewModel) -> Bool {

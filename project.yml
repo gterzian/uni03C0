@@ -21,6 +21,9 @@ packages:
   Subprocess:
     url: https://github.com/swiftlang/swift-subprocess
     from: "1.0.0"
+  Highlightr:
+    url: https://github.com/raspu/Highlightr
+    from: "2.1.0"
 targets:
   Core:
     type: framework
@@ -57,6 +60,8 @@ targets:
       - target: SandboxLauncher
       - package: Subprocess
         product: Subprocess
+      - package: Highlightr
+        product: Highlightr
     postCompileScripts:
       - name: Copy sandbox launcher into the app bundle
         script: |
@@ -94,6 +99,7 @@ targets:
       - Client/Views/MarkdownText.swift
       - Client/Views/TextRowView.swift
       - Client/Views/CodeCopyButton.swift
+      - Client/Views/ReadOnlyCodeTextView.swift
       - Client/Accessibility/DisplayOptions.swift
       - Client/Support/FontSettings.swift
       - RenderingTests

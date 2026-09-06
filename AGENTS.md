@@ -432,6 +432,12 @@ concurrency.
 - `TextDiff` / `EditToolArgs` — the pure line diff (prefix/suffix trim +
   bounded LCS, GitHub removed-then-added ordering) and the edit-tool
   arguments decoder behind the tool card's red/green diff view.
+- `GitStatus` / `CodeReference` / `RelativePath` — the git plumbing and
+  reference model behind the file browser: read-only git subprocesses
+  (`ls-files` + porcelain classification — two calls, never per-file diffs at
+  listing time), the copied `path:line` reference payload, and relative-path
+  math. All pure/async — no AppKit. Per-file content (HEAD side, diff) is
+  read on demand in the Client pane, never during a listing.
 - `StreamedPaste` — pure head/tail + chunk splitting for streaming very large
   pastes into the prompt input (surrogate-safe boundaries).
 - `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
@@ -473,14 +479,29 @@ concurrency.
   beside the icon, a "choose model/thinking level" prompt until one is
   set), and Resume. The live status readout (context %, model, thinking
   level) sits in the prompt bar, not the toolbar. Sending a prompt is
-  disabled until both a model and a thinking level have been chosen.
-- `SessionTab` — one tab's state: owns its `SessionViewModel` plus the
-  per-session UI bits (recent sessions, history sheet, prompt draft).
-- `SessionContent` / `SessionToolbar` — the shared session UI: transcript +
-  prompt bar + queued-steering banner, and the toolbar items, both bound to
-  whichever session owns them.
+  disabled until both a model and a thinking level have been chosen. Under
+  the active outer tab the panel shows that session's NESTED page tabs —
+  Session / Files — so the conversation/file-browser choice reads as
+  navigation within the top-level tab (see *Session pages and the file
+  browser* below).
+- `SessionTab` — one tab's state: owns its `SessionViewModel` (conversation)
+  and its `FileBrowserStore` (files — the file-side transcript store), plus
+  the per-session UI bits (recent sessions, history sheet, prompt draft, the
+  nested page choice `page`).
+- `SessionContent` / `SessionToolbar` — the shared session UI: both pages
+  (conversation + Files) stay MOUNTED and are swapped by visibility, never by
+  rebuild; plus the prompt bar + queued-steering banner, and the toolbar
+  items. See *Session pages and the file browser* below.
 - `TranscriptView` + `Coordinator` — the `NSTableView` transcript. See the
   transcript section below.
+- `FileBrowserStore` — the file browser's data store: session-owned like
+  `TranscriptStore`, all file processing off the main thread, immutable
+  snapshots, self-refreshing on agent file changes. See *Session pages and
+  the file browser* below.
+- `FileBrowserView` / `ReadOnlyFilePane` — the Files page: a thin view over
+  the store — a virtualized `NSTableView` tree over a memoized row list, and
+  a per-selection lazy content pane. See *Session pages and the file
+  browser* below.
 - `TextRowView` / `ToolCallCardView` — cells.
 - `TranscriptText` — the single source of truth for styling **and**
   measurement, so measured height exactly matches rendered height.
@@ -922,6 +943,164 @@ touching the markdown renderer or the transcript rows.
   cross-turn "large miss" detection is working as designed — the miss is
   real on the provider side, not an app-data artifact.
 
+## Session pages and the file browser (the second load-bearing part)
+
+The Files page obeys the same rule as the transcript: **rendering cost is a
+function of what is on screen, never of the project size** — a large project
+must open, browse, refresh, and stream like a small one — and the
+Session/Files switch must never rebuild the conversation. The file browser is
+the transcript pattern applied to a second data source: a session-owned store
+that processes everything off the main thread, and a thin view that renders
+only what it needs.
+
+### The page model (Session / Files)
+
+- Each session tab has a nested page choice (`SessionPage`: `.conversation` /
+  `.files`) switched by the **nested page tabs in the tab panel** — directly
+  under the ACTIVE outer tab's pill (`SessionTabsView.nestedPageTabs`) — so
+  the choice reads as navigation *within* the top-level tab, not a second
+  global level. The Files tab carries the edited-file count
+  (`SessionTab.gitChangeCount`), the review gate. The page choice persists
+  per outer tab (`SessionTab.page`).
+- **Both pages stay mounted** under the active outer tab, stacked in a ZStack
+  (`SessionContent`), and a page switch is a pure visibility flip
+  (opacity + allowsHitTesting + accessibilityHidden) — NEVER a rebuild.
+  Tearing the transcript down on a page switch was the blank-conversation
+  bug: a re-created coordinator whose store already had rows was never told
+  to render them (no reloadData/insertRows), so the conversation stayed blank
+  until a tab switch forced a reload. Keep-mounted also preserves the file
+  browser's view state (expansion, selection).
+- **The inactive page does zero per-delta work.** While Files is up the
+  transcript stays mounted but hidden, gated by `Coordinator.pageActive` (an
+  input on the `TranscriptView` representable → `setPageActive`):
+  `applyModelChanges` bails like occlusion and records `needsCatchUp`;
+  returning to the conversation page runs ONE catch-up pass
+  (unconditionally — `applyModelChanges` is cheap when idle). The
+  transcript's window key monitors are page-gated too, so
+  Cmd+F/Cmd+G/Cmd+Up/Down/arrows never act on an invisible conversation and
+  the arrow keys reach the file list.
+- **`SessionContent` is reused across outer-tab switches; the transcript
+  representable has NO `.id`** — its single coordinator is REBOUND
+  (`updateNSView` → `rebind`), preserving per-session windows, height caches,
+  and scroll positions. The Files view IS `.id`-keyed per tab: its `@State`
+  (expansion, selection) belongs to that tab's store and must reset on a
+  switch. If you add `.id` to a representable you are choosing per-instance
+  state over reuse — do it only when the view truly cannot be rebound.
+
+### The file-browser store (the file-side transcript store)
+
+`FileBrowserStore` (Client/Support/FileBrowserStore.swift) mirrors
+`TranscriptStore` and the same shape applies: **the session owns the data and
+all processing; a thin main-actor view reads finished snapshots and renders
+only what it needs.**
+
+- Session-owned (`SessionTab.fileBrowser`), lives for the tab, **warms at
+  session start** (`scheduleRefresh(immediate:)` in `SessionTab.start`) and
+  **refreshes itself** whenever the agent touches files — it subscribes to
+  `GitStatus.didChangeNotification` (debounced 350ms) whether or not the
+  Files page is shown. `stop()` on tab close. The view is ephemeral; the
+  store is not.
+- `refresh()` runs the git listing (`GitStatus.classify`), the by-path index,
+  the directory set, and the WHOLE tree build inside `FileTreeBuilder.build`
+  — a `nonisolated` builder awaited from a detached task — then swaps ONE
+  immutable `FileTreeSnapshot` on the main actor and bumps `version`. The
+  store is `@Observable`, so reading views re-render on the swap. A cancelled
+  refresh leaves the previous snapshot intact.
+- **Tree nodes are CLASSES** (`FileTreeNode`, immutable, Sendable). A
+  value-type node with a `children` array deep-copies its entire subtree into
+  every flattened row — the ~800MB/multi-second-stall failure below.
+
+### The Files view (thin)
+
+- The tree is a virtualized AppKit `NSTableView` (`FileTreeTable` +
+  `FileTreeCoordinator`), NOT a SwiftUI `List` — a List over a large project's
+  rows diffs and constructs every row on the main thread when the page opens
+  (the sampled beachball). Only visible rows are materialized; cells are
+  recycled and hand-framed (`FileTreeRowView`, no autolayout per cell).
+- The flattened row list is **memoized on (store version, expansion)** and is
+  a list of node REFERENCES (class nodes → O(rows), no copies); a body
+  re-evaluation that changes neither is O(1), so selection clicks and
+  spurious re-renders never re-flatten. The table reloads only when its row
+  keys actually changed and preserves the scroll position across refreshes.
+- **First-load auto-expand is capped** (`autoExpandFileLimit`, 3000 files):
+  small/medium projects open fully expanded (the review surface); larger
+  projects open collapsed at the top level. A giant auto-expanded tree is not
+  a useful review surface, and a small default row list bounds the flatten
+  and the table's change detection for the life of the session.
+- Row tinting is by coarse git kind only (added/deleted/modified) — never
+  per-side insertion/deletion fractions, which required diffing every
+  modified file at listing time (the slow, subprocess-per-file listing) and
+  misread a file whose deletions were a sliver (a regenerated lockfile showed
+  red with no visible deletion).
+- The content pane (`ReadOnlyFilePane`) is the heavy part and runs ONLY when
+  a file is selected: read + `git show` + `TextDiff` off-main, applied as one
+  attributed buffer with the added/deleted-line overlay. Loading/chrome
+  overlays use the AppKit `SpinnerView` — never a SwiftUI animated
+  `ProgressView` in a mounted view (it keeps the shell graph invalidating
+  every frame).
+
+### How to add to the file browser / pages (keep the invariants)
+
+Ask before every change: does this run on the main thread, and does it scale
+with the project — or only with what is visible?
+
+- **File data comes from the STORE.** To compute more per listing, add it to
+  `FileTreeBuilder` (nonisolated, off-main) and surface it on the snapshot.
+  Views never build indexes or trees, never run git, never do project-sized
+  work in `body`/`onAppear`.
+- **Rows over large data:** class nodes + memoize on (version, expansion).
+  Never rebuild a row list on every `body` evaluation, never put a value-type
+  tree in a flattened list, never feed a SwiftUI `List`/`ForEach` the whole
+  expanded project. A replacement tree widget must be virtualized too.
+- **Never do "warm it up early" work on the main thread.** A session-open
+  pre-load is fine only when it is off-main by construction (the store's
+  detached build) — an eager listing folded on the main thread was the
+  session-open spinner on large projects.
+- **Never tear the transcript down to show Files** (or anything else) — keep
+  pages mounted and gate work by page-active. If you ever DO recreate a
+  transcript coordinator with a populated store, populate it with
+  `resetToTail` (reloadData) — a fresh `NSTableView` does not render rows it
+  was never told about.
+- **New `NSEvent` window monitors** (transcript or prompt): the closure AppKit
+  invokes must be a NONISOLATED `@Sendable` handler doing pure-event reads,
+  handing off to a `@MainActor` method via `MainActor.assumeIsolated`. Do NOT
+  write an inferred-`@MainActor` closure: the compiler inserts an executor
+  entry check that crashes in `swift_getObjectType` when AppKit calls the
+  closure directly (the crash reports; the pattern is annotated in
+  TranscriptView/PromptInputView).
+- **Spinners in mounted/hidden views:** `SpinnerView` (AppKit), never
+  SwiftUI's animated `ProgressView`.
+- **Preserve the user's place** when data refreshes underneath them:
+  expansion, the open file, the scroll position.
+- The `.id` rules above (Files per-tab `.id`; transcript none) — think about
+  identity before adding it.
+
+### Failed fixes (pages/file browser — do not re-introduce)
+
+- **Value-type tree nodes in the flattened rows.** `Row` copied `TreeNode`
+  (children array included) per row — every row deep-copied its node's whole
+  subtree; flattening a large tree was O(rows × subtree): multi-second stalls
+  and ~800MB. Nodes are classes; flattening copies references.
+- **Folding the listing on the main thread.** The eager warm refresh built
+  the index + tree + expand-all on the main thread — the session-open
+  beachball on large projects before Files was even opened. It all runs in
+  the store's detached `FileTreeBuilder`.
+- **A SwiftUI `List` of the fully-expanded tree.** Page open diffed and
+  constructed every row on the main thread (the sampled
+  `DynamicViewList.updateValue` hotspot). The tree is an `NSTableView`.
+- **A per-body-eval flatten** (and per-update key arrays) over the visible
+  list — memoized on (version, expansion).
+- **Tearing the transcript down on a page switch** — the blank-conversation
+  bug (see *The page model*).
+- **@MainActor @Sendable `NSEvent` monitor closures** — the
+  executor-entry-check crash (see *How to add…*).
+
+Validation notes: opening a session in a large project shows no spinner and
+leaves the main thread idle; opening the Files page and scrolling the
+fully-expanded tree stays smooth; Session↔Files toggling is an instant
+visibility flip that preserves both panes' state; a `sample` while folding a
+big listing shows the main thread in the event loop.
+
 ## Tests
 
 Three deterministic bundles (no pi process, no network, no live model):
@@ -1073,4 +1252,7 @@ the whole `RenderingTests` directory, so `xcodegen generate` picks it up
 
 - `scratchpad/transcript-architecture.md` — the architecture write-up.
 - `scratchpad/transcript-overview.md` — a plain-terms overview.
+- `scratchpad/session-pages-architecture.md` — the Session/Files page model
+  and the file-browser store (the file-side mirror of the transcript),
+  including the failure history.
 

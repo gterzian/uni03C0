@@ -39,6 +39,12 @@ import SwiftUI
 /// reload positioned at the tail.
 struct TranscriptView: NSViewRepresentable {
     let viewModel: SessionViewModel
+    /// Whether the conversation page (not the session's Files page) is the one
+    /// currently shown. The view stays mounted while the Files page is up —
+    /// hidden, doing zero per-delta work — so switching pages never rebuilds
+    /// or re-measures the transcript (a rebuilt transcript used to show a
+    /// blank conversation until a tab switch forced a reload).
+    var isPageActive = true
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -52,6 +58,7 @@ struct TranscriptView: NSViewRepresentable {
         if context.coordinator.viewModel !== viewModel {
             context.coordinator.rebind(viewModel: viewModel)
         }
+        context.coordinator.setPageActive(isPageActive)
     }
 }
 
@@ -191,6 +198,16 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Set when a store change arrives while invisible, so a single catch-up
     /// pass happens on return to the foreground (rather than every delta).
     private var needsCatchUp = false
+
+    /// Whether the CONVERSATION page (not the session's Files page) is the one
+    /// currently shown. While the Files page is up the transcript stays mounted
+    /// but hidden (a page switch never rebuilds or re-measures it — that was
+    /// the blank-transcript bug), so per-delta rendering is gated exactly like
+    /// occlusion: zero work, one catch-up pass on return. Also gates the window
+    /// key monitors, so transcript hotkeys (Cmd+F / Cmd+G / Cmd+Up/Down / the
+    /// arrow scroll) never act on an invisible conversation while the user
+    /// browses files.
+    private var pageActive = true
 
     /// Whether the user is pinned to the tail and wants to auto-follow. Once
     /// they scroll up, this turns off so streaming doesn't keep yanking them
@@ -354,28 +371,28 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // use Cmd+Up/Down to move the insertion point to the beginning/end of
         // their own text, and to open dropdowns/sheets, like the prompt's Esc
         // handling.
-        cmdJumpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        // AppKit invokes these monitor closures directly on the main thread but
+        // OUTSIDE any Swift task context, so they must not be actor-isolated:
+        // a @MainActor closure here gets a compiler-inserted executor entry
+        // check whose object deref crashes at runtime (the crash reports). Each
+        // handler therefore does ONLY pure-event reads (off the main actor),
+        // then hands off to a @MainActor method via `MainActor.assumeIsolated`
+        // (the codebase's established AppKit-boundary pattern — thread-based
+        // check, no executor object deref).
+        let cmdJumpHandler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == 125 || event.keyCode == 126, // Down / Up
                   event.modifierFlags.contains(.command),
                   !event.modifierFlags.contains(.option),
                   !event.modifierFlags.contains(.control),
                   !event.modifierFlags.contains(.shift) else { return event }
-            guard let self, let window = self.tableView?.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle it.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A visible popup-menu-level window (a dropdown / the completion
-            // list) is tracking: don't steal the key from it.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            if let editor = window.firstResponder as? NSTextView, editor.isEditable {
-                return event
+            guard let self else { return event }
+            let isUp = event.keyCode == 126
+            let consume = MainActor.assumeIsolated {
+                self.handleUserMessageJump(isUp: isUp)
             }
-            if event.keyCode == 126 {
-                self.jumpToPreviousUserMessage()
-            } else {
-                self.jumpToNextUserMessage()
-            }
-            return nil
+            return consume ? nil : event
         }
+        cmdJumpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: cmdJumpHandler)
         // Arrow keys scroll the transcript, following the standard text-scroll
         // conventions: plain Up/Down move a few rows (the wheel feel), Fn+Up/
         // Fn+Down and the Page Up/Down keys move one page, Fn+Left / Home go
@@ -386,15 +403,14 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // top/tail. Deferred to EDITABLE text views (the prompt input, the
         // find field), which use the arrows for their own caret/page
         // navigation, and to open dropdowns/sheets, like the Cmd+Down handling.
-        arrowScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            // Scope: plain / Fn arrows and the Home/End/Page keys. Cmd/Option/
-            // Ctrl/Shift-modified keys fall through untouched (Cmd+Up/Down is
-            // the jump monitor above; Option+arrows are text-editing in fields).
+        let arrowScrollHandler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
+            // Pure-event scope test (see the cmdJumpHandler note): only event
+            // reads here; the window/responder checks and the scroll run in
+            // `handleScrollKey`, isolated explicitly.
             let flags = event.modifierFlags
             guard !flags.contains(.command), !flags.contains(.option),
                   !flags.contains(.control), !flags.contains(.shift) else { return event }
             let isFn = flags.contains(.function)
-            enum ScrollAction { case lines(Int), page(Int), top, tail }
             let scroll: ScrollAction?
             switch event.keyCode {
             case 126: // Up / Fn+Up
@@ -412,61 +428,36 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             default:
                 return event
             }
-            guard let self, let window = self.tableView?.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle it.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A visible popup-menu-level window (a dropdown / the completion
-            // list) is tracking: don't steal the key from it.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            if let editor = window.firstResponder as? NSTextView, editor.isEditable {
-                return event
+            guard let self else { return event }
+            let consume = MainActor.assumeIsolated {
+                self.handleScrollKey(scroll)
             }
-            switch scroll {
-            case .lines(let d): self.scrollByArrow(CGFloat(d))
-            case .page(let d): self.scrollByPage(CGFloat(d))
-            case .top: self.jumpToTop()
-            case .tail: self.jumpToBottom()
-            case nil: break
-            }
-            return nil
+            return consume ? nil : event
         }
+        arrowScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: arrowScrollHandler)
 
         // Cmd+F / Cmd+G / Shift+Cmd+G / Cmd+R — the session-bound command
         // shortcuts, handled here (not as SwiftUI hidden buttons) so they
         // always act on the ACTIVE tab: the coordinator's `viewModel` is
         // re-pointed on every rebind, and the monitor reads it at event time.
         // See the property comment on `sessionShortcutMonitor`.
-        sessionShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        let sessionShortcutHandler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
+            // Pure-event scope test (see the cmdJumpHandler note); the
+            // window/responder checks and the action run in
+            // `handleSessionShortcut`, isolated explicitly.
             let key = event.keyCode
             guard key == 3 || key == 5 || key == 15, // F / G / R
                   event.modifierFlags.contains(.command),
                   !event.modifierFlags.contains(.option),
                   !event.modifierFlags.contains(.control) else { return event }
+            guard let self else { return event }
             let isShift = event.modifierFlags.contains(.shift)
-            guard let self, let window = self.tableView?.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle it.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A visible popup-menu-level window (a dropdown / the completion
-            // list) is tracking: don't steal the key from it.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            guard let vm = self.viewModel else { return event }
-            switch key {
-            case 3: // Cmd+F: toggle the find bar (closing clears the query).
-                vm.toggleSearch()
-            case 5: // Cmd+G / Shift+Cmd+G: cycle matches while the bar is up.
-                guard vm.isSearchVisible else { return event }
-                if isShift {
-                    vm.previousSearchMatch()
-                } else {
-                    vm.nextSearchMatch()
-                }
-            case 15: // Cmd+R: reload the session from disk.
-                Task { await vm.reload() }
-            default:
-                return event
+            let consume = MainActor.assumeIsolated {
+                self.handleSessionShortcut(key: key, isShift: isShift)
             }
-            return nil
+            return consume ? nil : event
         }
+        sessionShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: sessionShortcutHandler)
 
         // Fetch older history (and refresh the tail) on scroll.
         NotificationCenter.default.addObserver(
@@ -512,12 +503,15 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         viewModel.onSearchResultsChanged = { [weak self] in
             self?.refreshSearchHighlight()
         }
-        let store = viewModel.store
-        lastGeneration = store.currentGeneration
-        windowStart = max(0, store.count - initialChunkRows())
-        windowEnd = store.count
-        fetchBlock = max(initialChunkRows() / 2, 20)
-        applyModelChanges() // initial state (usually empty; populate happens after)
+        // A fresh coordinator populates itself exactly like a rebind does —
+        // reloadData + off-main premeasure + a scroll to the tail. At first
+        // boot the store is empty and this is a no-op; the danger is a
+        // transcript RE-created with an already-populated store: the manual
+        // windowStart/windowEnd setup below never told the fresh table to
+        // RENDER those rows (no reloadData, no insertRows), so the
+        // conversation stayed blank until a tab switch forced a reload (the
+        // reported bug). resetToTail is the population path a rebind uses.
+        resetToTail(viewModel.store)
 
         return sv
     }
@@ -533,6 +527,107 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             NSEvent.removeMonitor(sessionShortcutMonitor)
         }
         NotificationCenter.default.removeObserver(self)
+    }
+
+    // MARK: - Window key-monitor actions (main actor)
+
+    /// What one plain/Home/End/Page arrow keypress asks for — computed from
+    /// the event in the monitor's nonisolated prefilter, applied on the main
+    /// actor (never as a `ScrollAction?` = pass-through; the prefilter returns
+    /// the event itself for keys outside the set).
+    private enum ScrollAction {
+        case lines(Int), page(Int), top, tail
+    }
+
+    /// Cmd+Up / Cmd+Down cycled to a user message. Runs on the main actor
+    /// (from the nonisolated monitor closure via `MainActor.assumeIsolated`):
+    /// every check is main-actor state, and the transcript hotkeys only act
+    /// while the conversation page is up — on the Files page the keys pass
+    /// through to whatever is focused there. Returns whether the event was
+    /// consumed (nil to AppKit = consumed).
+    @MainActor
+    private func handleUserMessageJump(isUp: Bool) -> Bool {
+        guard pageActive else { return false }
+        guard let window = tableView?.window else { return false }
+        // Window not front (or a sheet is up): let the key window handle it.
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        // A visible popup-menu-level window (a dropdown / the completion
+        // list) is tracking: don't steal the key from it.
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        if let editor = window.firstResponder as? NSTextView, editor.isEditable {
+            return false
+        }
+        if isUp {
+            jumpToPreviousUserMessage()
+        } else {
+            jumpToNextUserMessage()
+        }
+        return true
+    }
+
+    /// The arrow/Home/End/Page keys scrolled the transcript. See
+    /// `handleUserMessageJump` for the isolation and page gating.
+    @MainActor
+    private func handleScrollKey(_ scroll: ScrollAction?) -> Bool {
+        guard pageActive, let scroll else { return false }
+        guard let window = tableView?.window else { return false }
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        if let editor = window.firstResponder as? NSTextView, editor.isEditable {
+            return false
+        }
+        switch scroll {
+        case .lines(let d): scrollByArrow(CGFloat(d))
+        case .page(let d): scrollByPage(CGFloat(d))
+        case .top: jumpToTop()
+        case .tail: jumpToBottom()
+        }
+        return true
+    }
+
+    /// Cmd+F / Cmd+G / Shift+Cmd+G / Cmd+R. See `handleUserMessageJump` for
+    /// the isolation and page gating. Reads `viewModel` at event time (never
+    /// captured), so it always acts on the ACTIVE session.
+    @MainActor
+    private func handleSessionShortcut(key: UInt16, isShift: Bool) -> Bool {
+        guard pageActive else { return false }
+        guard let window = tableView?.window else { return false }
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        guard let vm = viewModel else { return false }
+        switch key {
+        case 3: // Cmd+F: toggle the find bar (closing clears the query).
+            vm.toggleSearch()
+        case 5: // Cmd+G / Shift+Cmd+G: cycle matches while the bar is up.
+            guard vm.isSearchVisible else { return false }
+            if isShift {
+                vm.previousSearchMatch()
+            } else {
+                vm.nextSearchMatch()
+            }
+        case 15: // Cmd+R: reload the session from disk.
+            Task { await vm.reload() }
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// The conversation page became visible again (the user switched back from
+    /// the Files page): one catch-up pass for anything that streamed while the
+    /// page was hidden. Runs UNCONDITIONALLY on activation — `applyModelChanges`
+    /// is cheap when nothing changed (generation equal, nothing streaming) and
+    /// materializing on every activation makes a blank conversation impossible
+    /// regardless of how the coordinator got here (a missed delta, a session
+    /// switch whose rebind landed while the page was hidden, an occlusion
+    /// transition). While the page is NOT active, per-delta work bails and
+    /// records `needsCatchUp`, exactly like the occlusion path.
+    func setPageActive(_ active: Bool) {
+        guard pageActive != active else { return }
+        pageActive = active
+        guard active else { return }
+        needsCatchUp = false
+        applyModelChanges()
     }
 
     func rebind(viewModel: SessionViewModel) {
@@ -785,7 +880,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // the per-delta render running while nothing is on screen.
         let visible = isOnScreen()
         isWindowVisible = visible
-        guard visible else {
+        guard visible, pageActive else {
             needsCatchUp = true
             return
         }

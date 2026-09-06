@@ -796,6 +796,11 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// stopped showing its caret even when not following.
     var isStreamingRowForTesting: Bool { isStreamingRow }
 
+    /// The plain text currently rendered in this row. Internal for
+    /// CoordinatorTests — the session-switch test asserts the table shows the
+    /// ACTIVE session's content after a rebind, not the previous one's.
+    var renderedTextForTesting: String { textView.string }
+
     override func layout() {
         super.layout()
         guard let container = textView.textContainer, let layoutManager = textView.layoutManager else { return }
