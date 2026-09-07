@@ -178,7 +178,9 @@ private enum PaneContentLoader {
     /// `TextDiff` output used everywhere else. `.same` and `.added` lines each
     /// occupy one current-text line, in order; `.removed` lines have no
     /// position in the current text at all and are deliberately not shown
-    /// inline (the red side of a modification lives only in the tree badge).
+    /// inline (the red side of a modification is what the tree's
+    /// deletion-vs-addition fill behind the file name shows — see
+    /// `rowTintColor` in FileBrowserView).
     nonisolated static func addedLineNumbers(old: String, new: String) -> [Int] {
         let diff = TextDiff.diff(old: old, new: new)
         var added: [Int] = []

@@ -1026,12 +1026,27 @@ only what it needs.**
   small/medium projects open fully expanded (the review surface); larger
   projects open collapsed at the top level. A giant auto-expanded tree is not
   a useful review surface, and a small default row list bounds the flatten
-  and the table's change detection for the life of the session.
-- Row tinting is by coarse git kind only (added/deleted/modified) — never
-  per-side insertion/deletion fractions, which required diffing every
-  modified file at listing time (the slow, subprocess-per-file listing) and
-  misread a file whose deletions were a sliver (a regenerated lockfile showed
-  red with no visible deletion).
+  and the table's change detection for the life of the session. The cap
+  applies to the DEFAULT expansion only — the ancestor folders of every
+  CHANGED file (added/modified/deleted/untracked) are always opened, on
+  first load and on every refresh (`reconcileExpansion`), so "all files with
+  edits are open" holds even in a large project that opened collapsed, and
+  edits landing anywhere surface immediately without auto-expanding the
+  whole tree.
+- Row fills show the per-file deletion↔addition balance, computed from ONE
+  batched two-pass numstat (`GitStatus.classify` → `FileEntry.stats`) — never
+  a `git show`/diff subprocess per file. The fill behind a changed file's
+  name blends red (all deletions) → amber (balanced) → green (all additions)
+  by the added:deleted ratio, with opacity ramping on the change's total
+  size, so a staged-new file the agent later edited shows its worktree delta
+  (real deletions) instead of a flat "whole file is new" green, and a
+  one-line churn stays faint. The counts come from `git diff --numstat` on
+  the worktree delta (index→worktree, the agent's live edits) falling back
+  to the staged delta (HEAD→index), so both a dirty repo and a no-commit-
+  yet repo get truthful per-file numbers. Untracked files keep the "not
+  added yet" badge and no fill (no baseline to score them against); the
+  content pane still computes the exact interleaved lines for the ONE
+  selected file.
 - The content pane (`ReadOnlyFilePane`) is the heavy part and runs ONLY when
   a file is selected: read + `git show` + `TextDiff` off-main, applied as one
   attributed buffer with the added/deleted-line overlay. Loading/chrome

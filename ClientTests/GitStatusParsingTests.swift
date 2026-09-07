@@ -64,4 +64,40 @@ final class GitStatusParsingTests: XCTestCase {
         // A rename code has no A/D/?? — it is treated as a modification.
         XCTAssertEqual(GitStatus.statusClass(forPorcelainCode: "R "), .modified)
     }
+
+    // MARK: - parseNumstatRecord (the `git diff -z --numstat` wire format)
+
+    func testNumstatRecordParsesCountsAndRawPath() {
+        let parsed = GitStatus.parseNumstatRecord("12\t7\tSources/Foo.swift")
+        XCTAssertEqual(parsed?.path, "Sources/Foo.swift")
+        XCTAssertEqual(parsed?.stats, GitStatus.DiffStats(added: 12, deleted: 7))
+    }
+
+    func testNumstatRecordKeepsPathContainingTabsVerbatim() {
+        // The -z form never C-style-quotes paths; a tab inside a path is the
+        // raw remainder of the record after the two counter fields.
+        let parsed = GitStatus.parseNumstatRecord("1\t2\ta\tb.swift")
+        XCTAssertEqual(parsed?.path, "a\tb.swift")
+        XCTAssertEqual(parsed?.stats, GitStatus.DiffStats(added: 1, deleted: 2))
+    }
+
+    func testNumstatZeroCountersParse() {
+        // A pure mode/whitespace-change record can carry 0/0; it still parses
+        // (the view treats a zero total as uncolored).
+        let parsed = GitStatus.parseNumstatRecord("0\t0\tmode.sh")
+        XCTAssertEqual(parsed?.path, "mode.sh")
+        XCTAssertEqual(parsed?.stats, GitStatus.DiffStats(added: 0, deleted: 0))
+    }
+
+    func testNumstatBinaryCountersAreNil() {
+        // Binary diffs report "-" counters, which don't read as integers.
+        XCTAssertNil(GitStatus.parseNumstatRecord("-\t-\tblob.bin"))
+        XCTAssertNil(GitStatus.parseNumstatRecord("-\t12\tblob.bin"))
+    }
+
+    func testNumstatGarbageIsNil() {
+        XCTAssertNil(GitStatus.parseNumstatRecord(""))
+        XCTAssertNil(GitStatus.parseNumstatRecord("not a numstat record"))
+        XCTAssertNil(GitStatus.parseNumstatRecord("1\t2"))
+    }
 }

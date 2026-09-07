@@ -42,6 +42,9 @@ struct FileBrowserView: View {
     /// folders as needed) — a giant auto-expanded tree is never a useful
     /// review surface, and keeping the default row list small bounds the
     /// flatten and the table's change detection for the life of the session.
+    /// Folders containing CHANGED files are opened regardless (see
+    /// `reconcileExpansion`), so the review surface — every file with an edit
+    /// — is always visible even in a large project.
     private static let autoExpandFileLimit = 3000
 
     var body: some View {
@@ -132,14 +135,55 @@ struct FileBrowserView: View {
     /// store's snapshot changes and when the view first appears over an
     /// already-loaded store (a session that loaded while its Files page was
     /// never shown).
+    ///
+    /// Whatever the policy, the ancestor folders of every CHANGED file are
+    /// always opened — first load and every refresh — so a file with an edit
+    /// is never buried under a collapsed directory: "all files with edits are
+    /// open" holds in a large project that opened collapsed at the top level
+    /// (a few dozen edited files only open their own folders, not the whole
+    /// tree) and stays true as the agent edits files anywhere while the
+    /// session runs. Expansion only ever grows — once a folder is open it
+    /// stays open (only the user collapses), and a refresh stops force-opening
+    /// a folder once none of its files are changed anymore.
     private func reconcileExpansion() {
         guard store.version > 0 else { return }
+        // Re-derived from the current snapshot every time: folders of files
+        // that were just edited appear on the next refresh; folders whose
+        // changed files all reverted stop being force-opened (they stay open
+        // until the user collapses them).
+        let changedAncestors = ancestors(ofChangedFiles: store.fileEntries)
         if !didExpandAllOnce {
             didExpandAllOnce = true
-            expandedDirectories = store.fileCount <= Self.autoExpandFileLimit ? store.directoryPaths : []
+            var expanded: Set<String> = store.fileCount <= Self.autoExpandFileLimit ? store.directoryPaths : []
+            expanded.formUnion(changedAncestors)
+            expandedDirectories = expanded
         } else {
             expandedDirectories.formIntersection(store.directoryPaths)
+            expandedDirectories.formUnion(changedAncestors)
         }
+    }
+
+    /// The ancestor directories of every file git sees as changed — added,
+    /// modified, deleted, and agent-created untracked (the "not added yet"
+    /// rows) alike. Top-level files have none and are always visible. This is
+    /// what keeps the review surface open without auto-expanding the whole
+    /// project.
+    private func ancestors(ofChangedFiles entries: [String: GitStatus.FileEntry]) -> Set<String> {
+        var ancestors: Set<String> = []
+        for (path, entry) in entries where entry.kind != .normal {
+            let components = path.split(separator: "/")
+            guard components.count > 1 else { continue }
+            var directory = ""
+            for component in components.dropLast() {
+                if directory.isEmpty {
+                    directory = String(component)
+                } else {
+                    directory += "/" + component
+                }
+                ancestors.insert(directory)
+            }
+        }
+        return ancestors
     }
 
     // MARK: - Tree model (view side)
@@ -238,16 +282,37 @@ struct FileBrowserView: View {
 
 // MARK: - Tree table (virtualized AppKit)
 
-/// Whole-row tint color by coarse git kind (see the design notes on the tree
-/// in `FileBrowserView`): no per-file diff at listing time, and no misleading
-/// "deleted sliver" on a file whose only change is a one-line churn. Direction
-/// and volume live per file in the content pane, computed on selection.
+/// The fill painted behind a changed file's name. When the file carries
+/// batched diff counts (`FileEntry.stats`), the fill is a deletion↔addition
+/// blend: hue runs from pure red (the change is all deletions) through amber
+/// (balanced) to pure green (all additions), so how much of the change was
+/// deletion vs. addition reads directly off the color behind the name — and a
+/// staged-new file the agent later edited shows its worktree delta (real
+/// deletions) instead of a flat "whole file is new" green. Opacity ramps with
+/// the change's total size (saturating around 60 lines), so a one-line churn
+/// stays a faint whisper while a rewrite saturates — a regenerated lockfile's
+/// thousands of balanced +/− read amber, not alarm-red. Paths the batched
+/// pass couldn't count (untracked — which carry their own "not added yet"
+/// badge — and binaries) fall back to the flat kind color; committed-identical
+/// rows get none.
 fileprivate func rowTintColor(for entry: GitStatus.FileEntry?) -> NSColor? {
-    switch entry?.kind {
-    case .added: NSColor.systemGreen.withAlphaComponent(0.15)
-    case .deleted: NSColor.systemRed.withAlphaComponent(0.13)
-    case .modified: NSColor.systemOrange.withAlphaComponent(0.09)
-    default: nil
+    guard let entry else { return nil }
+    if let stats = entry.stats {
+        let total = stats.added + stats.deleted
+        if total > 0 {
+            let addShare = CGFloat(stats.added) / CGFloat(total)
+            // 1.0 (all additions) → green (120°); 0.0 (all deletions) → red
+            // (0°); balanced → amber (60°).
+            let hue = addShare / 3
+            let opacity = 0.16 + 0.22 * min(1, CGFloat(total) / 60)
+            return NSColor(hue: hue, saturation: 0.85, brightness: 0.9, alpha: opacity)
+        }
+    }
+    switch entry.kind {
+    case .added: return NSColor.systemGreen.withAlphaComponent(0.15)
+    case .deleted: return NSColor.systemRed.withAlphaComponent(0.13)
+    case .modified: return NSColor.systemOrange.withAlphaComponent(0.09)
+    default: return nil
     }
 }
 
@@ -354,7 +419,7 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
         self.onToggleDirectory = onToggleDirectory
         guard tableView != nil else { return }
 
-        let keys = rows.map { $0.id + Self.kindSuffix($0.node.entry?.kind) }
+        let keys = rows.map { $0.id + Self.entrySuffix($0.node.entry) }
         if keys != rowKeys {
             let top = visibleTopKey()
             rowKeys = keys
@@ -395,13 +460,24 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
         tableView.scrollRowToVisible(index)
     }
 
-    private static func kindSuffix(_ kind: GitStatus.Kind?) -> String {
-        switch kind {
-        case .added: "A"
-        case .deleted: "D"
-        case .modified: "M"
-        default: "."
+    /// Reload discriminator per row: kind plus the diff counts when present.
+    /// The tree reloads only when the visible row LIST changes — a refresh
+    /// that only shifts a file's +/− counts must reload too (that is what
+    /// repaints the fill), but a plain selection flip must not.
+    private static func entrySuffix(_ entry: GitStatus.FileEntry?) -> String {
+        guard let entry else { return "/d" }
+        let kind: Character
+        switch entry.kind {
+        case .added: kind = "A"
+        case .deleted: kind = "D"
+        case .modified: kind = "M"
+        case .untracked: kind = "U"
+        case .normal: kind = "."
         }
+        if let stats = entry.stats {
+            return "/\(kind)+\(stats.added)-\(stats.deleted)"
+        }
+        return String(kind)
     }
 
     // MARK: NSTableViewDataSource / Delegate
