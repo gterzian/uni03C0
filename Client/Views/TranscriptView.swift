@@ -1840,27 +1840,34 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let query = searchMatchRowIDs.contains(entry.id) ? viewModel?.searchQuery : nil
         let isCurrent = currentSearchRowID == entry.id
         let caseSensitive = viewModel?.isCaseSensitive ?? false
+        // Agent-emitted file references in this row's text open in this
+        // session's file browser (see `openFileReference` below). The row has
+        // no reference back to the coordinator — the closure is threaded down
+        // like the tool cards' expand callback.
+        let openReferenceHandler: (FileReferenceLink) -> Void = { [weak self] link in
+            self?.openFileReference(link)
+        }
         let view: NSView
         switch entry.kind {
         case .userMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            v.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
             view = v
         case .assistantMessage(let text, let thinking, let isStreaming):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            v.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
             view = v
         case .errorMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            v.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
             view = v
         case .abortedMessage(let text):
             let v = tableView.makeView(withIdentifier: .textRow, owner: nil) as? TextRowView ?? TextRowView()
             v.identifier = .textRow
-            v.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            v.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
             view = v
         case .toolCall(let card):
             let v = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
@@ -1931,15 +1938,18 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let query = searchMatchRowIDs.contains(entry.id) ? viewModel?.searchQuery : nil
         let isCurrent = currentSearchRowID == entry.id
         let caseSensitive = viewModel?.isCaseSensitive ?? false
+        let openReferenceHandler: (FileReferenceLink) -> Void = { [weak self] link in
+            self?.openFileReference(link)
+        }
         switch entry.kind {
         case .userMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .user, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
         case .assistantMessage(let text, let thinking, let isStreaming):
-            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            (cell as? TextRowView)?.configure(text: text, thinking: thinking, role: .assistant, isStreaming: isStreaming, cacheHitRate: entry.cacheHitRate, cacheMiss: entry.cacheMiss, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
         case .errorMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .error, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
         case .abortedMessage(let text):
-            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent)
+            (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
         case .toolCall(let card):
             (cell as? ToolCallHostView)?.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent) { [weak self] in
                 self?.toggleToolCard(card.id)
@@ -2163,6 +2173,22 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let row else { return }
         heights.invalidate(id)
         tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integer: row))
+    }
+
+    /// A clicked agent-emitted file reference (`pi-file://` link) opens the
+    /// referenced file in this session's file browser. The coordinator has no
+    /// `SessionTab` (and never should) — it posts the same cwd-keyed
+    /// `NotificationCenter` shape `SessionTab`'s own file-change signal uses,
+    /// and the owning tab's observer switches to the Files page and drives the
+    /// browser store (selection, tree reveal, scroll to the reference line).
+    /// `viewModel` is weak, so it is guarded like every other access.
+    private func openFileReference(_ link: FileReferenceLink) {
+        guard let cwd = viewModel?.cwd else { return }
+        NotificationCenter.default.post(
+            name: .openFileReference,
+            object: nil,
+            userInfo: ["cwd": cwd, "link": link]
+        )
     }
 }
 

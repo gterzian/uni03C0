@@ -18,6 +18,16 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     /// The coordinator dedupes on (path, token), so identical re-renders are
     /// no-ops while a same-path reload with a new token re-reads the file.
     let reloadToken: Int
+    /// One-shot reference-driven open (agent-emitted `pi-file` link): when the
+    /// NEXT load for `path` lands, the pane scrolls the reference's start line
+    /// to the top of the viewport, flashes its line range, and keeps an anchor
+    /// marker on the start line. nil = the normal behavior (preserve the
+    /// current scroll on a same-file refresh, top on a new file). The value
+    /// travels WITH the reload it belongs to (never lives in shared mutable
+    /// coordinator state), and is consumed via `onReferenceConsumed` the
+    /// moment that reload captures it (the load itself is async).
+    var pendingReference: FileReferenceLink? = nil
+    var onReferenceConsumed: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -30,7 +40,14 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: FilePaneContainer, context: Context) {
-        context.coordinator.reload(cwd: cwd, path: path, kind: kind, token: reloadToken)
+        context.coordinator.reload(
+            cwd: cwd,
+            path: path,
+            kind: kind,
+            token: reloadToken,
+            reference: pendingReference?.path == path ? pendingReference : nil,
+            onReferenceConsumed: onReferenceConsumed
+        )
     }
 
     @MainActor
@@ -43,10 +60,17 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         private let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         private let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
 
-        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int) {
+        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
             guard container != nil else { return }
             if let last = lastRequest, last.path == path, last.token == token { return }
             lastRequest = (path, token)
+            // Hand the reference to THIS load only: it travels as a parameter
+            // of the task it belongs to, so a later, unrelated reload (which
+            // passes nil) can never overwrite or inherit it. The store's
+            // one-shot copy is consumed here — this reload captured it.
+            if reference != nil {
+                onReferenceConsumed?()
+            }
             loadTask?.cancel()
             // A genuinely different file clears the pane while it loads; a
             // same-path refresh (the file changed) keeps showing the old
@@ -55,15 +79,29 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 container?.showPlaceholder("Loading…")
             }
             loadTask = Task { [weak self] in
-                await self?.performLoad(cwd: cwd, path: path, kind: kind, token: token)
+                await self?.performLoad(cwd: cwd, path: path, kind: kind, token: token, reference: reference)
             }
         }
 
-        private func performLoad(cwd: URL, path: String, kind: GitStatus.Kind, token: Int) async {
+        private func performLoad(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?) async {
             guard let container else { return }
             let loaded = await PaneContentLoader.load(cwd: cwd, path: path, kind: kind)
             // A newer request supersedes this one.
             guard let last = lastRequest, last.path == path, last.token == token else { return }
+            // The target lines ride on the request that captured them (see
+            // `reload`) — a whole-file reference has no target lines.
+            let targetLines: (start: Int, end: Int)? = reference.flatMap { ref in
+                guard let start = ref.startLine else { return nil }
+                return (start, max(start, ref.endLine ?? start))
+            }
+            // The scrollbar edit map mirrors the edit overlay exactly (same
+            // added-line diff / whole-file classification).
+            let markers: PaneMarkers = switch loaded.overlay {
+            case .none: .none
+            case .greenLines(let lines): .lines(lines)
+            case .wholeGreen: .wholeAdded
+            case .wholeRed: .wholeDeleted
+            }
             // The code view is stamped with the file's RESOLVED ABSOLUTE path
             // (canonicalized once, here) — never the git-relative path: a
             // relative path would later be resolved against the app process's
@@ -75,8 +113,17 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 let attributed = makeAttributed(text: text, path: path, overlay: loaded.overlay)
                 // A live refresh of the file the user is already reading must
                 // not yank the view back to the top — keep their place when
-                // the same file is being re-shown.
-                container.displayContent(path: absolutePath, text: attributed, preserveScroll: displayedPath == path)
+                // the same file is being re-shown. A reference-driven open
+                // (targetLines != nil) is never "keep my place": even when it
+                // IS the same file, the click means "show me THIS line", so
+                // the ratio logic is skipped and the jump lands after load.
+                container.displayContent(
+                    path: absolutePath,
+                    text: attributed,
+                    preserveScroll: targetLines == nil && displayedPath == path,
+                    targetLines: targetLines,
+                    markers: markers
+                )
             } else {
                 container.showPlaceholder(loaded.message ?? "Couldn't read \((path as NSString).lastPathComponent).")
             }
@@ -136,6 +183,27 @@ private enum PaneOverlay: Sendable {
     case wholeGreen
     /// Every line came from HEAD (a deletion).
     case wholeRed
+}
+
+/// Edit positions for the SCROLLBAR edit map — derived from the same diff the
+/// edit overlay is built from (`PaneOverlay`), so the scrollbar and the text
+/// always agree. Resolved to colors/positions by the container (the overlay is
+/// carried off-main, so it stays color-free).
+///
+/// Files are loaded WHOLE into the code view (the entire attributed string
+/// lives in the text view; TextKit only LAYS OUT lazily) — there is no
+/// windowed/virtualized loading like the transcript's — so every marker has an
+/// exact document position. If incremental loading is ever introduced, lines
+/// beyond the loaded extent would pile at the top/bottom of the bar instead
+/// (see `CodePaneEditMarkerScroller`).
+enum PaneMarkers: Sendable {
+    case none
+    /// 1-based added lines of the current text (a partial modification).
+    case lines([Int])
+    /// The whole buffer is new content.
+    case wholeAdded
+    /// The whole buffer is the removed side of a deletion.
+    case wholeDeleted
 }
 
 private enum PaneContentLoader {
@@ -247,6 +315,12 @@ final class FilePaneContainer: NSView {
     }
 
     private func setup() {
+        // The edit-map scroller must be installed BEFORE the scroll view
+        // creates its own (hasVerticalScroller = true below would lazily make
+        // a plain NSScroller otherwise). Assigning a subclass forces the
+        // legacy (always-visible) scroller style — intended: the edit map is
+        // only useful while the bar is shown.
+        scrollView.verticalScroller = CodePaneEditMarkerScroller()
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
@@ -300,13 +374,22 @@ final class FilePaneContainer: NSView {
     /// `preserveScroll`, the viewport's proportional place in the file is kept
     /// across the swap (a live refresh of the file being read shouldn't jump
     /// back to the top); without it the view resets to the top (a new file).
-    func displayContent(path: String, text: NSAttributedString, preserveScroll: Bool = false) {
+    /// With `targetLines` (a reference-driven open), BOTH are overridden: the
+    /// top-scroll inside `codeView.load` fires first, then the jump anchors
+    /// the START line to the top of the viewport and flashes the range (see
+    /// `revealReference`) — ordering is load-bearing, a jump issued before the
+    /// load's own reset would be undone by it.
+    func displayContent(path: String, text: NSAttributedString, preserveScroll: Bool = false, targetLines: (start: Int, end: Int)? = nil, markers: PaneMarkers = .none) {
         statusLabel.isHidden = true
         codeView.isHidden = false
+        codeView.clearReveal()
+        // A load without a reference target clears the previous jump's ruler
+        // anchor too (a reference-driven load re-sets it in revealReference).
+        (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
 
         let clip = scrollView.contentView
         var anchorRatio: CGFloat?
-        if preserveScroll, codeView.frame.height > 0 {
+        if preserveScroll, targetLines == nil, codeView.frame.height > 0 {
             let visible = clip.bounds.height
             if visible > 0 {
                 let scrollable = codeView.frame.height - visible
@@ -317,8 +400,11 @@ final class FilePaneContainer: NSView {
         }
 
         codeView.load(path: path, text: text)
+        applyMarkers(markers, in: text.string)
 
-        if let anchorRatio {
+        if let targetLines {
+            revealReference(lines: targetLines, in: text.string)
+        } else if let anchorRatio {
             let visible = clip.bounds.height
             let scrollable = codeView.frame.height - visible
             if scrollable > 0 {
@@ -329,9 +415,91 @@ final class FilePaneContainer: NSView {
         }
     }
 
+    /// A reference-driven open: scroll so the reference's START line anchors
+    /// the top of the viewport, flash the whole referenced range with a
+    /// fading highlight, and keep an anchor — a capsule over the start line in
+    /// the ruler gutter plus a thin accent bar down the range's left edge — so
+    /// the location stays visible after the flash fades. Runs AFTER
+    /// `codeView.load`'s scroll-to-top. Lines past the end of the file simply
+    /// leave the view at the top (the geometry lookup fails cleanly).
+    private func revealReference(lines: (start: Int, end: Int), in text: String) {
+        guard let layoutManager = codeView.layoutManager,
+              let textContainer = codeView.textContainer,
+              let startRange = PaneContentLoader.charRanges(ofLines: [lines.start], in: text).first,
+              let endRange = PaneContentLoader.charRanges(ofLines: [lines.end], in: text).first
+        else { return }
+        let charRange = NSRange(location: startRange.location, length: (endRange.location + endRange.length) - startRange.location)
+        // Force the geometry now: the jump and the flash both need glyph rects
+        // (line 858 of a large file is only laid out on demand).
+        layoutManager.ensureLayout(for: textContainer)
+        let rangeBox = layoutManager.boundingRect(
+            forGlyphRange: layoutManager.glyphRange(forCharacterRange: charRange, actualCharacterRange: nil),
+            in: textContainer
+        )
+        let startBox = layoutManager.boundingRect(
+            forGlyphRange: layoutManager.glyphRange(forCharacterRange: startRange, actualCharacterRange: nil),
+            in: textContainer
+        )
+        // Layout-manager rects are in the (flipped, top-down) container space;
+        // the container sits inside the text view at the inset.
+        let insetY = codeView.textContainerInset.height
+        // The anchor: the start line's top at the top of the viewport.
+        let startDocY = startBox.minY + insetY
+        let clip = scrollView.contentView
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: max(0, startDocY)))
+        scrollView.reflectScrolledClipView(clip)
+        // The range's vertical band in text-view coordinates (full width — the
+        // container rect's own width is meaningless with wrapping disabled).
+        let band = NSRect(
+            x: 0,
+            y: rangeBox.minY + insetY,
+            width: codeView.bounds.width,
+            height: max(rangeBox.height, startBox.height)
+        )
+        codeView.startReveal(flashRect: band, anchorRect: band)
+        (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = lines.start
+    }
+
+    /// Refreshes the scrollbar edit map for the freshly-loaded text. Marker
+    /// positions are exact: the whole file is in the text view, so every added
+    /// line maps to `(line - 0.5) / lineCount` along the document.
+    private func applyMarkers(_ markers: PaneMarkers, in text: String) {
+        guard let scroller = scrollView.verticalScroller as? CodePaneEditMarkerScroller else { return }
+        switch markers {
+        case .none:
+            scroller.clearMarkers()
+        case .wholeAdded:
+            scroller.markers = []
+            scroller.wholeTrackColor = .systemGreen
+        case .wholeDeleted:
+            scroller.markers = []
+            scroller.wholeTrackColor = .systemRed
+        case .lines(let lines):
+            scroller.wholeTrackColor = nil
+            // Real displayed lines: `\n` separators + a final partial line.
+            var lineCount = 0
+            for character in text where character == "\n" { lineCount += 1 }
+            if !text.isEmpty, !text.hasSuffix("\n") { lineCount += 1 }
+            guard lineCount > 0 else {
+                scroller.markers = []
+                return
+            }
+            scroller.markers = lines.compactMap { line in
+                guard line >= 1, line <= lineCount else { return nil }
+                return CodePaneEditMarkerScroller.Marker(
+                    fraction: (CGFloat(line) - 0.5) / CGFloat(lineCount),
+                    color: .systemGreen
+                )
+            }
+        }
+    }
+
     /// Centered status text (loading / unreadable / no committed content)
     /// over a blank pane.
     func showPlaceholder(_ message: String) {
+        codeView.clearReveal()
+        (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
+        (scrollView.verticalScroller as? CodePaneEditMarkerScroller)?.clearMarkers()
         codeView.load(path: "", text: NSAttributedString(string: ""))
         statusLabel.stringValue = message
         statusLabel.isHidden = false

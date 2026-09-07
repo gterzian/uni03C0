@@ -78,7 +78,9 @@ RUNNER_MAIN
 
 # 3. Compile the renderer + tests + runner into one binary, linking the real
 #    Core module built by the SwiftPM harness. FontSettings is stubbed because
-#    the @Observable macro's plugin server is blocked in the sandbox.
+#    the @Observable macro's plugin server is blocked in the sandbox, and
+#    SyntaxHighlighter (RenderingTests/SyntaxHighlighterStub.swift) because it
+#    links Highlightr, which the renderer bundles don't.
 CORE_MODS="$BUILD/Modules"
 SUB_MODS="$(dirname "$(find "$BUILD" -name Subprocess.swiftmodule | head -1)")"
 SYS_MODS="$(dirname "$(find "$BUILD" -name SystemPackage.swiftmodule | head -1)")"
@@ -94,6 +96,7 @@ swiftc -swift-version 6 -default-isolation MainActor \
   Client/Views/CodeCopyButton.swift \
   Client/Views/MarkdownText.swift \
   Client/Views/ReadOnlyCodeTextView.swift \
+  Client/Views/ReadOnlyFilePane.swift \
   Client/Views/TextRowView.swift \
   RenderingTests/*.swift \
   -I "$CORE_MODS" -I "$SUB_MODS" -I "$SYS_MODS" -I "$SHIM_INC" \

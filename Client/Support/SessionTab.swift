@@ -68,6 +68,14 @@ final class SessionTab: Identifiable {
     /// session's process is gone and must not be terminated again.
     @ObservationIgnored private var hasStopped = false
 
+    /// Observer for `Notification.Name.openFileReference` — a click on an
+    /// agent-emitted `pi-file://` link in this tab's transcript. NEW lifecycle
+    /// surface (unlike `onFilesChanged`, which is a plain closure property,
+    /// `SessionTab` registers no NotificationCenter observer of its own
+    /// today), so it must be removed in `stop()` symmetrically with
+    /// `FileBrowserStore.stop()` removing its own observer.
+    @ObservationIgnored private var openReferenceObserver: NSObjectProtocol?
+
     /// Number of files with uncommitted changes in this session's folder
     /// (`git status --porcelain` line count), nil when the folder isn't a git
     /// repo or the first check hasn't completed. Drives the count badge on
@@ -115,7 +123,33 @@ final class SessionTab: Identifiable {
                 userInfo: ["cwd": self.cwd, "path": path as Any]
             )
         }
+        // A click on an agent-emitted file reference in the transcript (posted
+        // by the transcript coordinator, which has no SessionTab): switch to
+        // the Files page and open the referenced file there. cwd-scoped and
+        // delivered on the main queue, exactly like FileBrowserStore's own
+        // observer — this tab only reacts to links naming ITS folder.
+        openReferenceObserver = NotificationCenter.default.addObserver(
+            forName: .openFileReference,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            guard (note.userInfo?["cwd"] as? URL) == self.cwd else { return }
+            guard let link = note.userInfo?["link"] as? FileReferenceLink else { return }
+            MainActor.assumeIsolated {
+                self.openFileReference(link)
+            }
+        }
         scheduleGitCountRefresh(immediate: true)
+    }
+
+    /// Opens a clicked agent file reference: flip to the Files page (a pure
+    /// visibility flip — both pages stay mounted) and hand the link to the
+    /// file browser store, which selects the file, asks the tree to reveal it,
+    /// and arms the content pane to land on the reference's line.
+    private func openFileReference(_ link: FileReferenceLink) {
+        page = .files
+        fileBrowser.openReference(link)
     }
 
     func start() async {
@@ -134,6 +168,10 @@ final class SessionTab: Identifiable {
         hasStopped = true
         LiveSessions.unregister(viewModel.controller)
         gitCountTask?.cancel()
+        if let openReferenceObserver {
+            NotificationCenter.default.removeObserver(openReferenceObserver)
+            self.openReferenceObserver = nil
+        }
         fileBrowser.stop()
         await viewModel.stop()
     }

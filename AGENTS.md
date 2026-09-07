@@ -351,16 +351,20 @@ Three targets (see `project.yml`):
   protocol. Run via `xcodebuild -scheme ClientTests test`.
 - **RenderingTests** (unit-test bundle, XCTest, `MainActor`): unit tests for
   the AppKit rendering layer (`MarkdownText`, `TranscriptText`, `TextRowView`,
-  `CodeCopyButton`). Because the renderer lives in the Client target (which
-  ClientTests cannot link — it links Core only), this target compiles the
-  renderer sources directly alongside the tests. Covers inline/block styling,
-  code-block ranges and cards/copy buttons, block spacing, soft/hard line
-  breaks, the load-bearing measurement invariant (rendered height ==
-  measured height), the append-only streaming storage regressions
-  (`StreamingStorageTests`) and the streaming crossfade
-  (`StreamingFadeTests`). Run via `xcodebuild -scheme RenderingTests
-  test`; in the sandbox via `scripts/run-rendering-tests.sh` (plain `swiftc` +
-  the stub XCTest module, `TEST_FILTER=<substring>` for a subset).
+  `CodeCopyButton`) plus the file-browser content pane
+  (`ReadOnlyFilePane`/`FilePaneContainer`, compiled with a SyntaxHighlighter
+  stub — the real one links Highlightr). Because these live in the Client
+  target (which ClientTests cannot link — it links Core only), this target
+  compiles the renderer sources directly alongside the tests. Covers
+  inline/block styling, code-block ranges and cards/copy buttons, block
+  spacing, soft/hard line breaks, the load-bearing measurement invariant
+  (rendered height == measured height), the append-only streaming storage
+  regressions (`StreamingStorageTests`), the streaming crossfade
+  (`StreamingFadeTests`) and the reference-jump reveal in the file pane
+  (`FilePaneReferenceTests` — anchor-to-line, flash, persistent anchor). Run
+  via `xcodebuild -scheme RenderingTests test`; in the sandbox via
+  `scripts/run-rendering-tests.sh` (plain `swiftc` + the stub XCTest module,
+  `TEST_FILTER=<substring>` for a subset).
 - **CoordinatorTests** (unit-test bundle, XCTest, `MainActor`): end-to-end
   tests for the transcript `Coordinator`'s keyboard navigation — the
   Cmd+Up/Down user-message cycle, its scroll/focus/follow effects, and
@@ -432,12 +436,15 @@ concurrency.
 - `TextDiff` / `EditToolArgs` — the pure line diff (prefix/suffix trim +
   bounded LCS, GitHub removed-then-added ordering) and the edit-tool
   arguments decoder behind the tool card's red/green diff view.
-- `GitStatus` / `CodeReference` / `RelativePath` — the git plumbing and
-  reference model behind the file browser: read-only git subprocesses
-  (`ls-files` + porcelain classification — two calls, never per-file diffs at
-  listing time), the copied `path:line` reference payload, and relative-path
-  math. All pure/async — no AppKit. Per-file content (HEAD side, diff) is
-  read on demand in the Client pane, never during a listing.
+- `GitStatus` / `CodeReference` / `FileReferenceLink` / `RelativePath` — the
+  git plumbing and reference model behind the file browser: read-only git
+  subprocesses (`ls-files` + porcelain classification — two calls, never
+  per-file diffs at listing time), the copied `path:line` reference payload
+  (`CodeReference` — frozen, absolute), the agent-emitted `pi-file://` link
+  parser (`FileReferenceLink` — click-time, cwd-relative; the read-side twin
+  that shares only a convention), and relative-path math. All pure/async — no
+  AppKit. Per-file content (HEAD side, diff) is read on demand in the Client
+  pane, never during a listing.
 - `StreamedPaste` — pure head/tail + chunk splitting for streaming very large
   pastes into the prompt input (surrogate-safe boundaries).
 - `SessionListing` — recent-session discovery from `~/.pi/agent/sessions`.
@@ -448,6 +455,11 @@ concurrency.
 - `RPCEndpointSettings` — the persisted agent RPC endpoint: the local pi
   executable spawned as `pi --mode rpc`. Defaults to `PiExecutable.resolve()`
   (pi on PATH); the Settings page lets the user point at a different binary.
+- `PiAgentSettings` — maintains the ONE pointer pi's global settings hold to
+  the app-bundled skills directory (`~/.pi/agent/settings.json` `skills`
+  key). Merges, never clobbers: every other setting is preserved verbatim,
+  and a corrupt/read-only file is left alone. Called at app launch by
+  `AppDelegate` with the bundle's `Resources/Skills` path.
 - `ToolTimeoutSettings` — the configurable tool-call timeout (default
   10 minutes, off when disabled). This is a runtime *behavior*, so unlike the
   sandbox settings / RPC endpoint it is read LIVE at the start of each tool
@@ -598,7 +610,11 @@ concurrency.
 - `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
   and subprocess cleanup on termination (every live child gets EOF on quit).
   `AppDelegate` also enforces the single-window rule (closes duplicate main
-  windows).
+  windows) and, at launch, registers the app-bundled skills directory
+  (`…/Resources/Skills`, shipped from `Client/Resources/Skills` via
+  `project.yml`) in pi's GLOBAL settings (`~/.pi/agent/settings.json`
+  `skills` array, see `PiAgentSettings`) — the skill CONTENT lives in the app
+  bundle and is never written into the pi folder; only the pointer is.
 - `SandboxSettingsModel` / `SandboxSettingsView` — the editable sandbox
   settings: the Settings page (app menu → Settings…, and a Projects-menu
   entry) and the first-run picker fields. Saved to the same
@@ -1047,12 +1063,84 @@ only what it needs.**
   added yet" badge and no fill (no baseline to score them against); the
   content pane still computes the exact interleaved lines for the ONE
   selected file.
+- **Agent-emitted file references open files (clickable `pi-file://` links).**
+  The bundled `file-reference-links` skill teaches the agent to write
+  `[path:line](pi-file:///path#Lline)` markdown links instead of plain text.
+  MarkdownText already renders links (any scheme) with `.link`; clicking one
+  in a transcript row routes to the coordinator, which posts a cwd-keyed
+  `Notification.Name.openFileReference` carrying a parsed `FileReferenceLink`
+  (Core — the read-side twin of `CodeReference`; paths stay cwd-relative,
+  the tool-call convention). The owning `SessionTab` observes it (cwd-scoped,
+  removed in `stop()`), flips to the Files page, and drives the browser
+  store. SELECTION IS STORE STATE on purpose: `FileBrowserStore.selectedPath`
+  (plus one-shot `pendingRevealPath`/`pendingReference`) lets a tab-level
+  handler open a file without the view's cooperation. An open must also (a)
+  expand the file's ancestor folders before the row can exist in the flatten
+  (`FileBrowserView`'s `.onChange(of: store.selectedPath)`, the same
+  ancestor-forcing changed files get) and (b) scroll the row into view — a
+  one-shot `pendingRevealPath` the table's coordinator consumes once, never
+  on ordinary clicks. The content pane's jump is a REFERENCE-DRIVEN OPEN with
+  three parts, all inside `FilePaneContainer.revealReference` (driven by
+  `ReadOnlyFilePane.pendingReference`): the START line anchors the TOP of the
+  viewport (an explicit clip scroll, not `scrollRangeToVisible`), the whole
+  range gets a fading amber flash (~0.85s, drawn UNDER the glyphs in
+  `ReadOnlyCodeTextView.drawBackground`), and a persistent anchor stays after
+  the fade — a capsule over the start line in the ruler gutter plus a thin
+  accent bar down the range's left edge — cleared by any later plain reload.
+  The reference target TRAVELS WITH ITS LOAD (a parameter of the reload task,
+  never shared coordinator state): a later, unrelated reload can't overwrite
+  it mid-flight, which is how the "opens at the top" bug happened (a second
+  reload from a redundant reload-token bump on selection change superseded
+  the reference load before it landed — selection changes therefore do NOT
+  bump the pane token; path changes alone reload, deduped on (path, token)).
+  Ordering is load-bearing: the jump runs AFTER `codeView.load`'s scroll-to-
+  top, and geometry is forced with `ensureLayout` before the scroll/flash
+  rects are computed. `FilePaneReferenceTests` (RenderingTests) pin all of
+  this against the real pane in an offscreen window.
+  A reference to a path outside the git-derived listing (gitignored, typo'd)
+  still can't be opened — pre-existing gap, same as the live change signal.
 - The content pane (`ReadOnlyFilePane`) is the heavy part and runs ONLY when
   a file is selected: read + `git show` + `TextDiff` off-main, applied as one
   attributed buffer with the added/deleted-line overlay. Loading/chrome
   overlays use the AppKit `SpinnerView` — never a SwiftUI animated
   `ProgressView` in a mounted view (it keeps the shell graph invalidating
-  every frame).
+  every frame). Files are loaded WHOLE into the code view — the entire
+  attributed string lives in the NSTextView's storage (no windowed/virtualized
+  loading like the transcript's); TextKit LAYS OUT lazily as you scroll, but
+  memory holds the whole file.
+- **The vertical scroller is an edit map.** `FilePaneContainer` installs a
+  `CodePaneEditMarkerScroller` (an `NSScroller` subclass; assigning a subclass
+  forces the legacy always-visible scroller style, which is the point — the
+  map is only useful while the bar is shown). Drawing goes through
+  `drawKnobSlot` per the NSScroller.h guidance (a bare `draw(_:)` override is
+  unsupported; the system applies its fade alpha to parts-drawing methods).
+  Each edited line becomes a colored tick at `(line − 0.5) / lineCount`
+  along the bar, mapped the same way the knob travels (knob-top semantics:
+  a tick shows exactly how far you must scroll to bring that edit to the top
+  of the viewport; ticks stay put while the knob moves over them). The
+  markers mirror the edit overlay exactly (`PaneOverlay` → `PaneMarkers`):
+  added lines of a modification are green ticks; a whole new file tints the
+  whole track green; a deleted file's committed buffer tints it red. Because
+  files are loaded whole, every marker is EXACT — the pin-at-top/bottom
+  stacking is only relevant if incremental loading is ever added (see
+  `CodePaneEditMarkerScroller`). The map refreshes on every load
+  (`applyMarkers`), so live agent edits re-highlight as they land.
+  `FilePaneScrollbarMarkerTests` (RenderingTests) pin the fractions, the
+  whole-track tints, and the per-load replacement against the real pane.
+
+  The file LIST's vertical scroller is the same map for the tree: the
+  `FileTreeCoordinator` installs an `EditMarkerScroller` (the generic base
+  type; the pane's `CodePaneEditMarkerScroller` is now a named subclass of
+  it) and re-derives its ticks whenever the flattened row list changes — one
+  tick per changed-file row (added/modified/deleted/untracked, via
+  `rowMarkerColor`) at `(row + 0.5) / rowCount`, the tree's uniform-height
+  analog of the pane's `(line − 0.5) / lineCount`. Rows are all one height,
+  so a tick's bar position is exact and stays put while the knob travels over
+  it. The map speaks the tree's own change vocabulary: ticks reuse the row
+  fills' deletion↔addition blend hues (at full opacity — a ~4×5px tick needs
+  marker strength, not the row-background wash), and untracked rows get
+  informational blue ticks even though the fill leaves them blank — every row
+  the review gate counts is on the bar.
 
 ### How to add to the file browser / pages (keep the invariants)
 

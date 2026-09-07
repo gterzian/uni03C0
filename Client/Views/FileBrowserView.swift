@@ -28,10 +28,6 @@ struct FileBrowserView: View {
     /// materialized window). Survives refreshes because it is keyed by stable
     /// directory paths.
     @State private var expandedDirectories: Set<String> = []
-    @State private var selection: String?
-    /// Bumped whenever the open file should reload (selection change, or a
-    /// change event naming the open file / a turn end).
-    @State private var paneToken = 0
     @State private var didExpandAllOnce = false
     /// Memoized flattened rows (see `rows`) — a class so body evaluations can
     /// refresh it without writing `@State` (which would re-invalidate).
@@ -70,16 +66,31 @@ struct FileBrowserView: View {
             // from under them.
             guard (note.userInfo?["cwd"] as? URL) == store.cwd else { return }
             let path = note.userInfo?["path"] as? String
-            if path == nil || path == selection {
-                paneToken += 1
+            if path == nil || path == store.selectedPath {
+                store.bumpPaneReload()
             }
         }
         .onChange(of: store.version) { _, _ in
             reconcileExpansion()
         }
-        .onChange(of: selection) { _, newValue in
-            if newValue != nil {
-                paneToken += 1
+        // A selection change — a tree click, or an EXTERNAL open (a click on
+        // an agent-emitted file reference in the transcript): open the new
+        // path's ancestor folders (the tree can only select a row that exists
+        // in the current flatten — a file under a collapsed folder needs its
+        // ancestors opened, exactly like the changed-file expansion in
+        // `reconcileExpansion`), and drop any pending reference intents that
+        // belonged to a DIFFERENT path (the user navigated away before the
+        // pane/tree could consume them — they must not leak into the file they
+        // opened instead). NO reload-token bump here: a path change alone
+        // reloads the pane (`ReadOnlyFilePane` dedupes on (path, token)), and
+        // a redundant bump would trigger a SECOND reload that supersedes a
+        // reference-driven load before it lands, dropping its target line.
+        .onChange(of: store.selectedPath) { _, newValue in
+            if let newValue {
+                expandedDirectories.formUnion(ancestorDirectories(of: [newValue]))
+                if let pending = store.pendingReference, pending.path != newValue {
+                    store.clearReferenceIntents()
+                }
             }
         }
     }
@@ -95,9 +106,14 @@ struct FileBrowserView: View {
     private var treeColumn: some View {
         FileTreeTable(
             rows: rows,
-            selectedPath: selection,
-            onSelect: { selection = $0 },
-            onToggleDirectory: { toggleExpansion($0) }
+            selectedPath: store.selectedPath,
+            // The one-shot reveal of an externally-opened file (nil for plain
+            // clicks): the coordinator scrolls the row into view once, then
+            // clears it via `onRevealConsumed`.
+            revealPath: store.pendingRevealPath,
+            onSelect: { store.selectedPath = $0 },
+            onToggleDirectory: { toggleExpansion($0) },
+            onRevealConsumed: { store.consumePendingReveal() }
         )
         .overlay {
             if store.isLoading && rows.isEmpty {
@@ -169,8 +185,16 @@ struct FileBrowserView: View {
     /// what keeps the review surface open without auto-expanding the whole
     /// project.
     private func ancestors(ofChangedFiles entries: [String: GitStatus.FileEntry]) -> Set<String> {
+        ancestorDirectories(of: entries.filter { $0.value.kind != .normal }.map(\.key))
+    }
+
+    /// The ancestor directories of `paths` (top-level files have none). Used
+    /// by the changed-file expansion AND by selection: opening a file under a
+    /// collapsed folder must expand every directory on its path first, or the
+    /// row never appears in the flatten for the tree to select/reveal.
+    private func ancestorDirectories(of paths: [String]) -> Set<String> {
         var ancestors: Set<String> = []
-        for (path, entry) in entries where entry.kind != .normal {
+        for path in paths {
             let components = path.split(separator: "/")
             guard components.count > 1 else { continue }
             var directory = ""
@@ -239,7 +263,7 @@ struct FileBrowserView: View {
     /// doesn't hug the title bar.
     private var editorMeta: some View {
         HStack(spacing: 8) {
-            if let path = selection, store.fileEntries[path] != nil {
+            if let path = store.selectedPath, store.fileEntries[path] != nil {
                 Image(systemName: "doc.text")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -266,8 +290,15 @@ struct FileBrowserView: View {
         VStack(spacing: 0) {
             editorMeta
             Divider()
-            if let path = selection, let entry = store.fileEntries[path] {
-                ReadOnlyFilePane(cwd: store.cwd, path: path, kind: entry.kind, reloadToken: paneToken)
+            if let path = store.selectedPath, let entry = store.fileEntries[path] {
+                ReadOnlyFilePane(
+                    cwd: store.cwd,
+                    path: path,
+                    kind: entry.kind,
+                    reloadToken: store.paneReloadToken,
+                    pendingReference: store.pendingReference,
+                    onReferenceConsumed: { store.consumePendingReference() }
+                )
             } else {
                 ContentUnavailableView(
                     "Select a file",
@@ -316,6 +347,33 @@ fileprivate func rowTintColor(for entry: GitStatus.FileEntry?) -> NSColor? {
     }
 }
 
+/// The SCROLLBAR tick color for a changed file row (see `EditMarkerScroller`):
+/// one tick per row git sees as changed — added, modified, deleted, or
+/// agent-created untracked — the same "review surface" set the changed-file
+/// ancestor expansion and the tab's edited-file badge count from, so the bar,
+/// the force-opened folders, and the badge all tell one story. Colors mirror
+/// the fill behind the name (`rowTintColor`): a row with countable diff stats
+/// blends red→amber→green by its deletion↔addition share, and a stat-less row
+/// falls back to its kind color. Unlike the fill, ticks draw at full opacity —
+/// a ~4×5px tick on the track needs marker strength, not the wash tuned for a
+/// light row background — and untracked rows, which the fill leaves blank (no
+/// baseline to score), still get a tick: informational blue, "new content, not
+/// added yet". nil = no tick.
+fileprivate func rowMarkerColor(for entry: GitStatus.FileEntry?) -> NSColor? {
+    guard let entry, entry.kind != .normal else { return nil }
+    if let stats = entry.stats, stats.added + stats.deleted > 0 {
+        let addShare = CGFloat(stats.added) / CGFloat(stats.added + stats.deleted)
+        return NSColor(hue: addShare / 3, saturation: 0.85, brightness: 0.9, alpha: 1)
+    }
+    switch entry.kind {
+    case .added: return .systemGreen
+    case .deleted: return .systemRed
+    case .modified: return .systemOrange
+    case .untracked: return .systemBlue
+    case .normal: return nil
+    }
+}
+
 /// The file tree as an `NSTableView` (the transcript's technique, applied to
 /// the sidebar): the SwiftUI side holds only DATA — the flattened visible
 /// rows + the selection — and the table materializes just the rows on screen.
@@ -327,8 +385,14 @@ fileprivate func rowTintColor(for entry: GitStatus.FileEntry?) -> NSColor? {
 private struct FileTreeTable: NSViewRepresentable {
     let rows: [FileBrowserView.Row]
     let selectedPath: String?
+    /// When non-nil, the table must reveal that path's row (scroll it into
+    /// view) once it exists in `rows` — an externally-opened file (agent file
+    /// reference), where the user isn't already looking at the row. Cleared
+    /// through `onRevealConsumed` after the scroll.
+    let revealPath: String?
     let onSelect: (String?) -> Void
     let onToggleDirectory: (String) -> Void
+    let onRevealConsumed: () -> Void
 
     func makeCoordinator() -> FileTreeCoordinator { FileTreeCoordinator() }
 
@@ -340,8 +404,10 @@ private struct FileTreeTable: NSViewRepresentable {
         context.coordinator.update(
             rows: rows,
             selectedPath: selectedPath,
+            revealPath: revealPath,
             onSelect: onSelect,
-            onToggleDirectory: onToggleDirectory
+            onToggleDirectory: onToggleDirectory,
+            onRevealConsumed: onRevealConsumed
         )
     }
 }
@@ -350,6 +416,7 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
     private static let rowHeight: CGFloat = 22
 
     private var tableView: FileTreeTableView!
+    private var scrollView: NSScrollView!
     private var rows: [FileBrowserView.Row] = []
     /// The rows' paths (in table order), for O(n) change detection — the tree
     /// only reloads when this actually differs (or a row's kind — hence the
@@ -360,6 +427,12 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
     private var appliedSelection: String?
     private var onSelect: ((String?) -> Void)?
     private var onToggleDirectory: ((String) -> Void)?
+    /// The path an external open asked the table to reveal (see
+    /// `FileTreeTable.revealPath`). Held until the row exists in the flatten
+    /// AND has been scrolled into view — a reference under a collapsed folder
+    /// waits for the view's ancestor expansion to add its row on a later pass.
+    private var revealPath: String?
+    private var onRevealConsumed: (() -> Void)?
     /// True while a selection is being APPLIED from SwiftUI (a reload or an
     /// external selection change) — the resulting selectionDidChange must not
     /// round-trip back into `onSelect`.
@@ -386,6 +459,15 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
 
         let sv = NSScrollView()
         sv.documentView = tv
+        // The edited-file map lives on the vertical scroller (an
+        // `EditMarkerScroller`, the type the content pane's scroller is a
+        // subclass of). It must be installed BEFORE the scroll view creates
+        // its own (`hasVerticalScroller = true` below would lazily make a
+        // plain NSScroller otherwise — the content pane's install order), and
+        // assigning a subclass forces the legacy (always-visible) scroller
+        // style — intended, exactly like the content pane: the map is only
+        // useful while the bar is shown.
+        sv.verticalScroller = EditMarkerScroller()
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
         sv.drawsBackground = false
@@ -401,6 +483,7 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
             return true
         }
         tableView = tv
+        scrollView = sv
         return sv
     }
 
@@ -412,11 +495,15 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
     func update(
         rows: [FileBrowserView.Row],
         selectedPath: String?,
+        revealPath: String?,
         onSelect: @escaping (String?) -> Void,
-        onToggleDirectory: @escaping (String) -> Void
+        onToggleDirectory: @escaping (String) -> Void,
+        onRevealConsumed: @escaping () -> Void
     ) {
         self.onSelect = onSelect
         self.onToggleDirectory = onToggleDirectory
+        self.onRevealConsumed = onRevealConsumed
+        self.revealPath = revealPath
         guard tableView != nil else { return }
 
         let keys = rows.map { $0.id + Self.entrySuffix($0.node.entry) }
@@ -431,20 +518,74 @@ private final class FileTreeCoordinator: NSObject, NSTableViewDataSource, NSTabl
             // re-apply the SwiftUI selection (it no-ops when the path matches
             // `appliedSelection`, which still holds the pre-reload row).
             appliedSelection = nil
+            // The row list changed, so the scrollbar's edited-file map is
+            // stale — refresh it from the new flatten.
+            updateEditMarkers()
         }
         syncSelection(selectedPath)
     }
 
     private func syncSelection(_ path: String?) {
-        guard path != appliedSelection else { return }
+        guard path != appliedSelection else {
+            // Selection already applied — but a reveal request for this same
+            // path may still be pending (a reference click on the file that is
+            // already open: nothing re-runs the select, yet the row still has
+            // to scroll into view).
+            if let path, path == revealPath, let index = rowIDs.firstIndex(of: path) {
+                revealRow(path, at: index)
+            }
+            return
+        }
         appliedSelection = path
         applyingSelection = true
         defer { applyingSelection = false }
         if let path, let index = rowIDs.firstIndex(of: path) {
             tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            if path == revealPath {
+                revealRow(path, at: index)
+            }
         } else {
             tableView.deselectAll(nil)
         }
+    }
+
+    /// Scrolls the row into view and consumes the one-shot reveal request. A
+    /// path that never appears in the flatten (a reference to a file outside
+    /// the git-derived listing) is never revealed — the request stays pending
+    /// until the user selects something else (see
+    /// `FileBrowserView`'s stale-intent clearing on selection change).
+    private func revealRow(_ path: String, at index: Int) {
+        tableView.scrollRowToVisible(index)
+        revealPath = nil
+        onRevealConsumed?()
+    }
+
+    // MARK: Scrollbar edit map
+
+    /// Refreshes the vertical scroller's edited-file ticks for the current
+    /// flatten: one tick per changed-file row (see `rowMarkerColor`) at the
+    /// row's fraction of the document, `(index + 0.5) / count` — rows are
+    /// uniform-height, so a row's bar position is exact (the content pane's
+    /// `(line − 0.5) / lineCount` mapping, applied to rows). Markers are
+    /// doc-anchored and change only when the row list changes — reloads,
+    /// expansion flips, refreshes — never on scroll or selection.
+    private func updateEditMarkers() {
+        guard let scroller = scrollView.verticalScroller as? EditMarkerScroller else { return }
+        let count = rows.count
+        guard count > 0 else {
+            scroller.markers = []
+            return
+        }
+        var markers: [EditMarkerScroller.Marker] = []
+        markers.reserveCapacity(64)
+        for (index, row) in rows.enumerated() {
+            guard let color = rowMarkerColor(for: row.node.entry) else { continue }
+            markers.append(EditMarkerScroller.Marker(
+                fraction: (CGFloat(index) + 0.5) / CGFloat(count),
+                color: color
+            ))
+        }
+        scroller.markers = markers
     }
 
     // MARK: Scroll preservation across reloads

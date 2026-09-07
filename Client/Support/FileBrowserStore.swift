@@ -140,6 +140,74 @@ final class FileBrowserStore {
     /// O(1).
     private(set) var version = 0
 
+    // MARK: Selection + external "open file" requests
+
+    /// The currently selected file path (relative to `cwd`). STORE-owned, not
+    /// view `@State` — a tab-level handler (a click on an agent-emitted file
+    /// reference in the transcript) must be able to select a file without the
+    /// Files view's cooperation. The tree binds to this (clicking a row writes
+    /// it) and the content pane is derived from it.
+    var selectedPath: String?
+    /// One-shot tree reveal request set by `openReference`: the tree's
+    /// coordinator scrolls the just-selected row into view ONCE (an ordinary
+    /// click needs no scroll — the user is already looking at the row), then
+    /// the coordinator consumes it via `consumePendingReveal`. Held until the
+    /// target row exists in the flatten (a reference under a collapsed folder
+    /// needs the view to open its ancestors first — the reveal fires on a
+    /// later update pass).
+    var pendingRevealPath: String?
+    /// One-shot content-pane target set by `openReference`: the parsed
+    /// `FileReferenceLink` whose start/end lines the content pane should jump
+    /// to, flash, and anchor when it next loads the selected file. Consumed
+    /// via `consumePendingReference` the moment the pane captures it (the load
+    /// is async, so the pane takes the value at reload time). Cleared by
+    /// `clearReferenceIntents` when the user navigates to a different file
+    /// first.
+    var pendingReference: FileReferenceLink?
+    /// Bumped whenever the open file should reload: a selection change, a
+    /// file-change event naming the open file (or a turn end), or a reference
+    /// open — even to the file already open (`ReadOnlyFilePane` dedupes on
+    /// (path, token), so a same-path reload needs a fresh token).
+    private(set) var paneReloadToken = 0
+
+    /// Marks the open file as needing a content reload.
+    func bumpPaneReload() {
+        paneReloadToken &+= 1
+    }
+
+    /// The tree coordinator has scrolled the referenced row into view.
+    func consumePendingReveal() {
+        pendingRevealPath = nil
+    }
+
+    /// The content pane has captured the pending reference (it will jump to
+    /// its line when the load lands).
+    func consumePendingReference() {
+        pendingReference = nil
+    }
+
+    /// Drops every pending reference intent (used when the user navigates to a
+    /// different file before the pane/tree could consume them).
+    func clearReferenceIntents() {
+        pendingRevealPath = nil
+        pendingReference = nil
+    }
+
+    /// A click on an agent-emitted `pi-file` reference in the transcript (the
+    /// owning `SessionTab`'s observer calls this): select the referenced file,
+    /// ask the tree to reveal it, and arm the content pane to jump to the
+    /// reference's lines (scroll the start line to the top, flash the range,
+    /// keep an anchor at the start line). The ancestor-expansion + scroll-
+    /// reveal happen on the view side, driven by
+    /// `selectedPath`/`pendingRevealPath` changing here (see
+    /// `FileBrowserView`).
+    func openReference(_ link: FileReferenceLink) {
+        selectedPath = link.path
+        pendingRevealPath = link.path
+        pendingReference = link
+        bumpPaneReload()
+    }
+
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var refreshInFlight = false
     /// Debounce: a burst of agent edits collapses into one listing pass.

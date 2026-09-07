@@ -54,6 +54,12 @@ targets:
     platform: macOS
     sources:
       - Client
+    resources:
+      # The agent skills this app bundles (the `file-reference-links` skill).
+      # Copied into the bundle as Resources/Skills/… and registered with pi's
+      # GLOBAL settings at app launch — the skill content lives in the app
+      # bundle, never written into the pi folder.
+      - Client/Resources/Skills
     dependencies:
       - target: Core
         embed: true
@@ -100,6 +106,10 @@ targets:
       - Client/Views/TextRowView.swift
       - Client/Views/CodeCopyButton.swift
       - Client/Views/ReadOnlyCodeTextView.swift
+      # The file-browser content pane (FilePaneContainer + the reference-jump
+      # reveal). Its SyntaxHighlighter dependency is stubbed in the test
+      # bundle (it links Highlightr, which the renderer bundles don't).
+      - Client/Views/ReadOnlyFilePane.swift
       - Client/Accessibility/DisplayOptions.swift
       - Client/Support/FontSettings.swift
       - RenderingTests

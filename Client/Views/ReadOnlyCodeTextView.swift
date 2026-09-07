@@ -53,12 +53,102 @@ final class ReadOnlyCodeTextView: NSTextView {
         isEditable = false
         isSelectable = true
         isRichText = false
-        drawsBackground = false
+        drawsBackground = true
+        backgroundColor = .textBackgroundColor
         // Belt-and-suspenders on top of `isEditable = false`: the delegate
         // (this view) refuses every text change. Explicit, in the same spirit
         // as the sandbox policy's `with message` deny rules — this path is
         // deliberately closed off, not guarded by a single flag.
         delegate = self
+    }
+
+    // MARK: - Reference reveal (flash + anchor)
+
+    /// Persistent accent bar along a reference jump's line range (drawn under
+    /// the glyphs in `drawBackground`, so it scrolls with the text and stays
+    /// after the flash fades). Cleared by the next `displayContent`/placeholder.
+    private(set) var revealAnchorRect: NSRect? {
+        didSet { needsDisplay = true }
+    }
+    /// The fading flash rectangle of a reference jump; nil once faded out.
+    private(set) var revealFlashRect: NSRect? {
+        didSet { needsDisplay = true }
+    }
+    /// Current flash opacity (driven by `revealFlashTimer`).
+    private(set) var revealFlashAlpha: CGFloat = 0
+    private var revealFlashTimer: Timer?
+    private var revealFlashStart: Date?
+    /// The highlight color of a reference jump (amber, so it reads on both
+    /// light and dark syntax themes).
+    private static let revealColor = NSColor.systemYellow
+
+    /// Starts the flash animation over `rect` (text-view coordinates) and
+    /// keeps the anchor bar at the range's left edge.
+    func startReveal(flashRect: NSRect, anchorRect: NSRect) {
+        stopRevealFlash()
+        revealFlashRect = flashRect
+        revealAnchorRect = anchorRect
+        revealFlashAlpha = 0.55
+        revealFlashStart = Date()
+        needsDisplay = true
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.tickRevealFlash()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        revealFlashTimer = timer
+    }
+
+    /// Clears both the flash and the anchor (a new load, a placeholder).
+    func clearReveal() {
+        stopRevealFlash()
+        if revealFlashRect != nil {
+            revealFlashRect = nil
+        }
+        if revealAnchorRect != nil {
+            revealAnchorRect = nil
+        }
+    }
+
+    private func stopRevealFlash() {
+        revealFlashTimer?.invalidate()
+        revealFlashTimer = nil
+        if revealFlashRect != nil {
+            revealFlashRect = nil
+        }
+        revealFlashAlpha = 0
+        revealFlashStart = nil
+    }
+
+    private func tickRevealFlash() {
+        // ~0.85 s linear fade from 0.55 → 0, then the flash is gone for good
+        // (the anchor bar stays).
+        let duration: TimeInterval = 0.85
+        let elapsed = revealFlashStart.map { Date().timeIntervalSince($0) } ?? duration
+        if elapsed >= duration {
+            stopRevealFlash()
+            return
+        }
+        revealFlashAlpha = max(0, 0.55 * (1 - elapsed / duration))
+        needsDisplay = true
+    }
+
+    /// Draws the reveal chrome UNDER the glyphs: NSTextView paints the
+    /// background first and the text after, so a background fill reads as a
+    /// text highlight rather than a translucent wash over the characters. The
+    /// anchor is a thin accent bar along the range's left edge; the flash is
+    /// the fading fill (see `startReveal`).
+    override func drawBackground(in rect: NSRect) {
+        super.drawBackground(in: rect)
+        if let anchorRect = revealAnchorRect {
+            Self.revealColor.withAlphaComponent(0.6).setFill()
+            NSRect(x: 0, y: anchorRect.minY, width: 3, height: max(anchorRect.height, 1)).fill()
+        }
+        if let flashRect = revealFlashRect, revealFlashAlpha > 0.005 {
+            Self.revealColor.withAlphaComponent(revealFlashAlpha).setFill()
+            flashRect.fill()
+        }
     }
 
     @available(*, unavailable)
@@ -165,15 +255,24 @@ extension ReadOnlyCodeTextView: NSTextViewDelegate {
     }
 }
 
-// MARK: - Line-number ruler
-
-/// The content pane's line-number gutter: a custom `NSRulerView` (the
+// MARK: - Line-number ruler/// The content pane's line-number gutter: a custom `NSRulerView` (the
 /// mechanism source editors use) drawing numbers read from the code view's
 /// per-load offset table, scrolled in sync with the text automatically by the
 /// scroll view. Purely cosmetic — the copy/selection machinery in
 /// `ReadOnlyCodeTextView` needs no visible gutter at all.
 final class CodeLineRulerView: NSRulerView {
     weak var codeView: ReadOnlyCodeTextView?
+
+    /// The first line of the current reference jump — drawn as a persistent
+    /// marker in the gutter (the anchor that stays after the flash fades), so
+    /// the user can still find where the referenced range started. Cleared
+    /// when a different file loads without a reference.
+    var anchorLine: Int? {
+        didSet {
+            guard anchorLine != oldValue else { return }
+            needsDisplay = true
+        }
+    }
 
     /// Flipped so drawing coordinates run top-down like the text view's
     /// layout (line N sits below line N−1).
@@ -227,6 +326,25 @@ final class CodeLineRulerView: NSRulerView {
         ]
         let numberPadding: CGFloat = 6
 
+        // The persistent reference-jump anchor: a soft capsule over the start
+        // line's vertical span, drawn BEFORE the numbers so they stay legible
+        // on top of it.
+        if let anchorLine, anchorLine >= 1, anchorLine <= lineCount {
+            let centerYInCode = NSPoint(x: 0, y: topInset + (CGFloat(anchorLine) - 0.5) * lineHeight)
+            let centerYInRuler = convert(centerYInCode, from: codeView).y
+            NSColor.systemYellow.withAlphaComponent(0.4).setFill()
+            NSBezierPath(
+                roundedRect: NSRect(
+                    x: 4,
+                    y: centerYInRuler - lineHeight * 0.55,
+                    width: ruleThickness - 8,
+                    height: lineHeight * 1.1
+                ),
+                xRadius: 4,
+                yRadius: 4
+            ).fill()
+        }
+
         for line in firstLine...lastLine {
             guard line >= 1, line <= offsets.count else { continue }
             let label = "\(line)" as NSString
@@ -245,3 +363,101 @@ final class CodeLineRulerView: NSRulerView {
         }
     }
 }
+
+// MARK: - Edit-marker vertical scroller
+
+/// A vertical scroller annotated with colored ticks showing where content
+/// with edits sits along the document — the content pane's edited lines and
+/// the file tree's edited-file rows alike.
+///
+/// Each edited position gets a colored tick at the scrollbar position it
+/// would occupy when scrolled to — the knob-top mapping, so a tick tells you
+/// exactly how far you have to scroll to bring that edit into view at the
+/// top, and as you scroll the ticks stay put while the knob travels over them
+/// (the markers are doc-anchored; they update only when the content reloads
+/// or the row list changes, never on scroll).
+///
+/// Drawn via `drawKnobSlot` per the NSScroller.h guidance — the supported
+/// customization seam, with the system applying its own track/knob fade alpha
+/// to whatever these parts-drawing methods paint (a plain `draw(_:)` override
+/// is explicitly not supported). Assigning a scroller SUBCLASS to a scroll
+/// view forces the legacy scroller style (always-visible), which is the point:
+/// the edit map is only useful while the bar is shown. The knob is drawn by
+/// the default `drawKnob`, on top of whatever this draws.
+class EditMarkerScroller: NSScroller {
+    /// One edit tick: `fraction` is the edited position's center as a fraction
+    /// of the document (0 = top, 1 = bottom); `color` its marker color.
+    struct Marker {
+        let fraction: CGFloat
+        let color: NSColor
+    }
+
+    /// Whole-buffer edit tint (a file that is entirely new/deleted): fills the
+    /// whole track behind the knob. nil = per-line ticks only.
+    var wholeTrackColor: NSColor? {
+        didSet { needsDisplay = true }
+    }
+
+    /// The edit ticks, in ascending document order.
+    var markers: [Marker] = [] {
+        didSet { needsDisplay = true }
+    }
+
+    /// Clears both the ticks and the whole-track tint.
+    func clearMarkers() {
+        if !markers.isEmpty { markers = [] }
+        if wholeTrackColor != nil { wholeTrackColor = nil }
+    }
+
+    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        super.drawKnobSlot(in: slotRect, highlight: flag)
+        drawEditMarkers(in: slotRect)
+    }
+
+    /// Paints the edit map into the slot, UNDER the knob (the knob is drawn
+    /// afterwards by the default `drawKnob`, so it covers any tick it overlaps
+    /// — a tick whose edit is currently on screen disappears under the knob,
+    /// exactly the \"you are here\" read). The scroller is flipped (top-down):
+    /// slot y grows downward, matching the document.
+    private func drawEditMarkers(in slotRect: NSRect) {
+        let tickWidth: CGFloat = 4
+        let tickHeight: CGFloat = 5
+        let x = slotRect.midX - tickWidth / 2
+
+        if let wholeTrackColor {
+            wholeTrackColor.withAlphaComponent(0.28).setFill()
+            NSBezierPath(roundedRect: slotRect, xRadius: slotRect.width / 2, yRadius: slotRect.width / 2).fill()
+        }
+
+        guard !markers.isEmpty else { return }
+        // Map a document fraction to the slot position whose knob-top would
+        // land there: the knob travels over (slotHeight - knobHeight) as the
+        // viewport travels over the scrollable document.
+        // The knob's height at the current scroll (its travel range over the
+        // track is slotHeight - knobHeight). rect(for:) is the authoritative
+        // source when available; knobProportion is the fallback.
+        let knobHeight = rect(for: .knob).height > 0 ? rect(for: .knob).height : knobProportion * slotRect.height
+        let travel = max(slotRect.height - knobHeight, 1)
+        for marker in markers {
+            // Fraction along the scrollable document, clamped to the track.
+            let f = min(max(marker.fraction, 0), 1)
+            let y = slotRect.minY + f * travel - tickHeight / 2
+            marker.color.setFill()
+            NSBezierPath(
+                roundedRect: NSRect(x: x, y: y, width: tickWidth, height: tickHeight),
+                xRadius: tickWidth / 2,
+                yRadius: tickWidth / 2
+            ).fill()
+        }
+    }
+}
+
+/// The content pane's edit map: an `EditMarkerScroller` whose ticks are one
+/// per edited LINE of the open file — the added lines of a modification are
+/// green ticks, and a whole-buffer new/deleted file tints the whole track via
+/// `wholeTrackColor` instead. Kept as its own named subclass (not a bare
+/// `EditMarkerScroller`) so the pane's install/cast sites read as the pane's
+/// own type and it stays free to grow pane-specific behavior; the generic
+/// marker drawing lives in the base, which the file tree's scroller uses for
+/// its per-edited-file ticks.
+final class CodePaneEditMarkerScroller: EditMarkerScroller {}
