@@ -24,6 +24,16 @@ import SwiftUI
 struct FileBrowserView: View {
     let store: FileBrowserStore
 
+    /// Who owns the sidebar collapse state. The split view's column visibility
+    /// is bound HERE — never left to the framework's implicit handling — so the
+    /// Files page's toggle is a normal button in its own column header (see
+    /// `treeHeader`/`editorMeta`), and the automatic window-toolbar item that
+    /// `NavigationSplitView` would otherwise inject is removed (see
+    /// `body`). The button's screen position is fixed by the column's own
+    /// layout, not negotiated against the window title, so it never jumps when
+    /// the column collapses.
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
     /// Which directories are expanded (view state, like the transcript's
     /// materialized window). Survives refreshes because it is keyed by stable
     /// directory paths.
@@ -44,8 +54,22 @@ struct FileBrowserView: View {
     private static let autoExpandFileLimit = 3000
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             treeColumn
+                // Remove the system-injected sidebar toggle from the window
+                // toolbar (`com.apple.SwiftUI.navigationSplitView.toggleSidebar`):
+                // the Files page owns its own toggle in the tree column's
+                // header (`treeHeader`) and must not contribute window chrome —
+                // the window toolbar belongs to the session (SessionTabsView),
+                // not to one of its pages. Must be applied to the SIDEBAR
+                // content; applying it to the split view itself or the detail
+                // silently no-ops.
+                .toolbar(removing: .sidebarToggle)
+                // ORDER MATTERS (macOS 26): the width modifier must be applied
+                // AFTER the toolbar removal — in the other order the removal
+                // wipes the column-width contribution and the sidebar
+                // collapses to its content's intrinsic width (~140pt) instead
+                // of the requested 250-310pt.
                 .navigationSplitViewColumnWidth(min: 250, ideal: 310)
         } detail: {
             detailPane
@@ -97,45 +121,98 @@ struct FileBrowserView: View {
 
     // MARK: - Tree column
 
-    /// The file tree. Rendered by a virtualized AppKit `NSTableView`, not a
-    /// SwiftUI `List`: a `List` over the flattened, fully-expanded row array
-    /// (thousands of rows on a large project) diffs and constructs every row
-    /// on the main thread the moment the page appears — the multi-second
-    /// beachball in samples. An `NSTableView` only ever materializes the
-    /// visible rows (the transcript's exact technique).
+    /// The file tree column: the column's own header row (the collapse toggle
+    /// + a title) above the virtualized AppKit `NSTableView`. A `List` over
+    /// the flattened, fully-expanded row array (thousands of rows on a large
+    /// project) diffs and constructs every row on the main thread the moment
+    /// the page appears — the multi-second beachball in samples. An
+    /// `NSTableView` only ever materializes the visible rows (the transcript's
+    /// exact technique).
     private var treeColumn: some View {
-        FileTreeTable(
-            rows: rows,
-            selectedPath: store.selectedPath,
-            // The one-shot reveal of an externally-opened file (nil for plain
-            // clicks): the coordinator scrolls the row into view once, then
-            // clears it via `onRevealConsumed`.
-            revealPath: store.pendingRevealPath,
-            onSelect: { store.selectedPath = $0 },
-            onToggleDirectory: { toggleExpansion($0) },
-            onRevealConsumed: { store.consumePendingReveal() }
-        )
-        .overlay {
-            if store.isLoading && rows.isEmpty {
-                // AppKit spinner (see `SpinnerView`) — never SwiftUI's
-                // animated `ProgressView`: this page sits inside the window
-                // content hosting view, so a SwiftUI spinner would keep the
-                // whole shell graph invalidating per frame while it spins.
-                HStack(spacing: 8) {
-                    SpinnerView()
-                    Text("Listing files…")
-                        .font(.system(size: 12))
+        VStack(spacing: 0) {
+            treeHeader
+            Divider()
+            FileTreeTable(
+                rows: rows,
+                selectedPath: store.selectedPath,
+                // The one-shot reveal of an externally-opened file (nil for plain
+                // clicks): the coordinator scrolls the row into view once, then
+                // clears it via `onRevealConsumed`.
+                revealPath: store.pendingRevealPath,
+                onSelect: { store.selectedPath = $0 },
+                onToggleDirectory: { toggleExpansion($0) },
+                onRevealConsumed: { store.consumePendingReveal() }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay {
+                // The loading/empty overlays cover the TABLE only, below the
+                // header row (which stays interactive — its toggle works even
+                // while the listing is still in flight).
+                if store.isLoading && rows.isEmpty {
+                    // AppKit spinner (see `SpinnerView`) — never SwiftUI's
+                    // animated `ProgressView`: this page sits inside the window
+                    // content hosting view, so a SwiftUI spinner would keep the
+                    // whole shell graph invalidating per frame while it spins.
+                    HStack(spacing: 8) {
+                        SpinnerView()
+                        Text("Listing files…")
+                            .font(.system(size: 12))
+                    }
+                    .padding(12)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                } else if !store.isLoading && rows.isEmpty {
+                    ContentUnavailableView(
+                        "No files",
+                        systemImage: "folder",
+                        description: Text("Nothing to list — is this folder a git repository?")
+                    )
                 }
-                .padding(12)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-            } else if !store.isLoading && rows.isEmpty {
-                ContentUnavailableView(
-                    "No files",
-                    systemImage: "folder",
-                    description: Text("Nothing to list — is this folder a git repository?")
-                )
             }
         }
+    }
+
+    /// The tree column's own header: the sidebar collapse toggle plus a
+    /// column title. This is where the split view's collapse affordance LIVES
+    /// — a plain SwiftUI button laid out by the column's own stack, not an
+    /// item in the window toolbar (the system one is removed in `body`). Its
+    /// screen position is fixed by ordinary layout rules inside the column,
+    /// so it never repositions when the column collapses; the whole column
+    /// (header included) slides away with the tree.
+    private var treeHeader: some View {
+        HStack(spacing: 8) {
+            sidebarToggleButton
+            Text("Files")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+    }
+
+    /// The collapse toggle, shown in the tree column's header while the tree
+    /// is visible and MIRRORED at the leading edge of the detail column's
+    /// header (`editorMeta`) while it is hidden — the only visible way back
+    /// in once `.detailOnly` removed the tree header with the column. Either
+    /// position flips `columnVisibility` between `.all` and `.detailOnly`
+    /// (the button exists only where the current state allows the flip to be
+    /// meaningful), animated so the column slide is smooth.
+    private var sidebarToggleButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                columnVisibility = columnVisibility == .all ? .detailOnly : .all
+            }
+        } label: {
+            Image(systemName: "sidebar.leading")
+                .font(.system(size: 12))
+                // A modest fixed frame so the plain icon button has a
+                // comfortable click target in both headers.
+                .frame(width: 18, height: 18)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help(columnVisibility == .all ? "Hide file tree" : "Show file tree")
+        .accessibilityLabel(columnVisibility == .all ? "Hide file tree" : "Show file tree")
     }
 
     private func toggleExpansion(_ path: String) {
@@ -256,13 +333,27 @@ struct FileBrowserView: View {
 
     // MARK: - Detail column
 
-    /// The editor's own meta panel, at the top of the detail column (not the
-    /// whole window): just the open file — the project is already the tab's
-    /// title, so repeating it here would be noise. Left inset so the first
-    /// glyphs clear the window chrome, and vertically padded so the row
-    /// doesn't hug the title bar.
+    /// The viewer's own meta strip at the top of the detail column: the open
+    /// file's path (the project is already the tab's title, so repeating it
+    /// would be noise). Left inset so the first glyphs clear the window
+    /// chrome; vertically padded so the row doesn't hug the title bar.
+    ///
+    /// Painted with the CODE PANE's own background token
+    /// (`NSColor.textBackgroundColor` — opaque, white in light mode) so the
+    /// strip and the file beneath it are one continuous surface; the previous
+    /// `NSColor.underPageBackgroundColor` resolved to a mid-grey
+    /// (#969696 in light mode) and read as a grey slab sitting on the viewer.
+    ///
+    /// When the tree column is collapsed (`.detailOnly`) this strip's leading
+    /// edge mirrors the tree header's collapse toggle — the only visible way
+    /// back in, since collapsing removed the tree header with its column.
     private var editorMeta: some View {
         HStack(spacing: 8) {
+            if columnVisibility != .all {
+                // The tree is hidden — lead with the affordance that brings
+                // it back (see `sidebarToggleButton`).
+                sidebarToggleButton
+            }
             if let path = store.selectedPath, store.fileEntries[path] != nil {
                 Image(systemName: "doc.text")
                     .font(.system(size: 11))
@@ -272,18 +363,18 @@ struct FileBrowserView: View {
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-            } else {
-                Text("Select a file")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
             }
+            // No file: the strip is empty (the `ContentUnavailableView` below
+            // already says "Select a file") — the strip still anchors the
+            // pane's top edge and hosts the reopen toggle when the tree is
+            // collapsed.
             Spacer(minLength: 0)
         }
-        .padding(.leading, 16)
+        .padding(.leading, columnVisibility != .all ? 10 : 16)
         .padding(.trailing, 12)
         .padding(.top, 9)
         .padding(.bottom, 8)
-        .background(Color(nsColor: .underPageBackgroundColor))
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     private var detailPane: some View {
