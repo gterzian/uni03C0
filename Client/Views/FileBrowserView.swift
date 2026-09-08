@@ -36,15 +36,30 @@ struct FileBrowserView: View {
     /// thread while the user is looking at the conversation.
     var pageActive = true
 
-    /// Who owns the sidebar collapse state. The split view's column visibility
-    /// is bound HERE — never left to the framework's implicit handling — so the
-    /// Files page's toggle is a normal button in its own column header (see
-    /// `treeHeader`/`editorMeta`), and the automatic window-toolbar item that
-    /// `NavigationSplitView` would otherwise inject is removed (see
-    /// `body`). The button's screen position is fixed by the column's own
-    /// layout, not negotiated against the window title, so it never jumps when
-    /// the column collapses.
+    /// Who owns the tree column's collapse state. Bound HERE — never left to
+    /// the framework's implicit handling — and the layout is a plain `HStack`
+    /// (see `body`), so the Files page's toggle is a normal button in its own
+    /// column header (see `treeHeader`/`editorMeta`) and nothing is ever
+    /// injected into the window toolbar. The button's screen position is fixed
+    /// by the column's own layout, not negotiated against the window title, so
+    /// it never jumps when the column collapses.
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+
+    /// The tree column's width; the detail column takes the rest. Owned here
+    /// because the container is a plain `HStack` (see `body`): what used to be
+    /// `.navigationSplitViewColumnWidth(min: 250, ideal: 310)` — an AppKit
+    /// split-view constraint — is now plain view state starting at the old
+    /// ideal (310) and draggable within `treeColumnWidthRange` via
+    /// `columnDivider`. Per-tab view state like the rest of this view's (it is
+    /// `.id`-keyed per tab), so a session switch resets it — the split view's
+    /// width reset the same way.
+    @State private var treeColumnWidth: CGFloat = 310
+
+    /// The tree column's width range. The old split view let the user drag the
+    /// sidebar between its 250pt minimum and a generous maximum (no explicit
+    /// max was set on `.navigationSplitViewColumnWidth`); `columnDivider`
+    /// clamps the drag to this.
+    private static let treeColumnWidthRange: ClosedRange<CGFloat> = 250...520
 
     /// Which directories are expanded (view state, like the transcript's
     /// materialized window). Survives refreshes because it is keyed by stable
@@ -66,25 +81,35 @@ struct FileBrowserView: View {
     private static let autoExpandFileLimit = 3000
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            treeColumn
-                // Remove the system-injected sidebar toggle from the window
-                // toolbar (`com.apple.SwiftUI.navigationSplitView.toggleSidebar`):
-                // the Files page owns its own toggle in the tree column's
-                // header (`treeHeader`) and must not contribute window chrome —
-                // the window toolbar belongs to the session (SessionTabsView),
-                // not to one of its pages. Must be applied to the SIDEBAR
-                // content; applying it to the split view itself or the detail
-                // silently no-ops.
-                .toolbar(removing: .sidebarToggle)
-                // ORDER MATTERS (macOS 26): the width modifier must be applied
-                // AFTER the toolbar removal — in the other order the removal
-                // wipes the column-width contribution and the sidebar
-                // collapses to its content's intrinsic width (~140pt) instead
-                // of the requested 250-310pt.
-                .navigationSplitViewColumnWidth(min: 250, ideal: 310)
-        } detail: {
+        // A plain two-pane HStack (tree column, `columnDivider`, detail) —
+        // NOT a `NavigationSplitView`. Why: NavigationSplitView is backed by
+        // an `NSSplitViewController` whose first column is a `.sidebar` split
+        // item, and a sidebar split item opts the WINDOW into sidebar-aware
+        // title-bar layout — the native window title (which belongs to the
+        // session chrome one level up, `SessionTabsView`) gets renegotiated
+        // against the sidebar's tracked leading edge as the column
+        // collapses/expands, so toggling the file tree moved and recentered
+        // the title. AppKit applies that tracking for ANY mounted split view,
+        // however deeply nested, and it cannot be opted out of from inside the
+        // page: `.toolbar(removing: .sidebarToggle)` removes only the toolbar
+        // BUTTON, not the window's sidebar-tracking registration. This page
+        // already reimplements everything else NavigationSplitView would
+        // provide — the collapse state (`columnVisibility`), the toggle
+        // (`treeHeader`/`editorMeta`), the column width (`treeColumnWidth`),
+        // the drag-resize divider (`columnDivider`) — so the container is
+        // just two columns and no split view exists for AppKit to track.
+        // Trade-offs: the tree column loses the split divider's accessibility
+        // role, and column drag-resize is reimplemented in `columnDivider`.
+        HStack(spacing: 0) {
+            if columnVisibility != .detailOnly {
+                treeColumn
+                    .frame(width: treeColumnWidth)
+                    .transition(.move(edge: .leading))
+                columnDivider
+                    .transition(.move(edge: .leading))
+            }
             detailPane
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear {
             // The store warms at session start (off the main thread); a view
@@ -207,11 +232,11 @@ struct FileBrowserView: View {
     }
 
     /// The tree column's own header: the sidebar collapse toggle plus a
-    /// column title. This is where the split view's collapse affordance LIVES
-    /// — a plain SwiftUI button laid out by the column's own stack, not an
-    /// item in the window toolbar (the system one is removed in `body`). Its
-    /// screen position is fixed by ordinary layout rules inside the column,
-    /// so it never repositions when the column collapses; the whole column
+    /// column title. This is where the tree's collapse affordance LIVES — a
+    /// plain SwiftUI button laid out by the column's own stack, not an item in
+    /// the window toolbar (the layout is a plain `HStack`; see `body`). Its
+    /// screen position is fixed by ordinary layout rules inside the column, so
+    /// it never repositions when the column collapses; the whole column
     /// (header included) slides away with the tree.
     private var treeHeader: some View {
         HStack(spacing: 8) {
@@ -248,6 +273,15 @@ struct FileBrowserView: View {
         .foregroundStyle(.secondary)
         .help(columnVisibility == .all ? "Hide file tree" : "Show file tree")
         .accessibilityLabel(columnVisibility == .all ? "Hide file tree" : "Show file tree")
+    }
+
+    /// The divider between the tree and detail columns — the narrow draggable
+    /// strip whose position (the tree column's trailing edge) follows
+    /// `treeColumnWidth`. The visible line is a hairline; dragging it resizes
+    /// the tree column within `treeColumnWidthRange`, like the old split
+    /// view's divider. Removed with the tree when it collapses.
+    private var columnDivider: some View {
+        ColumnDivider(width: $treeColumnWidth, range: Self.treeColumnWidthRange)
     }
 
     private func toggleExpansion(_ path: String) {
@@ -378,6 +412,14 @@ struct FileBrowserView: View {
     /// strip and the file beneath it are one continuous surface; the previous
     /// `NSColor.underPageBackgroundColor` resolved to a mid-grey
     /// (#969696 in light mode) and read as a grey slab sitting on the viewer.
+    /// The strip's own top edge is NOT given a hairline here: the boundary
+    /// between this strip (and the tree header) and the chrome above is the
+    /// session chrome's divider under the translucent tab panel
+    /// (`SessionTabsView`), and the fill is opaque, so the only way this
+    /// surface ever read as see-through was the `NavigationSplitView`
+    /// sidebar-tracking renegotiating the title-bar layout over it as the
+    /// column collapsed/expanded — removed at the source by the plain-HStack
+    /// container in `body`.
     ///
     /// When the tree column is collapsed (`.detailOnly`) this strip's leading
     /// edge mirrors the tree header's collapse toggle — the only visible way
@@ -439,6 +481,83 @@ struct FileBrowserView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+}
+
+// MARK: - Column divider (drag-to-resize)
+
+/// The hairline divider between the tree and detail columns, with a wider
+/// drag target to its right (see `FileBrowserView.columnDivider`). Replaces
+/// the divider `NavigationSplitView`'s split view used to own — its
+/// drag-to-resize is the one split-view behavior this page actually wanted
+/// (see `FileBrowserView.body`): dragging moves the tree column's trailing
+/// edge, clamped to `range`, and the detail column takes up the slack. The
+/// resize cursor shows on hover.
+private struct ColumnDivider: View {
+    @Binding var width: CGFloat
+    let range: ClosedRange<CGFloat>
+
+    /// The tree width when the current drag began. The drag's translation is
+    /// added to this snapshot — not to the live (possibly already-clamped)
+    /// width — so clamping at the ends during a drag doesn't compound into the
+    /// width when the pointer comes back inside the range (the standard
+    /// split-divider feel: the divider stops at the limit and resumes
+    /// following the pointer once it re-enters).
+    @State private var dragStartWidth: CGFloat = 310
+    @State private var isDragging = false
+    @State private var isHovering = false
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            // The surface right of the hairline is painted with the DETAIL
+            // column's background token (the code pane's own), so the white
+            // gutter reads as the detail column starting AT the hairline —
+            // exactly like the old split view — rather than as stray page
+            // background between the two panes. (The tree column's backdrop is
+            // the window's; painting it here would show a gray notch in the
+            // header band between the hairline and the white strip.)
+            Color(nsColor: .textBackgroundColor)
+            // The visible hairline, at the tree column's trailing edge (the
+            // drag target is the whole strip to its right).
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor))
+                .frame(width: 1)
+        }
+        .frame(width: 8)
+        .frame(maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .gesture(drag)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.resizeLeftRight.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .accessibilityHidden(true)
+        .onDisappear {
+            // The column collapsed (or this view went away) mid-hover: leave
+            // the cursor stack balanced.
+            if isHovering {
+                NSCursor.pop()
+                isHovering = false
+            }
+        }
+    }
+
+    private var drag: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if !isDragging {
+                    isDragging = true
+                    dragStartWidth = width
+                }
+                width = min(max(dragStartWidth + value.translation.width, range.lowerBound), range.upperBound)
+            }
+            .onEnded { _ in
+                isDragging = false
+            }
     }
 }
 
