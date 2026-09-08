@@ -23,6 +23,18 @@ import SwiftUI
 /// final attributed buffer on main.
 struct FileBrowserView: View {
     let store: FileBrowserStore
+    /// Whether the Files page (not the conversation) is the visible page. The
+    /// view stays mounted while hidden behind the conversation (so a page
+    /// flip is an instant visibility flip and the tree's view state survives),
+    /// but it does ZERO of its heavy work while off-screen — no first-load
+    /// auto-expand + flatten, no content-pane load — the mirror of the
+    /// transcript coordinator's page-active gating. Activation runs one
+    /// catch-up pass (`reconcileExpansion`; the pane re-loads its latest
+    /// deferred request itself). This is what keeps a SESSION switch (which
+    /// remounts this view for the incoming tab — it is `.id`-keyed per tab)
+    /// from flattening a project or highlighting an open file on the main
+    /// thread while the user is looking at the conversation.
+    var pageActive = true
 
     /// Who owns the sidebar collapse state. The split view's column visibility
     /// is bound HERE — never left to the framework's implicit handling — so the
@@ -80,7 +92,24 @@ struct FileBrowserView: View {
             if store.version == 0, !store.isLoading {
                 store.scheduleRefresh(immediate: true)
             }
-            reconcileExpansion()
+            // The first-load expansion policy runs only once the page is
+            // actually shown: a view mounted behind the conversation (a
+            // session switch into a conversation-page tab) defers its
+            // auto-expand + flatten to first activation (see the
+            // `pageActive` change handler).
+            if pageActive {
+                reconcileExpansion()
+            }
+        }
+        // The Files page became visible: one catch-up pass — apply the
+        // expansion policy against the current snapshot (a hidden mount
+        // skipped it, and refreshes that landed while hidden were deferred
+        // too). Runs only on the hidden→visible transition, never per body
+        // evaluation.
+        .onChange(of: pageActive) { _, active in
+            if active {
+                reconcileExpansion()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: GitStatus.didChangeNotification)) { note in
             // The STORE refreshes its data on this same signal (it subscribes
@@ -95,7 +124,13 @@ struct FileBrowserView: View {
             }
         }
         .onChange(of: store.version) { _, _ in
-            reconcileExpansion()
+            // A refresh landed while the page is hidden: defer the expansion
+            // reconcile (it re-derives the changed-file folders and can grow
+            // the flatten) — activation's catch-up applies it against the
+            // latest snapshot.
+            if pageActive {
+                reconcileExpansion()
+            }
         }
         // A selection change — a tree click, or an EXTERNAL open (a click on
         // an agent-emitted file reference in the transcript): open the new
@@ -388,7 +423,12 @@ struct FileBrowserView: View {
                     kind: entry.kind,
                     reloadToken: store.paneReloadToken,
                     pendingReference: store.pendingReference,
-                    onReferenceConsumed: { store.consumePendingReference() }
+                    onReferenceConsumed: { store.consumePendingReference() },
+                    // The pane defers its loads while the Files page is hidden
+                    // (the conversation is up): no file IO / git show / syntax
+                    // highlight for a page nothing renders (see
+                    // `ReadOnlyFilePane.pageActive`).
+                    pageActive: pageActive
                 )
             } else {
                 ContentUnavailableView(

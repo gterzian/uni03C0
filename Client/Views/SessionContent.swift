@@ -42,7 +42,7 @@ struct SessionContent: View {
                     .opacity(tab.page == .conversation ? 1 : 0)
                     .allowsHitTesting(tab.page == .conversation)
                     .accessibilityHidden(tab.page != .conversation)
-                FileBrowserView(store: tab.fileBrowser)
+                FileBrowserView(store: tab.fileBrowser, pageActive: tab.page == .files)
                     .id(tab.id)
                     .opacity(tab.page == .files ? 1 : 0)
                     .allowsHitTesting(tab.page == .files)

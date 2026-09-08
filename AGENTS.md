@@ -994,7 +994,18 @@ only what it needs.
   (unconditionally — `applyModelChanges` is cheap when idle). The
   transcript's window key monitors are page-gated too, so
   Cmd+F/Cmd+G/Cmd+Up/Down/arrows never act on an invisible conversation and
-  the arrow keys reach the file list.
+  the arrow keys reach the file list. The file browser mirrors the gate on
+  the other side (`FileBrowserView.pageActive`, passed down to the content
+  pane): while the conversation is up, the Files page does no expansion
+  reconcile/flatten and the pane loads NOTHING — no file IO / `git show` /
+  diff, and no main-thread syntax-highlight pass + whole-file attributed
+  replace for a page nothing renders. Without that, a SESSION switch (which
+  remounts the `.id`-keyed Files view for the incoming tab even when that
+  tab shows the conversation) re-read and re-highlighted the open file on
+  the main thread at every switch — the session-switch hitch. Activation
+  runs ONE catch-up pass: `reconcileExpansion` (the pane re-loads its
+  latest deferred request itself, `ReadOnlyFilePane.Coordinator` cancels
+  in-flight loads on deactivation so a hidden apply can never run).
 - **`SessionContent` is reused across outer-tab switches; the transcript
   representable has NO `.id`** — its single coordinator is REBOUND
   (`updateNSView` → `rebind`), preserving per-session windows, height caches,
@@ -1158,7 +1169,10 @@ with the project — or only with what is visible?
 - **Never do "warm it up early" work on the main thread.** A session-open
   pre-load is fine only when it is off-main by construction (the store's
   detached build) — an eager listing folded on the main thread was the
-  session-open spinner on large projects.
+  session-open spinner on large projects. The same rule covers the HIDDEN
+  Files page: its content-pane loads and its expansion/flatten catch-up are
+  gated by `pageActive` and defer to first activation (see *The page
+  model*).
 - **Never tear the transcript down to show Files** (or anything else) — keep
   pages mounted and gate work by page-active. If you ever DO recreate a
   transcript coordinator with a populated store, populate it with

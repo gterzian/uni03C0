@@ -28,6 +28,19 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     /// moment that reload captures it (the load itself is async).
     var pendingReference: FileReferenceLink? = nil
     var onReferenceConsumed: (() -> Void)? = nil
+    /// Whether the Files page is the visible page (vs. hidden behind the
+    /// conversation). While false the coordinator does NOT load the file: the
+    /// pane is off-screen, so the whole pipeline — file IO, `git show`, the
+    /// diff, and the MAIN-THREAD syntax-highlight pass + whole-file
+    /// attributed replace — would be wasted work that blocks whatever page is
+    /// on screen. This is the mirror of the transcript coordinator's
+    /// page-active gating: the pane stays mounted (its content survives page
+    /// flips) but defers its loads; the latest request is recorded and ONE
+    /// catch-up load runs when the page activates. A session switch mounts
+    /// this pane for the incoming tab even when that tab shows the
+    /// conversation, which used to re-read + re-highlight the open file on
+    /// the main thread at every switch.
+    var pageActive = true
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -40,6 +53,11 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: FilePaneContainer, context: Context) {
+        // Activation first, so a return to the Files page triggers the
+        // catch-up load and the reload below then dedupes against it;
+        // deactivation cancels any in-flight load before the reload records
+        // the request for the next activation.
+        context.coordinator.setPageActive(pageActive)
         context.coordinator.reload(
             cwd: cwd,
             path: path,
@@ -54,43 +72,121 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     final class Coordinator {
         weak var container: FilePaneContainer?
         private var loadTask: Task<Void, Never>?
-        private var lastRequest: (path: String, token: Int)?
+        /// The latest request the pane accepted — a same (path, token) request
+        /// is a no-op (already loading or already shown), and a load only
+        /// applies when it still matches the accepted request (a newer one
+        /// supersedes it).
+        private var accepted: Pending?
+        /// The accepted request while the Files page was NOT the visible page
+        /// (or was hidden mid-load): the pane is off-screen, so its load is
+        /// deferred and this is re-launched as ONE catch-up load on
+        /// activation. Only the latest request is kept.
+        private var deferred: Pending?
+        /// Whether the Files page is the visible page. Defaults true (standalone
+        /// use / tests construct the pane without the conversation page).
+        private var isActive = true
+        /// The request whose content (a load result or a placeholder/status
+        /// message) currently sits in the pane.
         private var displayedPath: String?
+        private var displayedToken: Int?
         private let highlighter = SyntaxHighlighter()
         private let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         private let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
 
-        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
-            guard container != nil else { return }
-            if let last = lastRequest, last.path == path, last.token == token { return }
-            lastRequest = (path, token)
-            // Hand the reference to THIS load only: it travels as a parameter
-            // of the task it belongs to, so a later, unrelated reload (which
-            // passes nil) can never overwrite or inherit it. The store's
-            // one-shot copy is consumed here — this reload captured it.
-            if reference != nil {
-                onReferenceConsumed?()
-            }
-            loadTask?.cancel()
-            // A genuinely different file clears the pane while it loads; a
-            // same-path refresh (the file changed) keeps showing the old
-            // content until the new one is ready.
-            if displayedPath != path {
-                container?.showPlaceholder("Loading…")
-            }
-            loadTask = Task { [weak self] in
-                await self?.performLoad(cwd: cwd, path: path, kind: kind, token: token, reference: reference)
+        /// One full reload request — everything `launch` needs, captured at
+        /// accept time so a deferred (hidden-page) request can be re-launched
+        /// verbatim on activation, reference included.
+        private struct Pending {
+            let cwd: URL
+            let path: String
+            let kind: GitStatus.Kind
+            let token: Int
+            let reference: FileReferenceLink?
+            let onReferenceConsumed: (() -> Void)?
+        }
+
+        /// The Files page became the visible page (true) or hid behind the
+        /// conversation (false). Hidden: cancel any in-flight load so its
+        /// main-thread highlight/apply can never run for an off-screen pane,
+        /// and remember the accepted request if it never landed. Visible: one
+        /// catch-up load for the latest un-displayed request (the mirror of
+        /// the transcript coordinator's catch-up on page activation).
+        func setPageActive(_ active: Bool) {
+            guard isActive != active else { return }
+            isActive = active
+            if active {
+                guard let target = deferred ?? accepted, !isDisplayed(target) else {
+                    deferred = nil
+                    return
+                }
+                deferred = nil
+                launch(target)
+            } else {
+                loadTask?.cancel()
+                loadTask = nil
+                if let accepted, !isDisplayed(accepted) {
+                    deferred = accepted
+                }
             }
         }
 
-        private func performLoad(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?) async {
+        private func isDisplayed(_ request: Pending) -> Bool {
+            request.path == displayedPath && request.token == displayedToken
+        }
+
+        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
+            guard container != nil else { return }
+            if let accepted, accepted.path == path, accepted.token == token { return }
+            let request = Pending(
+                cwd: cwd, path: path, kind: kind, token: token,
+                reference: reference, onReferenceConsumed: onReferenceConsumed
+            )
+            accepted = request
+            guard isActive else {
+                // Off-screen page: no load now (its main-thread highlight and
+                // whole-file apply would block the page the user IS looking
+                // at — the session-switch hitch). Keep the latest request;
+                // activation runs it as one catch-up load.
+                deferred = request
+                return
+            }
+            launch(request)
+        }
+
+        private func launch(_ request: Pending) {
+            loadTask?.cancel()
+            loadTask = nil
+            // Hand the reference to THIS load only: it travels as a parameter
+            // of the task it belongs to, so a later, unrelated reload (which
+            // passes nil) can never overwrite or inherit it. The store's
+            // one-shot copy is consumed here — this load captured it (a load
+            // deferred until activation consumes it then, never twice).
+            if request.reference != nil {
+                request.onReferenceConsumed?()
+            }
+            // A genuinely different file clears the pane while it loads; a
+            // same-path refresh (the file changed) keeps showing the old
+            // content until the new one is ready.
+            if displayedPath != request.path {
+                container?.showPlaceholder("Loading…")
+            }
+            loadTask = Task { [weak self] in
+                await self?.performLoad(request)
+            }
+        }
+
+        private func performLoad(_ request: Pending) async {
             guard let container else { return }
-            let loaded = await PaneContentLoader.load(cwd: cwd, path: path, kind: kind)
+            let loaded = await PaneContentLoader.load(cwd: request.cwd, path: request.path, kind: request.kind)
+            // The page hid while the file was being read (the load was
+            // cancelled): nothing may be applied to an off-screen pane — the
+            // apply is main-thread work for a page the user cannot see.
+            guard !Task.isCancelled else { return }
             // A newer request supersedes this one.
-            guard let last = lastRequest, last.path == path, last.token == token else { return }
+            guard let current = accepted, current.path == request.path, current.token == request.token else { return }
             // The target lines ride on the request that captured them (see
             // `reload`) — a whole-file reference has no target lines.
-            let targetLines: (start: Int, end: Int)? = reference.flatMap { ref in
+            let targetLines: (start: Int, end: Int)? = request.reference.flatMap { ref in
                 guard let start = ref.startLine else { return nil }
                 return (start, max(start, ref.endLine ?? start))
             }
@@ -108,9 +204,9 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             // own working directory ("Client/ClientApp.swift" → "/Client/…")
             // when the reference is rendered, producing the bogus `..` walk
             // the pasted anchor showed (§1.1).
-            let absolutePath = SandboxPolicy.canonicalize(URL(fileURLWithPath: path, relativeTo: cwd).path)
+            let absolutePath = SandboxPolicy.canonicalize(URL(fileURLWithPath: request.path, relativeTo: request.cwd).path)
             if let text = loaded.displayText {
-                let attributed = makeAttributed(text: text, path: path, overlay: loaded.overlay)
+                let attributed = makeAttributed(text: text, path: request.path, overlay: loaded.overlay)
                 // A live refresh of the file the user is already reading must
                 // not yank the view back to the top — keep their place when
                 // the same file is being re-shown. A reference-driven open
@@ -120,14 +216,15 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 container.displayContent(
                     path: absolutePath,
                     text: attributed,
-                    preserveScroll: targetLines == nil && displayedPath == path,
+                    preserveScroll: targetLines == nil && displayedPath == request.path,
                     targetLines: targetLines,
                     markers: markers
                 )
             } else {
-                container.showPlaceholder(loaded.message ?? "Couldn't read \((path as NSString).lastPathComponent).")
+                container.showPlaceholder(loaded.message ?? "Couldn't read \((request.path as NSString).lastPathComponent).")
             }
-            displayedPath = path
+            displayedPath = request.path
+            displayedToken = request.token
         }
 
         /// Builds the final buffer: syntax highlighting (when the file is
