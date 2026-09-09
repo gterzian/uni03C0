@@ -182,7 +182,10 @@ final class ReadOnlyCodeTextView: NSTextView {
     }
 
     /// The 1-based line containing character `index` (0 ≤ index < length).
-    private func lineNumber(forIndex index: Int) -> Int {
+    /// `fileprivate` so the line-number ruler (same file) resolves each visible
+    /// fragment to the SAME per-load offset table the copy machinery uses — one
+    /// source of truth for "which line is this" across the pane.
+    fileprivate func lineNumber(forIndex index: Int) -> Int {
         let offsets = lineStartOffsets
         var low = 0
         var high = offsets.count - 1
@@ -255,11 +258,37 @@ extension ReadOnlyCodeTextView: NSTextViewDelegate {
     }
 }
 
-// MARK: - Line-number ruler/// The content pane's line-number gutter: a custom `NSRulerView` (the
+// MARK: - Line-number ruler
+
+/// The content pane's line-number gutter: a custom `NSRulerView` (the
 /// mechanism source editors use) drawing numbers read from the code view's
-/// per-load offset table, scrolled in sync with the text automatically by the
-/// scroll view. Purely cosmetic — the copy/selection machinery in
+/// per-load offset table. Purely cosmetic — the copy/selection machinery in
 /// `ReadOnlyCodeTextView` needs no visible gutter at all.
+///
+/// Two load-bearing properties keep the numbers glued to the right lines:
+///
+/// - **It redraws when the text scrolls or the buffer changes.** A ruler is a
+///   separate view sitting next to the clip view; scrolling the clip does NOT
+///   invalidate it (a view only redraws when AppKit asks, and nothing asks the
+///   ruler), so without observers the numbers go stale the moment the document
+///   moves — they stay attached to the OLD viewport's lines, half off-screen or
+///   missing entirely, until some unrelated event (a resize, an expose, a
+///   reload) happens to repaint the ruler, which reads as numbers that appear
+///   or disappear on scroll. The ruler therefore observes the clip view's
+///   bounds changes (`NSView.boundsDidChangeNotification` — the same signal the
+///   transcript's coordinator uses to detect scrolling) and the text storage's
+///   edits (a file load swaps the whole buffer), and marks itself dirty on
+///   either.
+///
+/// - **Every number's position comes from the layout manager, never from
+///   document-line arithmetic.** The visible band is derived by converting the
+///   ruler's own bounds into the text view (through AppKit's view conversion,
+///   so it is exact whatever the scroll origin or the code view's frame
+///   offset), and each label is centered on its line fragment's rect — the
+///   actual glyph rectangle the text view renders, queried via
+///   `enumerateLineFragments`. Uniform "line index × pitch" math breaks the
+///   moment anything shifts the document (a text-container inset, a scroll-
+///   view tiling offset, a font change); fragment rects cannot.
 final class CodeLineRulerView: NSRulerView {
     weak var codeView: ReadOnlyCodeTextView?
 
@@ -278,10 +307,42 @@ final class CodeLineRulerView: NSRulerView {
     /// layout (line N sits below line N−1).
     override var isFlipped: Bool { true }
 
+    /// How many times the gutter has drawn. Test hook for the RenderingTests
+    /// scroll-redraw regression: `needsDisplay` cannot be READ back in the
+    /// offscreen harness (the window consumes dirty flags on run-loop turns),
+    /// so the tests pin "the ruler redraws when the document scrolls" by
+    /// asserting this advances after a scroll — which it only does if the
+    /// observers in `init` marked the ruler dirty and the display pass ran.
+    /// Main-thread only, like drawing itself.
+    private(set) var renderedFrameCount = 0
+
+    /// Registers the two redraw sources (`init`-only, removed by name in
+    /// `deinit`): the clip view's bounds changes (every scroll) and the code
+    /// view's text storage edits (every buffer swap).
     init(scrollView: NSScrollView) {
         super.init(scrollView: scrollView, orientation: .verticalRuler)
         ruleThickness = 52
         clientView = scrollView.contentView
+
+        // Redraw on scroll: see the class doc — the ruler is a sibling of the
+        // clip view, and AppKit does not invalidate it when the clip scrolls.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(gutterSourceChanged(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        // Redraw when a load replaces the buffer (numbers + anchor must track
+        // the new text). `setAttributedString` on the storage posts this; the
+        // clip-bounds path cannot cover it (a new load does not scroll).
+        if let storage = (scrollView.documentView as? ReadOnlyCodeTextView)?.textStorage {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(gutterSourceChanged(_:)),
+                name: NSTextStorage.didProcessEditingNotification,
+                object: storage
+            )
+        }
     }
 
     @available(*, unavailable)
@@ -289,36 +350,54 @@ final class CodeLineRulerView: NSRulerView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSTextStorage.didProcessEditingNotification, object: nil)
+    }
+
+    @objc private func gutterSourceChanged(_ notification: Notification) {
+        needsDisplay = true
+    }
+
     override func drawHashMarksAndLabels(in rect: NSRect) {
+        renderedFrameCount += 1
         guard let codeView,
-              let scrollView = codeView.enclosingScrollView,
               let layoutManager = codeView.layoutManager,
               let textContainer = codeView.textContainer else { return }
         let ns = codeView.string as NSString
         guard ns.length > 0 else { return }
+        let inset = codeView.textContainerInset
 
-        // Every rendered line has the same height: the pane uses a single
-        // monospaced font with wrapping disabled, so line fragments are
-        // uniform. Measure once from the first fragment.
-        layoutManager.ensureLayout(for: textContainer)
-        let firstGlyph = layoutManager.glyphIndexForCharacter(at: 0)
-        let lineHeight = layoutManager.lineFragmentUsedRect(forGlyphAt: firstGlyph, effectiveRange: nil).height
-        guard lineHeight > 0 else { return }
+        // The band of text currently under the ruler: the ruler's own vertical
+        // extent mapped into the code view's coordinates (through AppKit's
+        // conversion — never doc-coordinate arithmetic — so it is exact
+        // whatever the scroll origin or the code view's frame offset relative
+        // to the clip), then shifted into the text container's coordinate
+        // system (glyph/fragment rects are container coords; the container
+        // sits inside the text view at the inset). Only the VERTICAL extent is
+        // meaningful here: the ruler is a vertical gutter, and the clip view's
+        // horizontal origin can sit anywhere relative to the text, so the
+        // band's x is widened to cover the whole document width.
+        let rulerVisibleInCodeView = codeView.convert(bounds, from: self)
+        let bandInContainer = NSRect(
+            x: -inset.width,
+            y: rulerVisibleInCodeView.minY - inset.height,
+            width: codeView.bounds.width + inset.width * 2,
+            height: rulerVisibleInCodeView.height
+        ).standardized
+        guard bandInContainer.height > 0 else { return }
 
-        let topInset = codeView.textContainerInset.height
+        // Lay out only what this band needs (plus slack so lines straddling
+        // the viewport edges are ready), then ask for the glyphs that fall —
+        // even partially — inside the band. Bounding layout, not
+        // `ensureLayout(for:)`: a large file must stay lazily laid out (files
+        // load whole; TextKit lays out on demand as the user scrolls), and a
+        // full-document layout on every redraw would defeat that.
+        layoutManager.ensureLayout(forBoundingRect: bandInContainer.insetBy(dx: 0, dy: -40), in: textContainer)
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: bandInContainer, in: textContainer)
+        guard glyphRange.length > 0 else { return }
+
         let offsets = codeView.lineStartOffsets
-        let lineCount = offsets.count - (offsets.last == ns.length && ns.length > 0 ? 1 : 0)
-        guard lineCount > 0 else { return }
-
-        // Visible band in the text view's (flipped, top-down) coordinates.
-        let clip = scrollView.contentView
-        let visible = clip.bounds
-        let docHeight = codeView.bounds.height
-        let startY = max(0, visible.minY - topInset)
-        let endY = min(docHeight - topInset, visible.maxY - topInset)
-        let firstLine = max(1, Int(floor(startY / lineHeight)) + 1)
-        let lastLine = min(lineCount, max(firstLine, Int(ceil(endY / lineHeight))))
-
         let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -328,34 +407,59 @@ final class CodeLineRulerView: NSRulerView {
 
         // The persistent reference-jump anchor: a soft capsule over the start
         // line's vertical span, drawn BEFORE the numbers so they stay legible
-        // on top of it.
-        if let anchorLine, anchorLine >= 1, anchorLine <= lineCount {
-            let centerYInCode = NSPoint(x: 0, y: topInset + (CGFloat(anchorLine) - 0.5) * lineHeight)
-            let centerYInRuler = convert(centerYInCode, from: codeView).y
-            NSColor.systemYellow.withAlphaComponent(0.4).setFill()
-            NSBezierPath(
-                roundedRect: NSRect(
-                    x: 4,
-                    y: centerYInRuler - lineHeight * 0.55,
-                    width: ruleThickness - 8,
-                    height: lineHeight * 1.1
-                ),
-                xRadius: 4,
-                yRadius: 4
-            ).fill()
+        // on top of it. Its span comes from the anchor line's own fragment
+        // rect (located via the same offset table the copy machinery uses), so
+        // it stays glued to the line it marks.
+        if let anchorLine, anchorLine >= 1, anchorLine - 1 < offsets.count {
+            let charIndex = offsets[anchorLine - 1]
+            if charIndex < ns.length {
+                let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+                let anchorFragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+                if anchorFragment.height > 0 {
+                    let centerY = convert(NSPoint(x: 0, y: anchorFragment.midY + inset.height), from: codeView).y
+                    // The anchor line is scrolled out of view: nothing to mark.
+                    if centerY >= bounds.minY, centerY <= bounds.maxY {
+                        NSColor.systemYellow.withAlphaComponent(0.4).setFill()
+                        NSBezierPath(
+                            roundedRect: NSRect(
+                                x: 4,
+                                y: centerY - anchorFragment.height * 0.55,
+                                width: ruleThickness - 8,
+                                height: anchorFragment.height * 1.1
+                            ),
+                            xRadius: 4,
+                            yRadius: 4
+                        ).fill()
+                    }
+                }
+            }
         }
 
-        for line in firstLine...lastLine {
-            guard line >= 1, line <= offsets.count else { continue }
+        // One label per visible line, centered on the line fragment's rect.
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { [weak self] fragmentRect, _, _, fragmentGlyphRange, _ in
+            guard let self, fragmentGlyphRange.length > 0 else { return }
+            let charIndex = layoutManager.characterIndexForGlyph(at: fragmentGlyphRange.location)
+            // The phantom empty line after a trailing newline has no characters.
+            guard charIndex < ns.length else { return }
+            let line = codeView.lineNumber(forIndex: charIndex)
+            // A wrapped line's continuation fragments are not line starts —
+            // only the fragment that begins the logical line carries the
+            // number (the pane disables wrapping, so this is defensive).
+            guard line >= 1, line - 1 < offsets.count, offsets[line - 1] == charIndex else { return }
+
             let label = "\(line)" as NSString
             let size = label.size(withAttributes: attributes)
-            // The line's vertical center in the text view's coordinates,
+            // The fragment's vertical center in the text view's coordinates,
             // converted into the ruler's (flipped) coordinates.
-            let centerInCodeView = NSPoint(x: 0, y: topInset + (CGFloat(line) - 0.5) * lineHeight)
-            let centerInRuler = convert(centerInCodeView, from: codeView)
+            let centerInCodeView = NSPoint(x: 0, y: fragmentRect.midY + inset.height)
+            let centerY = convert(centerInCodeView, from: codeView).y
+            // Skip fragments whose center is outside the ruler's own band: the
+            // glyph range includes lines that merely graze the viewport edge,
+            // whose labels would otherwise be drawn almost entirely off-view.
+            guard centerY >= bounds.minY, centerY <= bounds.maxY else { return }
             let drawRect = NSRect(
                 x: ruleThickness - numberPadding - size.width,
-                y: centerInRuler.y - size.height / 2,
+                y: centerY - size.height / 2,
                 width: size.width,
                 height: size.height
             )
@@ -438,16 +542,46 @@ class EditMarkerScroller: NSScroller {
         // source when available; knobProportion is the fallback.
         let knobHeight = rect(for: .knob).height > 0 ? rect(for: .knob).height : knobProportion * slotRect.height
         let travel = max(slotRect.height - knobHeight, 1)
+
+        // Batch the ticks by color: every same-color tick appends its rounded
+        // rect as a SUBPATH of one path, then each color gets exactly ONE
+        // fill. The old loop issued a path allocation + setFill + fill per
+        // marker, so a file with many edited lines (or a tree with many
+        // edited rows) meant that many tiny state changes and rasterized
+        // fills on every scroller repaint.
+        //
+        // Keyed by device-RGB components rather than the `NSColor` object:
+        // `NSColor` hash/equality across dynamically-constructed colors (the
+        // hue-blended row tints) is not a contract to rely on for dictionary
+        // keys, but equal components are exactly "paint these together".
+        struct ColorKey: Hashable {
+            let r, g, b, a: CGFloat
+            init(_ color: NSColor) {
+                let rgb = color.usingColorSpace(.deviceRGB) ?? color
+                r = rgb.redComponent
+                g = rgb.greenComponent
+                b = rgb.blueComponent
+                a = rgb.alphaComponent
+            }
+        }
+        var fills: [ColorKey: (color: NSColor, path: NSBezierPath)] = [:]
+        fills.reserveCapacity(min(markers.count, 8))
         for marker in markers {
             // Fraction along the scrollable document, clamped to the track.
             let f = min(max(marker.fraction, 0), 1)
             let y = slotRect.minY + f * travel - tickHeight / 2
-            marker.color.setFill()
-            NSBezierPath(
-                roundedRect: NSRect(x: x, y: y, width: tickWidth, height: tickHeight),
+            let key = ColorKey(marker.color)
+            let entry = fills[key] ?? (marker.color, NSBezierPath())
+            entry.path.appendRoundedRect(
+                NSRect(x: x, y: y, width: tickWidth, height: tickHeight),
                 xRadius: tickWidth / 2,
                 yRadius: tickWidth / 2
-            ).fill()
+            )
+            fills[key] = entry
+        }
+        for entry in fills.values {
+            entry.color.setFill()
+            entry.path.fill()
         }
     }
 }

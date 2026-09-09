@@ -98,8 +98,12 @@ struct FileBrowserView: View {
         // (`treeHeader`/`editorMeta`), the column width (`treeColumnWidth`),
         // the drag-resize divider (`columnDivider`) — so the container is
         // just two columns and no split view exists for AppKit to track.
-        // Trade-offs: the tree column loses the split divider's accessibility
-        // role, and column drag-resize is reimplemented in `columnDivider`.
+        // Trade-offs: the tree column loses the split divider's native
+        // accessibility role, and column drag-resize is reimplemented in
+        // `columnDivider`. The divider restores the role itself — it exposes
+        // an `.adjustable` accessibility element (keyboard/VoiceOver
+        // increment/decrement) so resize stays reachable without the split
+        // view's title-bar side effects.
         HStack(spacing: 0) {
             if columnVisibility != .detailOnly {
                 treeColumn
@@ -247,7 +251,15 @@ struct FileBrowserView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        // Vertical padding tuned so this header row's TOTAL height matches
+        // `editorMeta`'s (both land at 32pt: this row's content — the
+        // toggle's fixed 18×18 image frame — plus 7pt top/bottom; the meta
+        // strip's ~15pt icon+text content plus its 9pt/8pt top/bottom). Both
+        // panes' rows start at the same y, so equal totals put the two
+        // `Divider()` hairlines at the same height and the outlines meet at
+        // the column divider instead of stepping. If either row's content
+        // height changes, re-match the two here.
+        .padding(.vertical, 7)
     }
 
     /// The collapse toggle, shown in the tree column's header while the tree
@@ -472,6 +484,15 @@ struct FileBrowserView: View {
                     // `ReadOnlyFilePane.pageActive`).
                     pageActive: pageActive
                 )
+                // An authoritative size opinion, like the placeholder branch's
+                // below: without it the representable falls back to the
+                // `FilePaneContainer`'s own fitting size — the text view loads
+                // the whole file unbounded (`isVerticallyResizable`, maxSize
+                // ∞), so that fitting height can exceed the slot `editorMeta`
+                // + `Divider` left in this VStack, and the oversized pane
+                // overflows upward — the code pane's ruler rows paint through
+                // the (translucent) chrome above the detail column.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView(
                     "Select a file",
@@ -535,7 +556,27 @@ private struct ColumnDivider: View {
                 NSCursor.pop()
             }
         }
-        .accessibilityHidden(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("File tree width")
+        .accessibilityValue("\(Int(width)) points")
+        .accessibilityHint("Adjusts the width of the file tree column")
+        // Keyboard- and VoiceOver-accessible resize: the drag strip is an
+        // adjustable element whose increment/decrement move the divider by a
+        // fixed step (clamped to `range`), restoring the split divider's
+        // accessibility role the plain-HStack container gave up (see
+        // `FileBrowserView.body`). Full Keyboard Access focuses it like any
+        // adjustable control and adjusts it with the arrow keys.
+        .accessibilityAdjustableAction { direction in
+            let step: CGFloat = 20
+            switch direction {
+            case .increment:
+                width = min(width + step, range.upperBound)
+            case .decrement:
+                width = max(width - step, range.lowerBound)
+            @unknown default:
+                break
+            }
+        }
         .onDisappear {
             // The column collapsed (or this view went away) mid-hover: leave
             // the cursor stack balanced.
@@ -947,6 +988,11 @@ private final class FileTreeRowView: NSView {
     private let iconView = NSImageView()
     private let nameField = NSTextField(labelWithString: "")
     private let badgeField = NSTextField(labelWithString: "not added yet")
+    /// The badge's fitted size, measured ONCE when the cell is created (see
+    /// `setup`): the label is the constant string "not added yet" in a font
+    /// that never changes, so its fitted size is fixed. `layout` reads this
+    /// instead of re-measuring.
+    private var badgeFittedSize = NSSize.zero
     private var config: (path: String, isDirectory: Bool, depth: Int)?
     private var toggleAction: ((String) -> Void)?
 
@@ -979,6 +1025,16 @@ private final class FileTreeRowView: NSView {
         badgeField.textColor = .tertiaryLabelColor
         badgeField.lineBreakMode = .byClipping
         addSubview(badgeField)
+        // Fit the badge ONCE per cell instance (the cell is reused for many
+        // rows, but `setup` runs only when it is first created): the label is
+        // a constant string in a constant font, so its fitted size never
+        // changes. The old code called `sizeToFit()` on every row
+        // reconfigure — a full text measurement (CoreText work) for EVERY
+        // materialized row on every scroll — even though the result is only
+        // ever consulted on the rare visible (untracked) row, and is constant
+        // when it is.
+        badgeField.sizeToFit()
+        badgeFittedSize = badgeField.frame.size
     }
 
     /// (Re)configures a recycled cell for `row`. `isExpanded` decides the
@@ -988,17 +1044,19 @@ private final class FileTreeRowView: NSView {
         toggleAction = toggle
         let isDirectory = row.node.isDirectory
         nameField.stringValue = row.node.name
-        nameField.font = isDirectory
-            ? .systemFont(ofSize: 12)
-            : .monospacedSystemFont(ofSize: 12, weight: .regular)
+        let font = isDirectory ? Self.directoryNameFont : Self.fileNameFont
+        // Skip reassignment when the recycled cell already carries this font
+        // (rows are reconfigured on every scroll): assigning is only needed
+        // when the row kind flipped.
+        if nameField.font !== font {
+            nameField.font = font
+        }
         iconView.image = isDirectory ? Self.folderIcon : Self.fileIcon
         chevronButton.isHidden = !isDirectory
         if isDirectory {
             chevronButton.image = isExpanded ? Self.chevronDown : Self.chevronRight
         }
-        let untracked = row.node.entry?.kind == .untracked
-        badgeField.isHidden = !untracked
-        badgeField.sizeToFit()
+        badgeField.isHidden = row.node.entry?.kind != .untracked
         needsLayout = true
     }
 
@@ -1015,9 +1073,9 @@ private final class FileTreeRowView: NSView {
         let textX = iconX + 14
         var textWidth = bounds.width - textX - 8
         if !badgeField.isHidden {
-            let badgeWidth = min(badgeField.frame.width, 90)
+            let badgeWidth = min(badgeFittedSize.width, 90)
             textWidth -= badgeWidth + 8
-            badgeField.frame = NSRect(x: bounds.width - badgeWidth - 8, y: (height - badgeField.frame.height) / 2, width: badgeWidth, height: badgeField.frame.height)
+            badgeField.frame = NSRect(x: bounds.width - badgeWidth - 8, y: (height - badgeFittedSize.height) / 2, width: badgeWidth, height: badgeFittedSize.height)
         }
         nameField.frame = NSRect(x: textX, y: (height - 16) / 2, width: max(textWidth, 8), height: 16)
     }
@@ -1027,6 +1085,14 @@ private final class FileTreeRowView: NSView {
             toggleAction?(path)
         }
     }
+
+    // MARK: Row typography (built once)
+
+    /// The two name fonts, built once: rows reconfigure on every scroll, and
+    /// the old code constructed a fresh `NSFont` per call. (Same rationale as
+    /// the symbol art below.)
+    private static let directoryNameFont = NSFont.systemFont(ofSize: 12)
+    private static let fileNameFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 
     // MARK: Symbol art (built once)
 

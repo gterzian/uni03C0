@@ -540,10 +540,19 @@ final class FilePaneContainer: NSView {
         // Layout-manager rects are in the (flipped, top-down) container space;
         // the container sits inside the text view at the inset.
         let insetY = codeView.textContainerInset.height
-        // The anchor: the start line's top at the top of the viewport.
-        let startDocY = startBox.minY + insetY
+        // The anchor: the start line's top at the top of the viewport. The
+        // scroll position must be the start line's top expressed in the CLIP
+        // VIEW's (bounds) coordinate system — the space `clip.bounds.origin`
+        // lives in — not raw container+inset arithmetic: the text view's
+        // frame sits at a tiling offset from the clip (its frame origin is not
+        // the clip's origin), so a raw scroll lands the line that offset above
+        // the viewport — the referenced line ends up out of view and the ruler
+        // anchor never appears. Converting through the view chain is exact
+        // whatever that offset is.
+        let startTopInCodeView = startBox.minY + insetY
         let clip = scrollView.contentView
-        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: max(0, startDocY)))
+        let startClipY = clip.convert(NSPoint(x: 0, y: startTopInCodeView), from: codeView).y
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: max(0, startClipY)))
         scrollView.reflectScrolledClipView(clip)
         // The range's vertical band in text-view coordinates (full width — the
         // container rect's own width is meaningless with wrapping disabled).

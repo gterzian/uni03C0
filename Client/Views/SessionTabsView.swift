@@ -213,7 +213,18 @@ struct SessionTabsView: View {
         help: String,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
+        // The badge is visual-only; the selected state and the badge count go
+        // into the accessibility label + traits so VoiceOver announces
+        // "Files, 3 edited files, selected" instead of a plain unselected
+        // button (the custom pills carry none of the segmented control's
+        // free semantics — selected state, group traits).
+        let accessibilityLabel: String
+        if let badge, badge > 0 {
+            accessibilityLabel = "\(title), \(badge) edited file\(badge == 1 ? "" : "s")"
+        } else {
+            accessibilityLabel = title
+        }
+        return Button(action: action) {
             HStack(spacing: 5) {
                 Image(systemName: icon)
                     .font(.system(size: 10))
@@ -243,6 +254,8 @@ struct SessionTabsView: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     /// One tab: the session's folder name, its live status icon (spinner

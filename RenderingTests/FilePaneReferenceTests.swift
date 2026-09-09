@@ -56,12 +56,25 @@ final class FilePaneReferenceTests: XCTestCase {
         XCTAssertGreaterThan(container.codeView.frame.height, clip.bounds.minY + clip.bounds.height,
                              "content below the viewport remains (the anchor is the start line)")
 
+        // And it must anchor EXACTLY at the top edge, measured in clip-bounds
+        // space through the view conversion — a raw container+inset scroll
+        // lands the start line the text view's tiling offset above the
+        // viewport, out of view, and the ruler anchor capsule never appears.
+        let layoutManager = container.codeView.layoutManager!
+        let charIndex = container.codeView.lineStartOffsets[startLine - 1]
+        let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+        let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+        let ruler = container.scrollView.verticalRulerView as! CodeLineRulerView
+        let startTopInRuler = ruler
+            .convert(NSPoint(x: 0, y: fragment.minY + container.codeView.textContainerInset.height), from: container.codeView).y
+        XCTAssertEqual(startTopInRuler, 0, accuracy: 0.5,
+                       "the start line's top must sit exactly at the viewport top")
+
         // The flash is active and the anchor is set.
         XCTAssertNotNil(container.codeView.revealFlashRect, "flash highlight over the referenced range")
         XCTAssertGreaterThan(container.codeView.revealFlashAlpha, 0.3, "flash is visible, not already faded")
         XCTAssertNotNil(container.codeView.revealAnchorRect, "in-text accent bar")
-        let ruler = container.scrollView.verticalRulerView as? CodeLineRulerView
-        XCTAssertEqual(ruler?.anchorLine, startLine, "ruler capsule on the first line of the reference")
+        XCTAssertEqual(ruler.anchorLine, startLine, "ruler capsule on the first line of the reference")
     }
 
     @MainActor
