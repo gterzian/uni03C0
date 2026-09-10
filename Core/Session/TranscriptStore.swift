@@ -64,6 +64,16 @@ public final class TranscriptStore: @unchecked Sendable {
     /// "rows were appended, do incremental inserts".
     private var _generation: UInt64 = 0
 
+    /// The path of the file an `edit`/`write` tool just finished writing
+    /// (`tool_execution_end`), when one completed. This is the client's
+    /// file-change signal: it drives the git-derived UI (the "N edited"
+    /// button and any open file browser window) the moment the tool that
+    /// wrote the file finishes, without re-inferring completion from a card's
+    /// rendered state. Written under the lock by `apply`, read-and-cleared by
+    /// the session view model after each awaited fold (see
+    /// `consumeCompletedFileEdit`).
+    private var pendingFileEdit: String?
+
     // Live-streaming state (meaningless after a rebuild).
     private var streamingEntryID: String?
     /// Id of the placeholder streaming row created on `turn_start` — immediate
@@ -447,6 +457,9 @@ public final class TranscriptStore: @unchecked Sendable {
         _generation &+= 1
         streamingEntryID = nil
         turnStartPlaceholderID = nil
+        // A rebuild replaces the history wholesale — no tool "just completed"
+        // on top of it.
+        pendingFileEdit = nil
         // Carry the rebuilt history's cross-turn miss state into live folding:
         // the next request's miss detection must compare against the last
         // request in the history (an idle gap since then evicts the cache).
@@ -757,6 +770,27 @@ public final class TranscriptStore: @unchecked Sendable {
         card.state = (end.isError ?? false) ? .failed : .done
         entry.kind = .toolCall(card: card)
         _entries[index] = entry
+        // A completed edit/write means the file on disk just changed. Surface
+        // the path (already available on the card) so the session view model
+        // can refresh the git-derived UI. Fired even on failure — an aborted
+        // edit may still have written partial content, and the settle-time
+        // refresh is the safety net either way.
+        if card.toolName == "edit" || card.toolName == "write" {
+            pendingFileEdit = card.pathArgument
+        }
+    }
+
+    /// Reads and clears the path of the most recently completed `edit`/`write`
+    /// tool call, if any. Called by the session view model (main actor) right
+    /// after it awaits a fold, so it observes exactly one frame's outcome —
+    /// the VM applies frames serially and never overlaps two. Returns nil when
+    /// the frame completed no file-writing tool.
+    public func consumeCompletedFileEdit() -> String? {
+        lock.writeLock()
+        defer { lock.unlock() }
+        let path = pendingFileEdit
+        pendingFileEdit = nil
+        return path
     }
 
     /// Marks every tool-call card still `.running` as `.failed` — an

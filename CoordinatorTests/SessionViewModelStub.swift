@@ -1,4 +1,5 @@
 import Core
+import Foundation
 
 /// Stub of `SessionViewModel` for the coordinator tests.
 ///
@@ -13,6 +14,10 @@ import Core
 /// coordinator binds to — keep its members in sync with what
 /// `TranscriptView.swift` touches.
 final class SessionViewModel {
+    /// The folder the session runs in — read by the transcript coordinator when
+    /// a `pi-file://` reference link is clicked, to key the open-file
+    /// notification to the right tab.
+    let cwd = URL(fileURLWithPath: "/")
     let store = TranscriptStore()
     var onTranscriptChange: (() -> Void)?
     var onSearchJump: ((Int) -> Void)?

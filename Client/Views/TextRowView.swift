@@ -275,6 +275,11 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// Whether this row currently renders a streaming assistant message — the
     /// caret pulse and text fade only apply then.
     private var isStreamingRow = false
+    /// Invoked when the user clicks an agent-emitted `pi-file://` reference
+    /// link in this row's text. Threaded down from the coordinator exactly
+    /// like the tool cards' `onToggleExpand`, with the same non-Optional
+    /// default (`= { _ in }`) convention.
+    private var onOpenFileReference: (FileReferenceLink) -> Void = { _ in }
     /// Observer for the Reduce Motion toggle, so the caret pulse stops/starts
     /// without waiting for the next configure.
     private var reduceMotionObserver: NSObjectProtocol?
@@ -364,9 +369,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
         }
     }
 
-    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool, cacheHitRate: Double? = nil, cacheMiss: Bool = false, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false) {
+    func configure(text: String, thinking: String?, role: Role, isStreaming: Bool, cacheHitRate: Double? = nil, cacheMiss: Bool = false, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, onOpenFileReference: @escaping (FileReferenceLink) -> Void = { _ in }) {
         self.role = role
         isStreamingRow = isStreaming
+        self.onOpenFileReference = onOpenFileReference
         textView.setAccessibilityLabel(role.accessibilityLabel)
         let oldString = textView.string
         let result = TranscriptText.attributedResult(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: FontSettings.shared.bodySize)
@@ -796,6 +802,11 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// stopped showing its caret even when not following.
     var isStreamingRowForTesting: Bool { isStreamingRow }
 
+    /// The plain text currently rendered in this row. Internal for
+    /// CoordinatorTests — the session-switch test asserts the table shows the
+    /// ACTIVE session's content after a rebind, not the previous one's.
+    var renderedTextForTesting: String { textView.string }
+
     override func layout() {
         super.layout()
         guard let container = textView.textContainer, let layoutManager = textView.layoutManager else { return }
@@ -837,10 +848,20 @@ final class TextRowView: NSView, NSTextViewDelegate {
 
     // MARK: - NSTextViewDelegate
 
-    /// Markdown links are clickable: open them in the default browser. The
-    /// row is read-only, so this is the only interaction links need.
+    /// Markdown links are clickable. Standard links open in the default
+    /// browser; agent-emitted `pi-file://` file references (see
+    /// `FileReferenceLink`) go to the row's `onOpenFileReference` handler —
+    /// the transcript coordinator posts the cwd-keyed open-file notification
+    /// that switches the session to its Files page and opens the referenced
+    /// file. A `pi-file` URL that fails to parse (empty path) is declined so
+    /// it reads as dead text rather than doing nothing interesting.
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
         guard let url = link as? URL else { return false }
+        if url.scheme == FileReferenceLink.scheme {
+            guard let fileLink = FileReferenceLink(url: url) else { return false }
+            onOpenFileReference(fileLink)
+            return true
+        }
         NSWorkspace.shared.open(url)
         return true
     }

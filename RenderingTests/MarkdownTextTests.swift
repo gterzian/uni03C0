@@ -203,6 +203,24 @@ final class MarkdownTextTests: XCTestCase {
         )
     }
 
+    func testAgentFileReferenceLinkKeepsCustomScheme() {
+        // The parser's link handling must treat the agent-emitted pi-file
+        // scheme exactly like https — the load-bearing assumption behind the
+        // whole clickable-file-reference feature (a custom scheme that fell
+        // through to plain text would need a different encoding).
+        let b = body("[Core/Renderer.swift:118-126](pi-file:///Core/Renderer.swift#L118-126)")
+        let linkLoc = RenderTestHelper.range(of: "Core/Renderer.swift:118-126", in: b.string).location
+        XCTAssertNotEqual(linkLoc, NSNotFound)
+        let link = b.string.attribute(.link, at: linkLoc, effectiveRange: nil) as? URL
+        XCTAssertEqual(link?.absoluteString, "pi-file:///Core/Renderer.swift#L118-126")
+        XCTAssertEqual(link?.scheme, "pi-file")
+        // Whole-file form too, no fragment.
+        let whole = body("[Package.swift](pi-file:///Package.swift)")
+        let wholeLoc = RenderTestHelper.range(of: "Package.swift", in: whole.string).location
+        let wholeLink = whole.string.attribute(.link, at: wholeLoc, effectiveRange: nil) as? URL
+        XCTAssertEqual(wholeLink?.absoluteString, "pi-file:///Package.swift")
+    }
+
     // MARK: - Thematic break
 
     func testThematicBreakRendersSeparator() {

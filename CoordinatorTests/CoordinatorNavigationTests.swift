@@ -781,3 +781,104 @@ final class CoordinatorNavigationTests: XCTestCase {
         XCTAssertFalse(coordinator.premeasureInFlight, "nothing was scheduled")
     }
 }
+
+// MARK: - Session switch (tab switching)
+
+extension CoordinatorNavigationTests {
+    /// Switching to a session whose store ALREADY has content (a background
+    /// tab that kept folding, or a first visit to a populated session) must
+    /// render that session's rows — the tab-switch blank-transcript report.
+    /// The coordinator is a single reused instance bound to whichever session
+    /// is active (SessionContent is reused across outer-tab switches and the
+    /// representable rebinds), so this drives rebind on the SAME table.
+    func testRebindToAnotherSessionRendersItsRows() {
+        let vmA = SessionViewModel()
+        let vmB = SessionViewModel()
+        // Both sessions populated BEFORE either is bound: A is the tab the
+        // window opens on (content streams later), B is a background tab that
+        // folded while inactive.
+        foldTurn(vmA.store, user: "question A0", reply: "answer A0")
+        foldTurn(vmA.store, user: "question A1", reply: "answer A1")
+        foldTurn(vmB.store, user: "question B0", reply: "answer B0")
+        foldTurn(vmB.store, user: "question B1", reply: "answer B1")
+        foldTurn(vmB.store, user: "question B2", reply: "answer B2")
+
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vmA)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 600)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        // A is visible: rows materialized (makeScrollView populates a store
+        // that already has content).
+        XCTAssertGreaterThan(coordinator.numberOfRows(in: coordinator.tableView), 0)
+        XCTAssertTrue(visibleText(coordinator).contains("answer A1"))
+
+        // Switch to B: rebind is exactly what TranscriptView.updateNSView
+        // calls when the active tab changes.
+        coordinator.rebind(viewModel: vmB)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        XCTAssertGreaterThan(coordinator.numberOfRows(in: coordinator.tableView), 0)
+        let text = visibleText(coordinator)
+        XCTAssertTrue(text.contains("answer B2"), "B's tail should be visible, got: \(text.prefix(200))")
+        XCTAssertFalse(text.contains("answer A1"), "A's content must not linger after the switch")
+
+        // And back to A: its saved position/content returns.
+        coordinator.rebind(viewModel: vmA)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        XCTAssertGreaterThan(coordinator.numberOfRows(in: coordinator.tableView), 0)
+        XCTAssertTrue(visibleText(coordinator).contains("answer A1"))
+    }
+
+    /// The full reported flow: a session left on its Files page (transcript
+    /// deactivated) → switch to ANOTHER session's conversation → and back —
+    /// must never leave a blank transcript. Mirrors updateNSView's call order
+    /// (rebind, then setPageActive).
+    func testPageAndSessionSwitchesNeverLeaveBlankTranscript() {
+        let vmA = SessionViewModel()
+        let vmB = SessionViewModel()
+        foldTurn(vmA.store, user: "question A0", reply: "answer A0")
+        foldTurn(vmB.store, user: "question B0", reply: "answer B0")
+
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vmA)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 600)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        XCTAssertTrue(visibleText(coordinator).contains("answer A0"))
+
+        // A goes to its Files page (transcript deactivated)…
+        coordinator.setPageActive(false)
+        // …then the user switches to session B's conversation.
+        coordinator.rebind(viewModel: vmB)
+        coordinator.setPageActive(true)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        let bText = visibleText(coordinator)
+        XCTAssertTrue(bText.contains("answer B0"), "B's rows must render after the switch, got: \(bText.prefix(160))")
+        XCTAssertFalse(bText.contains("answer A0"))
+
+        // And back to A's conversation.
+        coordinator.setPageActive(false)
+        coordinator.rebind(viewModel: vmA)
+        coordinator.setPageActive(true)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        let aText = visibleText(coordinator)
+        XCTAssertTrue(aText.contains("answer A0"), "A's rows must render on return, got: \(aText.prefix(160))")
+    }
+
+    /// The text currently rendered by the materialized (visible) rows —
+    /// nil cells skipped.
+    private func visibleText(_ coordinator: Coordinator) -> String {
+        var out: [String] = []
+        let n = coordinator.numberOfRows(in: coordinator.tableView)
+        guard n > 0 else { return "" }
+        for row in 0..<min(n, 400) {
+            guard let view = coordinator.tableView.view(atColumn: 0, row: row, makeIfNecessary: true) as? TextRowView else { continue }
+            out.append(view.renderedTextForTesting)
+        }
+        return out.joined(separator: " ")
+    }
+}
