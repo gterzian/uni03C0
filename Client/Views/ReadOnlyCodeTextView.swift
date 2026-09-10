@@ -323,6 +323,11 @@ final class CodeLineRulerView: NSRulerView {
         super.init(scrollView: scrollView, orientation: .verticalRuler)
         ruleThickness = 52
         clientView = scrollView.contentView
+        // Clip the ruler's own subviews (AppKit's `_NSRulerContentView` is
+        // sized to the DOCUMENT and can be taller than the ruler) to the
+        // ruler's bounds, so nothing the ruler machinery draws can escape the
+        // gutter.
+        clipsToBounds = true
 
         // Redraw on scroll: see the class doc — the ruler is a sibling of the
         // clip view, and AppKit does not invalidate it when the clip scrolls.

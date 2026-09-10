@@ -68,6 +68,25 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         )
     }
 
+    /// The pane fills whatever slot SwiftUI gives it; it must NEVER size itself
+    /// to its CONTENT. `FilePaneContainer`'s fitting size is the whole file's
+    /// text height — the code text view is deliberately unbounded
+    /// (`isVerticallyResizable`, `maxSize` = `.greatestFiniteMagnitude`) so it
+    /// can scroll — and that fitting height leaks into SwiftUI's layout as the
+    /// representable's ideal size, inflating the pane (and everything laid out
+    /// around it: `columnDivider`, the ruler) past the real visible slot. This
+    /// is the actual root cause the earlier `.frame(maxHeight: .infinity)`
+    /// wrapper could not fix: a frame with an infinite max still ADOPTS the
+    /// child's oversized ideal height. Adopt the proposed size instead — that
+    /// is what "fill the slot" means at the representable boundary.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: FilePaneContainer, context: Context) -> CGSize? {
+        func finite(_ value: CGFloat?) -> CGFloat {
+            guard let value, value.isFinite else { return 0 }
+            return value
+        }
+        return CGSize(width: finite(proposal.width), height: finite(proposal.height))
+    }
+
     @MainActor
     final class Coordinator {
         weak var container: FilePaneContainer?
@@ -412,12 +431,27 @@ final class FilePaneContainer: NSView {
     }
 
     private func setup() {
+        // Hard-clip everything inside the pane to the pane's own bounds. SwiftUI
+        // makes this view layer-backed, and a layer-backed NSView does NOT clip
+        // its subviews by default (AppKit only clips non-layer-backed drawing).
+        // AppKit's ruler machinery sizes its internal content view to the
+        // DOCUMENT — which can exceed the pane — and draws the gutter's
+        // separator from the scroll view's geometry; with no clip that chrome
+        // paints outside the pane, over the tab panel above and the prompt bar
+        // below (the full-height gutter-line symptom). Clipping makes the pane's
+        // own bounds the hard edge for its subviews regardless of what AppKit
+        // lays out inside it.
+        clipsToBounds = true
+
         // The edit-map scroller must be installed BEFORE the scroll view
         // creates its own (hasVerticalScroller = true below would lazily make
         // a plain NSScroller otherwise). Assigning a subclass forces the
         // legacy (always-visible) scroller style — intended: the edit map is
         // only useful while the bar is shown.
         scrollView.verticalScroller = CodePaneEditMarkerScroller()
+        // The ruler and AppKit's ruler helper views are subviews of the scroll
+        // view; keep them inside it too.
+        scrollView.clipsToBounds = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor

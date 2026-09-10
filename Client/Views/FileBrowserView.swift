@@ -484,14 +484,14 @@ struct FileBrowserView: View {
                     // `ReadOnlyFilePane.pageActive`).
                     pageActive: pageActive
                 )
-                // An authoritative size opinion, like the placeholder branch's
-                // below: without it the representable falls back to the
-                // `FilePaneContainer`'s own fitting size — the text view loads
-                // the whole file unbounded (`isVerticallyResizable`, maxSize
-                // ∞), so that fitting height can exceed the slot `editorMeta`
-                // + `Divider` left in this VStack, and the oversized pane
-                // overflows upward — the code pane's ruler rows paint through
-                // the (translucent) chrome above the detail column.
+                // A flexible slot in this VStack (the placeholder branch below
+                // declares the same). The pane now fills it exactly: its
+                // `sizeThatFits` override adopts the proposed size instead of
+                // reporting `FilePaneContainer`'s fitting size — the whole
+                // file's text height (the code text view is unbounded so it can
+                // scroll). Without both, the oversized fitting height inflates
+                // the pane past this slot and the code pane's ruler rows paint
+                // through the (translucent) chrome above the detail column.
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView(
@@ -700,6 +700,19 @@ private struct FileTreeTable: NSViewRepresentable {
             onToggleDirectory: onToggleDirectory,
             onRevealConsumed: onRevealConsumed
         )
+    }
+
+    /// Same contract as `ReadOnlyFilePane.sizeThatFits`: the tree table fills
+    /// the slot given to it, never its content. An `NSTableView`'s fitting
+    /// height is `rows × rowHeight` — for a large expanded project that would
+    /// inflate the tree column (and the divider it shares with the detail
+    /// pane) past the page slot, the same leak the code pane used to have.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        func finite(_ value: CGFloat?) -> CGFloat {
+            guard let value, value.isFinite else { return 0 }
+            return value
+        }
+        return CGSize(width: finite(proposal.width), height: finite(proposal.height))
     }
 }
 
