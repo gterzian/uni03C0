@@ -44,6 +44,21 @@ struct SessionContent: View {
                     .accessibilityHidden(tab.page != .conversation)
                 FileBrowserView(store: tab.fileBrowser, pageActive: tab.page == .files)
                     .id(tab.id)
+                    // Same top-level contract as `conversationPage` above: fill
+                    // exactly the page slot offered, regardless of what our own
+                    // content wants. Both pages stay mounted and
+                    // layout-participating in this ZStack (hidden via opacity),
+                    // and `FileBrowserView` wraps an unbounded
+                    // `NSViewRepresentable` (the code text view) whose fitting
+                    // height would otherwise leak into the ZStack's size
+                    // computation. That inflated the whole browser — including
+                    // `columnDivider` and the code pane's ruler canvas — past
+                    // the real visible slot (the divider extending above the
+                    // header and below the file). `ReadOnlyFilePane`'s own
+                    // `.frame(maxHeight: .infinity)` only pins `detailPane`'s
+                    // local slot inside `FileBrowserView`; this closes the gap
+                    // one level up.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .opacity(tab.page == .files ? 1 : 0)
                     .allowsHitTesting(tab.page == .files)
                     .accessibilityHidden(tab.page != .files)
