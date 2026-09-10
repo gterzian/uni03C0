@@ -40,6 +40,8 @@ struct AppCommands: Commands {
 
         CommandMenu("View") {
             FontSizeCommands()
+            Divider()
+            AppearanceCommands()
         }
 
         CommandMenu("Projects") {

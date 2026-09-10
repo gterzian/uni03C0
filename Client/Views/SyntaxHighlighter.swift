@@ -13,6 +13,14 @@ import Highlightr
 /// "never block the UI" invariant wins over coloring an enormous file (the
 /// doc's own fallback for an unrecognized extension, generalized to "too big
 /// to color cheaply").
+///
+/// The theme is a MATCHED light/dark pair (`atom-one-light` / `atom-one-dark`),
+/// re-resolved from the effective appearance on every `highlight` call. Because
+/// Highlightr bakes the theme's fixed RGB values into the returned string, the
+/// displayed file is re-highlighted when the app's appearance changes —
+/// `FilePaneContainer.viewDidChangeEffectiveAppearance` drives that, so a
+/// light/dark toggle (or a system appearance change) lands in the code pane
+/// without re-reading the file.
 @MainActor
 final class SyntaxHighlighter {
     private let highlightr: Highlightr?
@@ -48,11 +56,14 @@ final class SyntaxHighlighter {
         guard appliedDarkTheme != dark else { return }
         appliedDarkTheme = dark
         guard let highlightr else { return }
-        let preferred = dark ? "atom-one-dark" : "xcode"
-        if !highlightr.setTheme(to: preferred) {
-            // Highlightr's built-in default (pojoaque) is dark and readable;
-            // failing to find the preferred theme just keeps it.
-            _ = highlightr.setTheme(to: "github")
-        }
+        // A matched pair from the same family: atom-one-light / atom-one-dark,
+        // so token colors keep their relationships when the app switches
+        // appearance. Fall back to a same-contrast alternative (github /
+        // github-dark) if a theme is ever renamed out of the bundle, then to
+        // Highlightr's built-in default as the last resort.
+        let preferred = dark ? "atom-one-dark" : "atom-one-light"
+        if highlightr.setTheme(to: preferred) { return }
+        if highlightr.setTheme(to: dark ? "github-dark" : "github") { return }
+        _ = highlightr.setTheme(to: "pojoaque")
     }
 }

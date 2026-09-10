@@ -28,6 +28,12 @@ enum LiveSessions {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Apply the persisted appearance (light / dark / match system) before
+        // the first window shows, so the initial frame is already correct.
+        // `AppearanceSettings.shared` initializes once and pushes the saved
+        // mode onto NSApplication.appearance; the toolbar/menu reuse it.
+        _ = AppearanceSettings.shared
+
         // Register the bundled skills directory in pi's GLOBAL settings, so
         // every session the app spawns can load the app-bundled skills (the
         // `file-reference-links` skill the agent is taught to use). The skill

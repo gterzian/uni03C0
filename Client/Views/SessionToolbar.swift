@@ -22,6 +22,10 @@ enum SessionToolbar {
             modelMenu(tab.viewModel)
             thinkingMenu(tab.viewModel)
             resumeMenu(tab)
+            // App-wide appearance (light / dark / system). A single window is
+            // the app, so the toggle lives on the session toolbar but applies
+            // to every window and pane.
+            AppearanceMenuButton()
         }
     }
 

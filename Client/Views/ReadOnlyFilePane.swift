@@ -49,6 +49,12 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     func makeNSView(context: Context) -> FilePaneContainer {
         let container = FilePaneContainer()
         context.coordinator.container = container
+        // A light/dark change (app toggle or system) must re-highlight the
+        // open file: Highlightr caches the resolved theme once, so the pane
+        // asks its coordinator to rebuild the attributed buffer.
+        container.onAppearanceChange = { [weak coordinator = context.coordinator] in
+            coordinator?.appearanceChanged()
+        }
         return container
     }
 
@@ -108,6 +114,16 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         /// message) currently sits in the pane.
         private var displayedPath: String?
         private var displayedToken: Int?
+        /// The absolute path + edit overlay of the content currently displayed
+        /// (nil while a placeholder is up). Kept so an appearance change can
+        /// re-highlight the SAME buffer WITHOUT re-reading the file: the plain
+        /// text is read from the code view's own storage in
+        /// `appearanceChanged`.
+        private var displayedAbsolutePath: String?
+        private var displayedOverlay: PaneOverlay = .none
+        /// A light/dark change arrived while the Files page was hidden: run the
+        /// re-highlight once on activation instead of for an off-screen pane.
+        private var pendingAppearanceRefresh = false
         private let highlighter = SyntaxHighlighter()
         private let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         private let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
@@ -134,12 +150,23 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             guard isActive != active else { return }
             isActive = active
             if active {
-                guard let target = deferred ?? accepted, !isDisplayed(target) else {
+                let launched: Bool
+                if let target = deferred ?? accepted, !isDisplayed(target) {
                     deferred = nil
-                    return
+                    launch(target)
+                    launched = true
+                } else {
+                    deferred = nil
+                    launched = false
                 }
-                deferred = nil
-                launch(target)
+                // A theme change that landed while hidden: the displayed buffer
+                // still carries the old theme. Re-highlight it — unless a
+                // catch-up load just started, which already highlights with the
+                // current appearance.
+                if pendingAppearanceRefresh {
+                    pendingAppearanceRefresh = false
+                    if !launched { appearanceChanged() }
+                }
             } else {
                 loadTask?.cancel()
                 loadTask = nil
@@ -188,6 +215,9 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             // content until the new one is ready.
             if displayedPath != request.path {
                 container?.showPlaceholder("Loading…")
+                // No buffer is on screen for this path: an appearance change
+                // must not re-highlight the previous file over the placeholder.
+                displayedAbsolutePath = nil
             }
             loadTask = Task { [weak self] in
                 await self?.performLoad(request)
@@ -211,12 +241,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             }
             // The scrollbar edit map mirrors the edit overlay exactly (same
             // added-line diff / whole-file classification).
-            let markers: PaneMarkers = switch loaded.overlay {
-            case .none: .none
-            case .greenLines(let lines): .lines(lines)
-            case .wholeGreen: .wholeAdded
-            case .wholeRed: .wholeDeleted
-            }
+            let markers = paneMarkers(for: loaded.overlay)
             // The code view is stamped with the file's RESOLVED ABSOLUTE path
             // (canonicalized once, here) — never the git-relative path: a
             // relative path would later be resolved against the app process's
@@ -239,11 +264,49 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                     targetLines: targetLines,
                     markers: markers
                 )
+                displayedAbsolutePath = absolutePath
+                displayedOverlay = loaded.overlay
             } else {
                 container.showPlaceholder(loaded.message ?? "Couldn't read \((request.path as NSString).lastPathComponent).")
+                displayedAbsolutePath = nil
             }
             displayedPath = request.path
             displayedToken = request.token
+        }
+
+        /// Re-runs syntax highlighting for the displayed buffer with the
+        /// current appearance's theme. Called from the container when its
+        /// effective appearance changes (an app light/dark toggle OR a system
+        /// appearance change). The file is NOT re-read and no git subprocess
+        /// runs: the plain text comes from the code view's storage and the edit
+        /// overlay is the one captured at load, so this is one main-thread
+        /// highlight pass with the scroll position preserved. A hidden Files
+        /// page defers it to activation; a placeholder does nothing.
+        func appearanceChanged() {
+            guard isActive, let container, let absolutePath = displayedAbsolutePath, let relativePath = displayedPath else {
+                pendingAppearanceRefresh = displayedAbsolutePath != nil
+                return
+            }
+            pendingAppearanceRefresh = false
+            let text = container.codeView.string
+            let attributed = makeAttributed(text: text, path: relativePath, overlay: displayedOverlay)
+            container.displayContent(
+                path: absolutePath,
+                text: attributed,
+                preserveScroll: true,
+                markers: paneMarkers(for: displayedOverlay)
+            )
+        }
+
+        /// The scrollbar edit map for an overlay — the same mapping the load
+        /// path uses, shared so a theme-only re-render keeps the markers.
+        private func paneMarkers(for overlay: PaneOverlay) -> PaneMarkers {
+            switch overlay {
+            case .none: .none
+            case .greenLines(let lines): .lines(lines)
+            case .wholeGreen: .wholeAdded
+            case .wholeRed: .wholeDeleted
+            }
         }
 
         /// Builds the final buffer: syntax highlighting (when the file is
@@ -264,6 +327,11 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             // uniform monospaced, and the ruler's uniform line-height math
             // depends on it.
             styled.addAttribute(.font, value: font, range: whole)
+            // Drop the highlight.js theme's OWN background (the `.hljs` rule),
+            // so the pane keeps the app's semantic `textBackgroundColor`
+            // instead of a theme-specific wash that would clash with the file
+            // browser and the transcript. Token foreground colors stay.
+            styled.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: styled.length))
             switch overlay {
             case .none:
                 break
@@ -419,6 +487,19 @@ final class FilePaneContainer: NSView {
     let scrollView = NSScrollView()
     let codeView = ReadOnlyCodeTextView(frame: .zero, textContainer: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+
+    /// Called when the view's effective appearance changes (an app light/dark
+    /// toggle or a system appearance change), so the coordinator can re-run
+    /// syntax highlighting with the matching theme. AppKit invokes
+    /// `viewDidChangeEffectiveAppearance` for inherited appearance changes on
+    /// every view in the window, so this covers a mid-session toggle without
+    /// any global observer.
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

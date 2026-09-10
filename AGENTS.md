@@ -606,6 +606,18 @@ concurrency.
   read it; the transcript coordinator observes the change, clears every
   session's cached heights, and re-measures, so heights always match the
   rendered font.
+- `AppearanceSettings` / `AppearanceCommands` / `AppearanceMenuButton` —
+  app-wide appearance (light / dark / match system), persisted and applied via
+  `NSApplication.appearance` (plus already-open windows), so every window,
+  semantic color, material and AppKit view follows through the normal
+  appearance-change path. The toolbar button and the View menu both write it.
+  The one cache that must be reset is syntax highlighting — Highlightr bakes
+  fixed RGB values out of a highlight.js theme — so `FilePaneContainer`
+  reacts to `viewDidChangeEffectiveAppearance` and re-highlights the open file
+  with the matching light/dark theme (`atom-one-light` / `atom-one-dark`)
+  from the code view's existing buffer, without re-reading the file. The
+  highlight.js theme's own background is stripped so the pane keeps the
+  semantic background.
 - `SessionHistorySheet` — unbounded session list.
 - `AppState` / `AppStorage` / `AppDelegate` — app-wide state, storage paths,
   and subprocess cleanup on termination (every live child gets EOF on quit).
