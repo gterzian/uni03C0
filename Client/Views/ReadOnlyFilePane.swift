@@ -114,6 +114,15 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         /// message) currently sits in the pane.
         private var displayedPath: String?
         private var displayedToken: Int?
+        /// The git kind the displayed content was loaded with. Part of the
+        /// display identity alongside path/token: a refresh can change a
+        /// file's kind (clean → modified) WITHOUT bumping the token — the
+        /// token bump fires on the file-change notification, which precedes
+        /// the store's own debounced refresh, so it carries the OLD kind. If
+        /// the kind weren't part of the identity, that stale-kind load would
+        /// be considered "already displayed" and the pane would keep the
+        /// uncolored buffer (the missing added-line overlay).
+        private var displayedKind: GitStatus.Kind?
         /// The absolute path + edit overlay of the content currently displayed
         /// (nil while a placeholder is up). Kept so an appearance change can
         /// re-highlight the SAME buffer WITHOUT re-reading the file: the plain
@@ -177,12 +186,18 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         }
 
         private func isDisplayed(_ request: Pending) -> Bool {
-            request.path == displayedPath && request.token == displayedToken
+            request.path == displayedPath
+                && request.token == displayedToken
+                && request.kind == displayedKind
         }
 
         func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
             guard container != nil else { return }
-            if let accepted, accepted.path == path, accepted.token == token { return }
+            // The KIND is part of the identity: a refresh that reclassifies
+            // the open file (clean → modified) arrives with an unchanged
+            // token and must still reload, or the pane never gains the edit
+            // overlay (see `displayedKind`).
+            if let accepted, accepted.path == path, accepted.token == token, accepted.kind == kind { return }
             let request = Pending(
                 cwd: cwd, path: path, kind: kind, token: token,
                 reference: reference, onReferenceConsumed: onReferenceConsumed
@@ -231,8 +246,13 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             // cancelled): nothing may be applied to an off-screen pane — the
             // apply is main-thread work for a page the user cannot see.
             guard !Task.isCancelled else { return }
-            // A newer request supersedes this one.
-            guard let current = accepted, current.path == request.path, current.token == request.token else { return }
+            // A newer request supersedes this one — same path+token but a
+            // reclassified kind is a NEWER request (the store refresh landed
+            // after the token bump), so it must win over this stale-kind load.
+            guard let current = accepted,
+                  current.path == request.path,
+                  current.token == request.token,
+                  current.kind == request.kind else { return }
             // The target lines ride on the request that captured them (see
             // `reload`) — a whole-file reference has no target lines.
             let targetLines: (start: Int, end: Int)? = request.reference.flatMap { ref in
@@ -272,6 +292,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             }
             displayedPath = request.path
             displayedToken = request.token
+            displayedKind = request.kind
         }
 
         /// Re-runs syntax highlighting for the displayed buffer with the

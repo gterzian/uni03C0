@@ -1115,7 +1115,14 @@ only what it needs.**
   it mid-flight, which is how the "opens at the top" bug happened (a second
   reload from a redundant reload-token bump on selection change superseded
   the reference load before it landed — selection changes therefore do NOT
-  bump the pane token; path changes alone reload, deduped on (path, token)).
+  bump the pane token; path changes alone reload, deduped on (path, kind,
+  token)). The KIND is part of that identity on purpose: a refresh that
+  reclassifies the open file (clean → modified) arrives with an unchanged
+  token — the token bump fires on the file-change notification, which
+  precedes the store's debounced git refresh, so it carries the OLD kind —
+  and must still reload, or the added-line overlay never appears.
+  `FilePaneEditOverlayTests` (RenderingTests) pin the overlay plus that
+  stale-kind reload against a real throwaway git repo.
   Ordering is load-bearing: the jump runs AFTER `codeView.load`'s scroll-to-
   top, and geometry is forced with `ensureLayout` before the scroll/flash
   rects are computed. `FilePaneReferenceTests` (RenderingTests) pin all of
