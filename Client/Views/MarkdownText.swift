@@ -19,9 +19,10 @@ import AppKit
 /// (monospaced, wrapping early to leave `codeBlockRightReserve` at the right
 /// edge for the corner copy button — the row draws the full-width card and
 /// button from the reported `codeBlocks`), bullet and ordered lists (nested,
-/// with hanging indents), blockquotes, and links (clickable — `TextRowView`
-/// opens them). Tables are not part of the parser's CommonMark subset and fall
-/// back to plain paragraphs.
+/// with hanging indents), blockquotes, links (clickable — `TextRowView`
+/// opens them), and GitHub-style tables (detected before parsing —
+/// Foundation's parser has no table extension — and rendered as an aligned
+/// grid of columns).
 @MainActor
 enum MarkdownText {
     /// A plain immutable data holder; `nonisolated` so `build` and the
@@ -77,6 +78,53 @@ enum MarkdownText {
     }
 
     nonisolated private static func build(text: String, bodySize: CGFloat) -> MarkdownBody {
+        // Fast path: no pipe anywhere → no table is possible, so the whole
+        // line scan (and its per-message line array) is skipped. This keeps the
+        // streaming hot path a single `contains` scan, like before tables.
+        guard text.contains("|") else { return buildMarkdown(text, bodySize: bodySize) }
+        let segments = tableSegments(in: text)
+        // No table blocks detected → the original single-parse path.
+        if segments.count == 1, case .markdown = segments[0] {
+            return buildMarkdown(text, bodySize: bodySize)
+        }
+        let result = NSMutableAttributedString()
+        var codeBlocks: [(range: NSRange, code: String)] = []
+        for segment in segments {
+            let piece: MarkdownBody
+            switch segment {
+            case .markdown(let source):
+                piece = buildMarkdown(source, bodySize: bodySize)
+            case .table(let table):
+                piece = MarkdownBody(string: renderTable(table, bodySize: bodySize), codeBlocks: [])
+            }
+            guard piece.string.length > 0 else { continue }
+            if result.length > 0 { appendSegmentGap(to: result, bodySize: bodySize) }
+            let offset = result.length
+            result.append(piece.string)
+            codeBlocks.append(contentsOf: piece.codeBlocks.map {
+                (range: NSRange(location: offset + $0.range.location, length: $0.range.length), code: $0.code)
+            })
+        }
+        return MarkdownBody(string: result, codeBlocks: codeBlocks)
+    }
+
+    /// The gap between two independently-rendered segments (a markdown run and
+    /// a table, or two markdown runs split by a table). Mirrors the spacer-line
+    /// mechanism `buildMarkdown` uses between blocks: a terminating newline
+    /// carrying the previous run's attributes, then an empty line whose font
+    /// height equals the gap.
+    nonisolated private static func appendSegmentGap(to result: NSMutableAttributedString, bodySize: CGFloat) {
+        let bodyFont = NSFont.systemFont(ofSize: bodySize)
+        let bodyLineRatio = (bodyFont.ascender - bodyFont.descender + bodyFont.leading) / bodyFont.pointSize
+        let gapFont = NSFont.systemFont(ofSize: max(6 / bodyLineRatio, 1))
+        let lastAttrs = result.length > 0
+            ? result.attributes(at: result.length - 1, effectiveRange: nil)
+            : [.font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: plainParagraph()]
+        result.append(NSAttributedString(string: "\n", attributes: lastAttrs))
+        result.append(NSAttributedString(string: "\n", attributes: [.font: gapFont]))
+    }
+
+    nonisolated private static func buildMarkdown(_ text: String, bodySize: CGFloat) -> MarkdownBody {
         guard let parsed = try? AttributedString(markdown: text) else {
             // The parser is CommonMark-tolerant; on the off chance it refuses,
             // render the source verbatim (identical to the old plain path).
@@ -215,6 +263,290 @@ enum MarkdownText {
             lastBlock = block
         }
         return MarkdownBody(string: result, codeBlocks: codeBlocks)
+    }
+
+    // MARK: - Tables
+
+    /// A GitHub-style table block detected in the source (its delimiter row
+    /// makes it unambiguous). Foundation's parser has no table extension, so
+    /// these are pulled out before parsing and rendered by `renderTable`.
+    nonisolated private struct MarkdownTable {
+        var headers: [String]
+        var alignments: [CellAlignment]
+        var rows: [[String]]
+    }
+
+    nonisolated private enum CellAlignment { case left, center, right }
+
+    /// A run of source: either plain markdown (parsed by `buildMarkdown`) or a
+    /// detected table.
+    nonisolated private enum TableSegment {
+        case markdown(String)
+        case table(MarkdownTable)
+    }
+
+    /// Splits the source into markdown runs and table blocks. A table is a
+    /// header line followed by a delimiter line (`| --- | :--: |`) with the
+    /// same cell count; body rows are the following lines that still contain a
+    /// `|`. Lines inside fenced code blocks are never considered.
+    nonisolated private static func tableSegments(in text: String) -> [TableSegment] {
+        let lines = text.components(separatedBy: "\n")
+        var segments: [TableSegment] = []
+        var buffer: [String] = []
+        var inFence = false
+        var fence = ""
+        func flush() {
+            guard !buffer.isEmpty else { return }
+            segments.append(.markdown(buffer.joined(separator: "\n")))
+            buffer.removeAll()
+        }
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if inFence {
+                buffer.append(line)
+                if trimmed.hasPrefix(fence) { inFence = false }
+                i += 1
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inFence = true
+                fence = String(trimmed.prefix(3))
+                buffer.append(line)
+                i += 1
+                continue
+            }
+            if i + 1 < lines.count,
+               let headers = parseTableRow(line),
+               let alignments = parseDelimiterRow(lines[i + 1]),
+               headers.count == alignments.count,
+               !headers.isEmpty {
+                var rows: [[String]] = []
+                var j = i + 2
+                while j < lines.count, let cells = parseTableRow(lines[j]) {
+                    rows.append(normalize(cells, to: headers.count))
+                    j += 1
+                }
+                flush()
+                segments.append(.table(MarkdownTable(headers: headers, alignments: alignments, rows: rows)))
+                i = j
+                continue
+            }
+            buffer.append(line)
+            i += 1
+        }
+        flush()
+        return segments
+    }
+
+    /// Splits a table line into trimmed cells. Returns nil when the line has no
+    /// `|` at all (so ordinary prose never starts a table). An escaped `\|`
+    /// stays in the cell text for the inline markdown parse to unescape.
+    nonisolated private static func parseTableRow(_ line: String) -> [String]? {
+        guard line.contains("|") else { return nil }
+        var cells: [String] = []
+        var current = ""
+        var escaped = false
+        for ch in line {
+            if escaped {
+                current.append(ch)
+                escaped = false
+            } else if ch == "\\" {
+                current.append(ch)
+                escaped = true
+            } else if ch == "|" {
+                cells.append(current)
+                current = ""
+            } else {
+                current.append(ch)
+            }
+        }
+        cells.append(current)
+        if let first = cells.first, first.trimmingCharacters(in: .whitespaces).isEmpty { cells.removeFirst() }
+        if let last = cells.last, last.trimmingCharacters(in: .whitespaces).isEmpty { cells.removeLast() }
+        return cells.map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// Parses a GFM delimiter row (`---`, `:---`, `---:`, `:--:`) into
+    /// per-column alignments; nil when any cell is not a delimiter.
+    nonisolated private static func parseDelimiterRow(_ line: String) -> [CellAlignment]? {
+        guard let cells = parseTableRow(line), !cells.isEmpty else { return nil }
+        var alignments: [CellAlignment] = []
+        for cell in cells {
+            guard !cell.isEmpty,
+                  cell.contains("-"),
+                  cell.allSatisfy({ $0 == "-" || $0 == ":" }) else { return nil }
+            let left = cell.hasPrefix(":")
+            let right = cell.hasSuffix(":")
+            alignments.append(left && right ? .center : right ? .right : .left)
+        }
+        return alignments
+    }
+
+    nonisolated private static func normalize(_ cells: [String], to count: Int) -> [String] {
+        if cells.count == count { return cells }
+        if cells.count > count { return Array(cells.prefix(count)) }
+        return cells + Array(repeating: "", count: count - cells.count)
+    }
+
+    /// Renders a table as an aligned grid of text lines: a bold header with a
+    /// tinted background, a dashed separator, then one line per row. Columns
+    /// are positioned with tab stops at the widest cell's edge, so alignment
+    /// is exact (a right-aligned tab stop lands the following text flush at
+    /// the column's right edge, a center stop at its middle) regardless of
+    /// inline styling; tabs keep the whole table inside the row's single
+    /// attributed string (the load-bearing measurement invariant). Cells are
+    /// inline markdown, so `**bold**`, `` `code` `` and links work inside a
+    /// cell.
+    nonisolated private static func renderTable(_ table: MarkdownTable, bodySize: CGFloat) -> NSAttributedString {
+        let bodyFont = NSFont.systemFont(ofSize: bodySize)
+        let columnCount = table.headers.count
+        // The gap between columns, as a fixed point width (it must not depend
+        // on the font's space glyph, since the columns are laid out by tab).
+        let columnGap: CGFloat = 12
+
+        let headerCells = (0..<columnCount).map {
+            renderInlineCell($0 < table.headers.count ? table.headers[$0] : "", bodySize: bodySize, isHeader: true)
+        }
+        let bodyRows: [[NSAttributedString]] = table.rows.map { row in
+            (0..<columnCount).map {
+                renderInlineCell($0 < row.count ? row[$0] : "", bodySize: bodySize, isHeader: false)
+            }
+        }
+
+        var widths = [CGFloat](repeating: 0, count: columnCount)
+        for (column, cell) in headerCells.enumerated() {
+            widths[column] = max(widths[column], cell.size().width)
+        }
+        for row in bodyRows {
+            for (column, cell) in row.enumerated() {
+                widths[column] = max(widths[column], cell.size().width)
+            }
+        }
+
+        var starts = [CGFloat](repeating: 0, count: columnCount)
+        var cursor: CGFloat = 0
+        for column in 0..<columnCount {
+            starts[column] = cursor
+            cursor += widths[column] + columnGap
+        }
+
+        func tabStop(for column: Int) -> NSTextTab {
+            let alignment: NSTextAlignment = switch table.alignments[column] {
+            case .left: .left
+            case .right: .right
+            case .center: .center
+            }
+            let location: CGFloat = switch table.alignments[column] {
+            case .left: starts[column]
+            case .right: starts[column] + widths[column]
+            case .center: starts[column] + widths[column] / 2
+            }
+            return NSTextTab(textAlignment: alignment, location: location, options: [:])
+        }
+
+        // A left-aligned first column needs no leading tab (a left tab stop at
+        // 0 is skipped by the layout engine, which would jump the cell to the
+        // NEXT stop). A right/center first column gets a leading tab whose stop
+        // is its own.
+        let leadingTab = table.alignments[0] != .left
+        var stops: [NSTextTab] = []
+        if leadingTab { stops.append(tabStop(for: 0)) }
+        for column in 1..<columnCount { stops.append(tabStop(for: column)) }
+
+        let tab = NSAttributedString(string: "\t", attributes: [.font: bodyFont])
+        func assemble(_ cells: [NSAttributedString]) -> NSMutableAttributedString {
+            let line = NSMutableAttributedString()
+            if leadingTab { line.append(tab) }
+            line.append(cells[0])
+            for column in 1..<columnCount {
+                line.append(tab)
+                line.append(cells[column])
+            }
+            return line
+        }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 2
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.tabStops = stops
+
+        let dashWidth = ("\u{2500}" as NSString).size(withAttributes: [.font: bodyFont]).width
+        let separatorCells = (0..<columnCount).map { column -> NSAttributedString in
+            let count = dashWidth > 0 ? max(1, Int(widths[column] / dashWidth)) : 1
+            return NSAttributedString(string: String(repeating: "\u{2500}", count: count), attributes: [
+                .font: bodyFont,
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ])
+        }
+
+        let out = NSMutableAttributedString()
+        out.append(assemble(headerCells))
+        out.addAttribute(.backgroundColor, value: tableHeaderBackground, range: NSRange(location: 0, length: out.length))
+        out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
+        out.append(assemble(separatorCells))
+        out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
+        for row in bodyRows {
+            out.append(assemble(row))
+            out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
+        }
+        // One line per row, so no trailing blank line; the block gap is added
+        // by the segment assembler.
+        if out.string.hasSuffix("\n") { out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1)) }
+        out.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: out.length))
+        return out
+    }
+
+    /// Renders one table cell's inline markdown (bold/italic/strikethrough/
+    /// inline code/links) at the cell's font. Cells carry no block structure,
+    /// so this is the inline half of `buildMarkdown` without block handling.
+    nonisolated private static func renderInlineCell(_ source: String, bodySize: CGFloat, isHeader: Bool) -> NSAttributedString {
+        let baseFont = isHeader ? NSFont.boldSystemFont(ofSize: bodySize) : NSFont.systemFont(ofSize: bodySize)
+        let monoFont = NSFont.monospacedSystemFont(ofSize: max(bodySize - 1, 9), weight: .regular)
+        let trimmed = source.trimmingCharacters(in: .whitespaces)
+        let out = NSMutableAttributedString()
+        guard !trimmed.isEmpty else {
+            // A single space keeps alignment and gives the column a real width.
+            return NSAttributedString(string: " ", attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+        }
+        guard let parsed = try? AttributedString(markdown: trimmed) else {
+            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+        }
+        for run in parsed.runs {
+            let text = String(parsed.characters[run.range]).replacingOccurrences(of: "\n", with: " ")
+            guard !text.isEmpty else { continue }
+            var font = baseFont
+            if run.inlinePresentationIntent?.contains(.code) == true { font = monoFont }
+            if let inline = run.inlinePresentationIntent {
+                if inline.contains(.stronglyEmphasized) { font = withTrait([.bold], font) }
+                if inline.contains(.emphasized) { font = withTrait([.italic], font) }
+            }
+            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+            if run.inlinePresentationIntent?.contains(.code) == true { attrs[.backgroundColor] = codeBackground }
+            if let inline = run.inlinePresentationIntent, inline.contains(.strikethrough) {
+                attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            }
+            if let url = run.link {
+                attrs[.link] = url
+                attrs[.foregroundColor] = NSColor.linkColor
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            out.append(NSAttributedString(string: text, attributes: attrs))
+        }
+        if out.length == 0 {
+            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+        }
+        return out
+    }
+
+    /// Tint behind a table's header row; dynamic so it adapts to dark/light
+    /// mode and is resolved per draw.
+    nonisolated private static let tableHeaderBackground = NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.09)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.05)
     }
 
     /// Applies a font trait (bold/italic) without `NSFontManager` — the

@@ -728,8 +728,13 @@ Behavior details that matter:
   crossfade writes colors INTO the shared text storage, so it must always end
   where the string says: a batch superseded before its ~0.3s fade finished is
   **settled** to its final colors (`TextRowView.settlePendingFade`, called from
-  `configure` before the new string lands), and the last fade step restores the
-  captured color OBJECT rather than `withAlphaComponent(1)`. Both are
+  `configure` before the new string lands), the last fade step restores the
+  captured color OBJECT rather than `withAlphaComponent(1)`, and the fade
+  never drops below a legible floor (`minimumFadeAlpha`) and interpolates to
+  each run's OWN alpha, so a faint run is never brightened past its settled
+  color. The floor is load-bearing in dark mode: `secondaryLabelColor` — the
+  thinking-trace color — is already alpha ~0.55, so the old absolute 0.12
+  dim made the newest reasoning text the color of the background. All three are
   load-bearing — see *Failed fixes*.
   The
   streaming row's height comes from the cell's own layout manager
@@ -915,7 +920,11 @@ works around them, and reintroducing any of them breaks the fast-UI property.
   bold. `settlePendingFade` + restoring the captured color object fix both;
   `RenderingTests/StreamingFadeTests.swift` pins them. Anything new that
   animates attributes in the row's storage must settle to the built string's
-  values.
+  values. A third failure was the fade's absolute 0.12 floor: the semantic
+  colors are translucent, so the newest thinking-trace text (in
+  `secondaryLabelColor`, ~0.55) composited to the background in dark mode. The
+  fade now floors at a legible alpha and interpolates to each run's own alpha —
+  never past it (`StreamingFadeTests.testThinkingStreamNeverFadesToTheBackground`).
 
 Validation notes: a `sample` during a long streaming turn should show the main
 thread mostly idle in the event loop (the per-tick work is confined to the
@@ -938,6 +947,19 @@ touching the markdown renderer or the transcript rows.
   `.softBreak` intent whose text is a space (hard breaks — two trailing
   spaces — are `.lineBreak` runs with `\n`). Re-emit a real `\n` for both,
   or multi-line prose collapses to one line.
+- **`AttributedString(markdown:)` has no table extension.** GitHub-style
+  tables are detected and rendered by `MarkdownText` itself: `build` scans for
+  a header line + a GFM delimiter row (`| --- | :--: |`, matched cell count,
+  never inside a fence), splits the source into markdown runs and table blocks,
+  and renders each table as tab-stop-positioned lines inside the row's ONE
+  attributed string (so the measurement invariant still holds). Columns are
+  positioned with `NSTextTab`s at the widest cell's edge — a right-aligned tab
+  stop lands the following text flush at the column's right edge — NOT with
+  space padding, which rounds to whole spaces and drifts ~2pt out of flush.
+  A leading tab is used only when the first column is not left-aligned: a left
+  tab stop at 0 is skipped by the layout engine, which would jump the first
+  cell to the next stop. The no-`|` fast path keeps the streaming hot path a
+  single `contains` scan.
 - **The text view is flipped; the row is not.** Layout-manager rects
   (`boundingRect`, line fragments) are in the text view's (flipped, top-down)
   container coordinates. Positioning subviews of the row requires

@@ -596,49 +596,65 @@ final class TextRowView: NSView, NSTextViewDelegate {
         }
     }
 
-    /// Dims `range` to near-invisible, then steps it back to its final color
-    /// over ~0.3s. The final color is captured per attribute run before the
-    /// dimming (thinking/body/caret can differ).
+    /// The dimmest a fresh-fade glyph may go. The semantic text colors are
+    /// already translucent (`secondaryLabelColor` — the thinking trace color —
+    /// is alpha ~0.55), so fading toward zero made the newest streaming text
+    /// the color of the background: on a dark background, `secondaryLabelColor`
+    /// at 0.12 composites to near-black and the reasoning trace is unreadable
+    /// while it arrives. Flooring the fade keeps the word-group crossfade
+    /// (0.5 → the run's own color) without ever dropping below legibility.
+    private static let minimumFadeAlpha: CGFloat = 0.5
+
+    /// Steps `range` from a readable dim back to its final color over ~0.3s.
+    /// The final color is captured per attribute run before the dimming
+    /// (thinking/body/caret can differ), and the fade interpolates to THAT
+    /// color's own alpha — never past it, so a faint run is never briefly
+    /// brightened beyond its settled appearance.
     private func fadeIn(range: NSRange) {
         guard let storage = textView.textStorage, range.length > 0 else { return }
         fadeGeneration += 1
         let generation = fadeGeneration
-        var runs: [(NSRange, NSColor)] = []
+        var runs: [(range: NSRange, color: NSColor, startAlpha: CGFloat)] = []
         var idx = range.location
         let end = range.location + range.length
         while idx < end {
             var eff = NSRange(location: 0, length: 0)
             let color = (storage.attribute(.foregroundColor, at: idx, effectiveRange: &eff) as? NSColor) ?? .labelColor
             if let clipped = eff.intersection(range), clipped.length > 0 {
-                runs.append((clipped, color))
+                // Never fade a run dimmer than itself: an already-faint color
+                // (below the floor) is left alone rather than pushed to near
+                // zero.
+                let start = min(Self.minimumFadeAlpha, color.alphaComponent)
+                runs.append((clipped, color, start))
             }
             idx = eff.upperBound
         }
-        for (r, c) in runs {
-            storage.addAttribute(.foregroundColor, value: c.withAlphaComponent(0.12), range: r)
+        for run in runs {
+            storage.addAttribute(.foregroundColor, value: run.color.withAlphaComponent(run.startAlpha), range: run.range)
         }
-        pendingFadeRuns = runs.map { (range: $0.0, color: $0.1) }
+        pendingFadeRuns = runs.map { (range: $0.range, color: $0.color) }
         let steps = 6
         for step in 1...steps {
-            let alpha = 0.12 + 0.88 * CGFloat(step) / CGFloat(steps)
+            let t = CGFloat(step) / CGFloat(steps)
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.05) { [weak self] in
                 guard let self, self.fadeGeneration == generation, let storage = self.textView.textStorage else { return }
                 let isLast = step == steps
                 if isLast { self.pendingFadeRuns.removeAll() }
-                for (r, c) in runs {
+                for run in runs {
                     // The text may have been replaced/truncated since this fade
                     // was scheduled; clip the range to the current length so a
                     // stale range can't exceed the string (which raises an
                     // NSRangeException on addAttribute).
                     let current = NSRange(location: 0, length: storage.length)
-                    let clipped = NSIntersectionRange(r, current)
+                    let clipped = NSIntersectionRange(run.range, current)
                     guard clipped.length > 0 else { continue }
                     // The last step restores the captured color OBJECT, never
                     // `withAlphaComponent(1)`: the semantic colors are not
                     // opaque (`labelColor` is alpha 0.85), so forcing alpha 1
                     // left every faded-in run slightly DARKER than the text
                     // around it — reading as stray bold until a full re-render.
-                    storage.addAttribute(.foregroundColor, value: isLast ? c : c.withAlphaComponent(alpha), range: clipped)
+                    let alpha = run.startAlpha + (run.color.alphaComponent - run.startAlpha) * t
+                    storage.addAttribute(.foregroundColor, value: isLast ? run.color : run.color.withAlphaComponent(alpha), range: clipped)
                 }
             }
         }

@@ -229,6 +229,111 @@ final class MarkdownTextTests: XCTestCase {
         XCTAssertFalse(RenderTestHelper.ranges(of: "⸻", in: b.string).isEmpty)
     }
 
+    // MARK: - Tables
+
+    func testTableRendersAsAnAlignedGrid() {
+        let b = body("| Name | Age |\n|:-----|----:|\n| Alice | 30 |\n| Bob | 5 |")
+        let text = b.string.string
+        XCTAssertFalse(text.contains("|"), "the pipe delimiters are consumed")
+        XCTAssertTrue(text.contains("Name"))
+        XCTAssertTrue(text.contains("Alice"))
+        XCTAssertTrue(text.contains("\t"), "columns are positioned by tab stops")
+        // The header row is bold and carries a background tint so it reads as
+        // a header; the body row is not bold.
+        let header = RenderTestHelper.range(of: "Name", in: b.string).location
+        XCTAssertTrue(RenderTestHelper.font(b.string, at: header, hasTrait: .bold))
+        XCTAssertNotNil(b.string.attribute(.backgroundColor, at: header, effectiveRange: nil))
+        let bodyCell = RenderTestHelper.range(of: "Alice", in: b.string).location
+        XCTAssertFalse(RenderTestHelper.font(b.string, at: bodyCell, hasTrait: .bold))
+        XCTAssertNil(b.string.attribute(.backgroundColor, at: bodyCell, effectiveRange: nil))
+    }
+
+    func testTableHonorsColumnAlignment() {
+        let b = body("| left | right | center |\n|:-----|------:|:------:|\n| a | b | c |")
+        let ps = RenderTestHelper.paragraph(b.string, at: 0)
+        let stops = ps?.tabStops ?? []
+        // One tab stop per column after the (left-aligned, tab-less) first.
+        XCTAssertEqual(stops.count, 2)
+        XCTAssertEqual(stops[0].alignment, .right)
+        XCTAssertEqual(stops[1].alignment, .center)
+    }
+
+    func testTableRightEdgeIsFlushAcrossRows() {
+        // Right alignment must land the cell's right edge exactly on the
+        // column edge (the tab-stop path, unlike space padding).
+        let b = body("| h |\n|---:|\n| wide |\n| x |")
+        let (_, view) = RenderTestHelper.layout(b.string, width: 400)
+        let lm = view.layoutManager!
+        let container = view.textContainer!
+        let ns = b.string.string as NSString
+        func rightEdge(of needle: String) -> CGFloat {
+            let loc = ns.range(of: needle).location
+            let glyphs = lm.glyphRange(forCharacterRange: NSRange(location: loc, length: (needle as NSString).length), actualCharacterRange: nil)
+            return lm.boundingRect(forGlyphRange: glyphs, in: container).maxX
+        }
+        XCTAssertEqual(rightEdge(of: "wide"), rightEdge(of: "x"), accuracy: 0.5)
+    }
+
+    func testTableCellsKeepInlineStyling() {
+        let b = body("| **Bold** | `code` |\n|---|---|\n| a | b |")
+        let bold = RenderTestHelper.range(of: "Bold", in: b.string).location
+        XCTAssertTrue(RenderTestHelper.font(b.string, at: bold, hasTrait: .bold))
+        let code = RenderTestHelper.range(of: "code", in: b.string).location
+        XCTAssertTrue(RenderTestHelper.font(b.string, at: code, hasTrait: .monoSpace))
+        XCTAssertNil(RenderTestHelper.range(of: "**", in: b.string).location != NSNotFound ? "found" : nil)
+    }
+
+    func testTableLinesAreSeparatedByTabsAndNotDoubleSpaced() {
+        let b = body("| a | b |\n|---|---|\n| c | d |")
+        // Three lines: header, separator, body. No paragraphSpacing
+        // inflation (which would inflate every line fragment).
+        XCTAssertEqual(RenderTestHelper.ranges(of: "\n", in: b.string).count, 2)
+        var location = 0
+        while location < b.string.length {
+            var effective = NSRange(location: 0, length: 0)
+            let ps = b.string.attribute(.paragraphStyle, at: location, effectiveRange: &effective) as? NSParagraphStyle
+            XCTAssertEqual(ps?.paragraphSpacingBefore ?? 0, 0, "at \(location)")
+            XCTAssertEqual(ps?.paragraphSpacing ?? 0, 0, "at \(location)")
+            location = effective.upperBound
+        }
+    }
+
+    func testTableInsideCodeFenceIsNotATable() {
+        let b = body("```\n| a | b |\n|---|---|\n```")
+        XCTAssertEqual(b.codeBlocks.count, 1)
+        XCTAssertTrue(b.codeBlocks[0].code.contains("|---|---|"))
+        XCTAssertFalse(b.string.string.contains("\t"), "the fenced table is code, not a rendered table")
+    }
+
+    func testPipeInProseWithoutDelimiterStaysText() {
+        let b = body("Use the pipe | operator here\nand continue")
+        XCTAssertTrue(b.string.string.contains("pipe | operator"))
+    }
+
+    func testTableMeasurementMatchesRenderedHeight() {
+        let b = body("| Name | Age |\n|:-----|----:|\n| Alice | 30 |\n| Bob | 5 |")
+        for width: CGFloat in [400, 200, 120] {
+            let (used, _) = RenderTestHelper.layout(b.string, width: width)
+            XCTAssertEqual(
+                RenderTestHelper.boundingHeight(b.string, width: width),
+                used.height,
+                accuracy: 0.5,
+                "measured height must match the layout manager at width \(width)"
+            )
+        }
+    }
+
+    func testTableBetweenParagraphsKeepsTheSurroundingText() {
+        let b = body("Intro.\n\n| a | b |\n|---|---|\n| c | d |\n\nOutro.")
+        let text = b.string.string
+        XCTAssertTrue(text.contains("Intro."))
+        XCTAssertTrue(text.contains("Outro."))
+        XCTAssertTrue(text.contains("a"))
+        XCTAssertTrue(text.contains("c"))
+        // A blank line (the block gap) separates the table from each paragraph.
+        XCTAssertTrue(text.contains("Intro.\n\n"))
+    }
+
     // MARK: - Measurement invariant
 
     func testMeasuredHeightMatchesRenderedHeight() {
