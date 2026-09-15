@@ -210,6 +210,14 @@ final class FileBrowserStore {
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var refreshInFlight = false
+    /// A refresh request that arrived while a pass was already running: the
+    /// running pass loops once more when it finishes, so the LATEST on-disk
+    /// state is never dropped. Without this, a request that landed while an
+    /// earlier pass was still in flight was discarded (`refresh()` returned
+    /// early on `refreshInFlight`) — the "committed files keep their diff
+    /// markers in the tree" bug, where the commit's refresh was dropped and
+    /// the store stayed stale until some unrelated later file event.
+    @ObservationIgnored private var refreshQueued = false
     /// Debounce: a burst of agent edits collapses into one listing pass.
     @ObservationIgnored private static let refreshSettleDelay: Duration = .milliseconds(350)
 
@@ -243,11 +251,21 @@ final class FileBrowserStore {
         }
         refreshTask?.cancel()
         refreshTask = nil
+        refreshQueued = false
     }
 
     /// Debounced refresh. Callers: the session's file-change signal and the
     /// Files view's warm-up.
     func scheduleRefresh(immediate: Bool = false) {
+        // A pass is already running: coalesce into one follow-up instead of
+        // cancelling it (a cancelled pass discards the snapshot it just built)
+        // or letting this request be dropped (which left the tree stale until
+        // the next unrelated file event — e.g. after a commit). `refresh()`
+        // drains `refreshQueued` once the running pass finishes.
+        if refreshInFlight {
+            refreshQueued = true
+            return
+        }
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -263,21 +281,29 @@ final class FileBrowserStore {
     /// detached task (`FileTreeBuilder` is nonisolated); the finished snapshot
     /// is swapped in here on the main actor (Observation re-renders any view
     /// reading it). A cancelled refresh leaves the previous snapshot intact.
+    /// A request that arrived mid-pass (`refreshQueued`) runs one more pass
+    /// immediately after this one, so the final on-disk state always lands.
     func refresh() async {
-        guard !refreshInFlight else { return }
+        if refreshInFlight {
+            refreshQueued = true
+            return
+        }
         refreshInFlight = true
         defer { refreshInFlight = false }
-        guard !Task.isCancelled else { return }
-        let cwd = self.cwd
-        let snapshot = await Task.detached(priority: .userInitiated) {
-            await FileTreeBuilder.build(cwd: cwd)
-        }.value
-        guard !Task.isCancelled else { return }
-        fileEntries = snapshot.fileEntries
-        rootNodes = snapshot.rootNodes
-        directoryPaths = snapshot.directoryPaths
-        fileCount = snapshot.fileCount
-        isLoading = false
-        version &+= 1
+        repeat {
+            refreshQueued = false
+            guard !Task.isCancelled else { return }
+            let cwd = self.cwd
+            let snapshot = await Task.detached(priority: .userInitiated) {
+                await FileTreeBuilder.build(cwd: cwd)
+            }.value
+            guard !Task.isCancelled else { return }
+            fileEntries = snapshot.fileEntries
+            rootNodes = snapshot.rootNodes
+            directoryPaths = snapshot.directoryPaths
+            fileCount = snapshot.fileCount
+            isLoading = false
+            version &+= 1
+        } while refreshQueued
     }
 }
