@@ -1153,7 +1153,15 @@ only what it needs.**
   still can't be opened — pre-existing gap, same as the live change signal.
 - The content pane (`ReadOnlyFilePane`) is the heavy part and runs ONLY when
   a file is selected: read + `git show` + `TextDiff` off-main, applied as one
-  attributed buffer with the added/deleted-line overlay. Loading/chrome
+  attributed buffer with the added/deleted-line overlay. For a modification
+  the buffer is the **GitHub-style interleaved diff** — the real current file
+  with each removed run re-inserted in red at its original position, added
+  lines green (a deletion-only change is therefore finally visible; the old
+  added-lines-only pane showed a changed tree row with an uncolored buffer).
+  The display-line → REAL-line map (`ReadOnlyCodeTextView.lineNumberMap`)
+  keeps the gutter numbers, the reference jump (`displayLine(forRealLine:)`),
+  and copy-tagging on line N of the real file; a copy whose selection spans a
+  removal drops the removed lines from the frozen snippet. Loading/chrome
   overlays use the AppKit `SpinnerView` — never a SwiftUI animated
   `ProgressView` in a mounted view (it keeps the shell graph invalidating
   every frame). Files are loaded WHOLE into the code view — the entire
@@ -1171,7 +1179,8 @@ only what it needs.**
   a tick shows exactly how far you must scroll to bring that edit to the top
   of the viewport; ticks stay put while the knob moves over them). The
   markers mirror the edit overlay exactly (`PaneOverlay` → `PaneMarkers`):
-  added lines of a modification are green ticks; a whole new file tints the
+  a modification's added lines are green ticks and its removed lines (shown
+  inline in the interleaved diff) are red ticks; a whole new file tints the
   whole track green; a deleted file's committed buffer tints it red. Because
   files are loaded whole, every marker is EXACT — the pin-at-top/bottom
   stacking is only relevant if incremental loading is ever added (see
@@ -1252,6 +1261,13 @@ with the project — or only with what is visible?
   bug (see *The page model*).
 - **@MainActor @Sendable `NSEvent` monitor closures** — the
   executor-entry-check crash (see *How to add…*).
+- **Showing only the added lines of a modification.** The content pane used to
+  render the real file with green added-line backgrounds and no representation
+  of removals, so a deletion-only change showed a colored tree row with a
+  completely uncolored pane — the reported "title shows a diff, content shows
+  zero diff highlights". The pane now renders the interleaved diff (removed
+  lines inline in red) with a display→real line map, so references and
+  copy-tagging still name real lines.
 
 Validation notes: opening a session in a large project shows no spinner and
 leaves the main thread idle; opening the Files page and scrolling the

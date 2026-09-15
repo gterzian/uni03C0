@@ -4,9 +4,15 @@ import SwiftUI
 
 /// The file browser's content pane: a real, current (or, for a deletion,
 /// last-committed) file buffer in a `ReadOnlyCodeTextView`, with edit-coloring
-/// applied as attributes on top of syntax highlighting. Always the actual text
-/// — never an interleaved diff — so `startLine`/`endLine` mean "line N of the
-/// real file" and copy-tagging stays exact (§2.6).
+/// applied as attributes on top of syntax highlighting. For a modification the
+/// buffer is the GITHUB-STYLE INTERLEAVED diff of the current file: every real
+/// line in order with the removed lines re-inserted in red at their original
+/// position (added lines green). The text is therefore the real file plus the
+/// removed lines; `ReadOnlyCodeTextView.lineNumberMap` records the REAL
+/// current-file line of each display line, so the gutter numbers, the
+/// reference jump, and copy-tagging still mean "line N of the real file" and a
+/// selection that spans a removal still produces a valid in-file reference
+/// (§2.6).
 struct ReadOnlyFilePane: NSViewRepresentable {
     let cwd: URL
     /// Path of the file to show, relative to `cwd`.
@@ -130,6 +136,10 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         /// `appearanceChanged`.
         private var displayedAbsolutePath: String?
         private var displayedOverlay: PaneOverlay = .none
+        /// The real-line map of the displayed interleaved diff (nil for a
+        /// non-diff buffer). Kept alongside the overlay so a theme re-render
+        /// rebuilds the SAME buffer with its real-line numbering intact.
+        private var displayedLineNumbers: [Int?]?
         /// A light/dark change arrived while the Files page was hidden: run the
         /// re-highlight once on activation instead of for an off-screen pane.
         private var pendingAppearanceRefresh = false
@@ -282,10 +292,12 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                     text: attributed,
                     preserveScroll: targetLines == nil && displayedPath == request.path,
                     targetLines: targetLines,
-                    markers: markers
+                    markers: markers,
+                    lineNumbers: loaded.lineNumbers
                 )
                 displayedAbsolutePath = absolutePath
                 displayedOverlay = loaded.overlay
+                displayedLineNumbers = loaded.lineNumbers
             } else {
                 container.showPlaceholder(loaded.message ?? "Couldn't read \((request.path as NSString).lastPathComponent).")
                 displayedAbsolutePath = nil
@@ -315,7 +327,8 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 path: absolutePath,
                 text: attributed,
                 preserveScroll: true,
-                markers: paneMarkers(for: displayedOverlay)
+                markers: paneMarkers(for: displayedOverlay),
+                lineNumbers: displayedLineNumbers
             )
         }
 
@@ -324,7 +337,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         private func paneMarkers(for overlay: PaneOverlay) -> PaneMarkers {
             switch overlay {
             case .none: .none
-            case .greenLines(let lines): .lines(lines)
+            case .diff(let added, let removed): .lines(added: added, removed: removed)
             case .wholeGreen: .wholeAdded
             case .wholeRed: .wholeDeleted
             }
@@ -356,9 +369,15 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             switch overlay {
             case .none:
                 break
-            case .greenLines(let lines):
-                for range in PaneContentLoader.charRanges(ofLines: lines, in: text) {
+            case .diff(let added, let removed):
+                // Additions green, removals red — the GitHub unified view. The
+                // ranges are display-line ranges (a removed line is a real
+                // line of the buffer now).
+                for range in PaneContentLoader.charRanges(ofLines: added, in: text) {
                     styled.addAttribute(.backgroundColor, value: addedColor, range: range)
+                }
+                for range in PaneContentLoader.charRanges(ofLines: removed, in: text) {
+                    styled.addAttribute(.backgroundColor, value: deletedColor, range: range)
                 }
             case .wholeGreen:
                 styled.addAttribute(.backgroundColor, value: addedColor, range: whole)
@@ -378,12 +397,20 @@ private struct LoadedContent: Sendable {
     var displayText: String?
     var message: String?
     var overlay: PaneOverlay = .none
+    /// For an interleaved diff, the REAL current-file line number of each
+    /// DISPLAY line (`nil` for a removed line, which belongs to the old side).
+    /// nil overall → the display is the real file and lines number 1,2,3…
+    var lineNumbers: [Int?]? = nil
 }
 
 private enum PaneOverlay: Sendable {
     case none
-    /// 1-based lines of the CURRENT text that were added.
-    case greenLines([Int])
+    /// An interleaved diff of the open file: 1-based DISPLAY line indices that
+    /// are additions (green) and removals (red). The display text is the real
+    /// current file with the removed lines re-inserted in their original
+    /// position (GitHub's unified view), so a deletion is finally visible —
+    /// the marker is the red line itself.
+    case diff(added: [Int], removed: [Int])
     /// Every line is new (an untracked-but-added file).
     case wholeGreen
     /// Every line came from HEAD (a deletion).
@@ -403,8 +430,9 @@ private enum PaneOverlay: Sendable {
 /// (see `CodePaneEditMarkerScroller`).
 enum PaneMarkers: Sendable {
     case none
-    /// 1-based added lines of the current text (a partial modification).
-    case lines([Int])
+    /// 1-based DISPLAY line numbers of an interleaved diff's added (green) and
+    /// removed (red) lines.
+    case lines(added: [Int], removed: [Int])
     /// The whole buffer is new content.
     case wholeAdded
     /// The whole buffer is the removed side of a deletion.
@@ -438,7 +466,12 @@ private enum PaneContentLoader {
                 // fail.
                 return LoadedContent(displayText: text)
             }
-            return LoadedContent(displayText: text, overlay: .greenLines(addedLineNumbers(old: old, new: text)))
+            let diff = interleaved(old: old, new: text)
+            return LoadedContent(
+                displayText: diff.text,
+                overlay: .diff(added: diff.added, removed: diff.removed),
+                lineNumbers: diff.lineNumbers
+            )
         case .normal, .untracked:
             guard let text = GitStatus.currentContent(of: path, cwd: cwd) else {
                 return LoadedContent(message: "Couldn't read \((path as NSString).lastPathComponent).")
@@ -447,29 +480,43 @@ private enum PaneContentLoader {
         }
     }
 
-    /// 1-based line numbers (in the NEW text) of added lines, from the same
-    /// `TextDiff` output used everywhere else. `.same` and `.added` lines each
-    /// occupy one current-text line, in order; `.removed` lines have no
-    /// position in the current text at all and are deliberately not shown
-    /// inline (the red side of a modification is what the tree's
-    /// deletion-vs-addition fill behind the file name shows — see
-    /// `rowTintColor` in FileBrowserView).
-    nonisolated static func addedLineNumbers(old: String, new: String) -> [Int] {
+    /// Builds the GitHub-style interleaved view of a modification: every real
+    /// current-file line in order, with each run of removed lines re-inserted
+    /// where it was (removed-then-added, `TextDiff`'s order). Returns the
+    /// display text, the REAL current-file line number of each display line
+    /// (`nil` for a removed line), and the 1-based display lines that are
+    /// added / removed so the overlay and the scrollbar can color them.
+    ///
+    /// A modification whose whole change is a deletion therefore displays the
+    /// removed lines in red — the gap the old added-lines-only pane left
+    /// (title showed a diff, content showed nothing).
+    nonisolated static func interleaved(old: String, new: String) -> (text: String, lineNumbers: [Int?], added: [Int], removed: [Int]) {
         let diff = TextDiff.diff(old: old, new: new)
+        var lines: [String] = []
+        var lineNumbers: [Int?] = []
         var added: [Int] = []
-        var newLine = 0
+        var removed: [Int] = []
+        var currentLine = 0
         for line in diff {
             switch line.kind {
-            case .same, .added:
-                newLine += 1
+            case .same:
+                currentLine += 1
+                lines.append(line.text)
+                lineNumbers.append(currentLine)
+            case .added:
+                currentLine += 1
+                lines.append(line.text)
+                lineNumbers.append(currentLine)
+                added.append(lines.count)
             case .removed:
-                continue
-            }
-            if line.kind == .added {
-                added.append(newLine)
+                lines.append(line.text)
+                lineNumbers.append(nil)
+                removed.append(lines.count)
             }
         }
-        return added
+        var text = lines.joined(separator: "\n")
+        if new.hasSuffix("\n") { text += "\n" }
+        return (text, lineNumbers, added, removed)
     }
 
     /// Character ranges (including each line's trailing newline — harmless
@@ -612,7 +659,7 @@ final class FilePaneContainer: NSView {
     /// the START line to the top of the viewport and flashes the range (see
     /// `revealReference`) — ordering is load-bearing, a jump issued before the
     /// load's own reset would be undone by it.
-    func displayContent(path: String, text: NSAttributedString, preserveScroll: Bool = false, targetLines: (start: Int, end: Int)? = nil, markers: PaneMarkers = .none) {
+    func displayContent(path: String, text: NSAttributedString, preserveScroll: Bool = false, targetLines: (start: Int, end: Int)? = nil, markers: PaneMarkers = .none, lineNumbers: [Int?]? = nil) {
         statusLabel.isHidden = true
         codeView.isHidden = false
         codeView.clearReveal()
@@ -632,7 +679,7 @@ final class FilePaneContainer: NSView {
             }
         }
 
-        codeView.load(path: path, text: text)
+        codeView.load(path: path, text: text, lineNumbers: lineNumbers)
         applyMarkers(markers, in: text.string)
 
         if let targetLines {
@@ -656,10 +703,16 @@ final class FilePaneContainer: NSView {
     /// `codeView.load`'s scroll-to-top. Lines past the end of the file simply
     /// leave the view at the top (the geometry lookup fails cleanly).
     private func revealReference(lines: (start: Int, end: Int), in text: String) {
-        guard let layoutManager = codeView.layoutManager,
+        // `lines` are REAL current-file line numbers (what an agent-emitted
+        // `pi-file://` link carries). The buffer may be an interleaved diff, so
+        // map each real line to its DISPLAY line first (a removed line has no
+        // own display line; the nearest context line anchors instead).
+        guard let displayStart = codeView.displayLine(forRealLine: lines.start),
+              let displayEnd = codeView.displayLine(forRealLine: lines.end),
+              let layoutManager = codeView.layoutManager,
               let textContainer = codeView.textContainer,
-              let startRange = PaneContentLoader.charRanges(ofLines: [lines.start], in: text).first,
-              let endRange = PaneContentLoader.charRanges(ofLines: [lines.end], in: text).first
+              let startRange = PaneContentLoader.charRanges(ofLines: [displayStart], in: text).first,
+              let endRange = PaneContentLoader.charRanges(ofLines: [displayEnd], in: text).first
         else { return }
         let charRange = NSRange(location: startRange.location, length: (endRange.location + endRange.length) - startRange.location)
         // Force the geometry now: the jump and the flash both need glyph rects
@@ -699,12 +752,14 @@ final class FilePaneContainer: NSView {
             height: max(rangeBox.height, startBox.height)
         )
         codeView.startReveal(flashRect: band, anchorRect: band)
-        (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = lines.start
+        (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = displayStart
     }
 
     /// Refreshes the scrollbar edit map for the freshly-loaded text. Marker
-    /// positions are exact: the whole file is in the text view, so every added
-    /// line maps to `(line - 0.5) / lineCount` along the document.
+    /// positions are exact: the whole file is in the text view, so every edited
+    /// line maps to `(line - 0.5) / lineCount` along the document. Added lines
+    /// are green ticks, removed lines (of an interleaved diff) red — the same
+    /// red/green the text overlay paints, so the bar and the buffer agree.
     private func applyMarkers(_ markers: PaneMarkers, in text: String) {
         guard let scroller = scrollView.verticalScroller as? CodePaneEditMarkerScroller else { return }
         switch markers {
@@ -716,9 +771,9 @@ final class FilePaneContainer: NSView {
         case .wholeDeleted:
             scroller.markers = []
             scroller.wholeTrackColor = .systemRed
-        case .lines(let lines):
+        case .lines(let added, let removed):
             scroller.wholeTrackColor = nil
-            // Real displayed lines: `\n` separators + a final partial line.
+            // Displayed lines: `\n` separators + a final partial line.
             var lineCount = 0
             for character in text where character == "\n" { lineCount += 1 }
             if !text.isEmpty, !text.hasSuffix("\n") { lineCount += 1 }
@@ -726,13 +781,16 @@ final class FilePaneContainer: NSView {
                 scroller.markers = []
                 return
             }
-            scroller.markers = lines.compactMap { line in
+            func marker(_ line: Int, _ color: NSColor) -> CodePaneEditMarkerScroller.Marker? {
                 guard line >= 1, line <= lineCount else { return nil }
                 return CodePaneEditMarkerScroller.Marker(
                     fraction: (CGFloat(line) - 0.5) / CGFloat(lineCount),
-                    color: .systemGreen
+                    color: color
                 )
             }
+            scroller.markers = (added.compactMap { marker($0, .systemGreen) }
+                + removed.compactMap { marker($0, .systemRed) })
+                .sorted { $0.fraction < $1.fraction }
         }
     }
 

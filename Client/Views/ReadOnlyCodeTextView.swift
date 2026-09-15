@@ -33,6 +33,13 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the trailing "phantom" line non-empty in the table but unreachable via
     /// `lineNumber(forIndex:)` (guarded by `index < length`).
     private(set) var lineStartOffsets: [Int] = [0]
+    /// For an interleaved diff buffer, the REAL current-file line number of
+    /// each 1-based DISPLAY line (`nil` for a removed line, which is old-side
+    /// content). nil → the buffer is the real file and display line == real
+    /// line. The gutter, the reference jump, and copy all consult this so
+    /// "line N" keeps meaning line N of the real file even though the buffer
+    /// carries the removed lines.
+    private(set) var lineNumberMap: [Int?]?
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         if let container {
@@ -157,9 +164,11 @@ final class ReadOnlyCodeTextView: NSTextView {
     }
 
     /// Loads a file's content (syntax + edit attributes already applied by the
-    /// pane) and rebuilds the line-offset table.
-    func load(path: String, text: NSAttributedString) {
+    /// pane) and rebuilds the line-offset table. `lineNumbers` is the real-line
+    /// map for an interleaved diff (nil for a plain, non-diff buffer).
+    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil) {
         absolutePath = path
+        lineNumberMap = lineNumbers
         textStorage?.setAttributedString(text)
         rebuildLineOffsets()
         sizeToFit()
@@ -202,6 +211,68 @@ final class ReadOnlyCodeTextView: NSTextView {
         return answer + 1
     }
 
+    /// The REAL current-file line number of a 1-based DISPLAY line. nil = a
+    /// removed line (old-side content with no current-file position). Without
+    /// an interleaved-diff map, the display line IS the real line.
+    func realLineNumber(forDisplayLine displayLine: Int) -> Int? {
+        guard let lineNumberMap else { return displayLine >= 1 ? displayLine : nil }
+        guard displayLine >= 1, displayLine <= lineNumberMap.count else { return nil }
+        return lineNumberMap[displayLine - 1]
+    }
+
+    /// The 1-based DISPLAY line showing real current-file line `real`, or the
+    /// nearest preceding real line when `real` itself was removed (a reference
+    /// to a removed line anchors at the context around it).
+    func displayLine(forRealLine real: Int) -> Int? {
+        guard real >= 1 else { return nil }
+        guard let lineNumberMap else { return real }
+        var lastReal: Int?
+        for (index, value) in lineNumberMap.enumerated() {
+            guard let value else { continue }
+            if value == real { return index + 1 }
+            if value > real { return lastReal ?? (index + 1) }
+            lastReal = index + 1
+        }
+        return lastReal
+    }
+
+    /// The REAL current-file line number of a character index (the copy
+    /// reference's line). A character on a removed line maps to the nearest
+    /// real line before it, so a selection spanning a removal still produces a
+    /// valid in-file reference.
+    func realLineNumber(forIndex index: Int) -> Int {
+        let display = lineNumber(forIndex: index)
+        var candidate = display
+        while candidate >= 1 {
+            if let real = realLineNumber(forDisplayLine: candidate) { return real }
+            candidate -= 1
+        }
+        return 1
+    }
+
+    /// The selected text with any interleaved removed lines dropped, so a
+    /// copy-tagged reference quotes text that is actually in the current file.
+    /// Real lines keep their own newlines, so the surviving lines join
+    /// naturally.
+    private func realSnippet(for selection: NSRange) -> String {
+        let ns = string as NSString
+        let end = selection.location + selection.length
+        var location = selection.location
+        var snippet = ""
+        while location < end {
+            let display = lineNumber(forIndex: location)
+            let lineStart = lineStartOffsets[display - 1]
+            let nextStart = display < lineStartOffsets.count ? lineStartOffsets[display] : ns.length
+            let segmentEnd = min(nextStart, end)
+            let segmentStart = max(lineStart, selection.location)
+            if realLineNumber(forDisplayLine: display) != nil, segmentEnd > segmentStart {
+                snippet += ns.substring(with: NSRange(location: segmentStart, length: segmentEnd - segmentStart))
+            }
+            location = segmentEnd
+        }
+        return snippet
+    }
+
     // MARK: - Copy → frozen reference
 
     override func copy(_ sender: Any?) {
@@ -210,17 +281,20 @@ final class ReadOnlyCodeTextView: NSTextView {
         // normal copy behavior instead of writing a zero-width nonsense
         // reference.
         guard selection.length > 0,
-              let range = Range(selection, in: string),
+              Range(selection, in: string) != nil,
               !absolutePath.isEmpty else {
             super.copy(sender)
             return
         }
         // endLine is derived from the LAST selected character, so a selection
         // that extends through a trailing newline does not count the following
-        // (empty) line as included.
-        let startLine = lineNumber(forIndex: selection.location)
-        let endLine = lineNumber(forIndex: selection.location + selection.length - 1)
-        let snippet = String(string[range])
+        // (empty) line as included. The lines are REAL current-file lines even
+        // when the buffer is an interleaved diff (removed lines map to the
+        // nearest real line around them), and the snippet drops the removed
+        // lines so the frozen reference always quotes text that is in the file.
+        let startLine = realLineNumber(forIndex: selection.location)
+        let endLine = realLineNumber(forIndex: selection.location + selection.length - 1)
+        let snippet = realSnippet(for: selection)
         let reference = CodeReference(
             absolutePath: absolutePath,
             startLine: startLine,
@@ -446,13 +520,17 @@ final class CodeLineRulerView: NSRulerView {
             let charIndex = layoutManager.characterIndexForGlyph(at: fragmentGlyphRange.location)
             // The phantom empty line after a trailing newline has no characters.
             guard charIndex < ns.length else { return }
-            let line = codeView.lineNumber(forIndex: charIndex)
+            let displayLine = codeView.lineNumber(forIndex: charIndex)
             // A wrapped line's continuation fragments are not line starts —
             // only the fragment that begins the logical line carries the
             // number (the pane disables wrapping, so this is defensive).
-            guard line >= 1, line - 1 < offsets.count, offsets[line - 1] == charIndex else { return }
+            guard displayLine >= 1, displayLine - 1 < offsets.count, offsets[displayLine - 1] == charIndex else { return }
+            // The number is the REAL current-file line, and an interleaved
+            // diff's removed lines have no current-file number — their gutter
+            // stays blank (the red line background is their marker).
+            guard let realLine = codeView.realLineNumber(forDisplayLine: displayLine) else { return }
 
-            let label = "\(line)" as NSString
+            let label = "\(realLine)" as NSString
             let size = label.size(withAttributes: attributes)
             // The fragment's vertical center in the text view's coordinates,
             // converted into the ruler's (flipped) coordinates.

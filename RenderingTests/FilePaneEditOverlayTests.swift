@@ -106,6 +106,26 @@ final class FilePaneEditOverlayTests: XCTestCase {
         return storage.attribute(.backgroundColor, at: location, effectiveRange: nil) != nil
     }
 
+    /// The overlay color painted at `location` (nil when none).
+    @MainActor
+    private func overlayColor(_ container: FilePaneContainer, at location: Int) -> NSColor? {
+        guard let storage = container.codeView.textStorage,
+              location >= 0, location < storage.length else { return nil }
+        return storage.attribute(.backgroundColor, at: location, effectiveRange: nil) as? NSColor
+    }
+
+    @MainActor
+    private func isRed(_ color: NSColor?) -> Bool {
+        guard let rgb = color?.usingColorSpace(.deviceRGB) else { return false }
+        return rgb.redComponent - rgb.greenComponent > 0.1
+    }
+
+    @MainActor
+    private func isGreen(_ color: NSColor?) -> Bool {
+        guard let rgb = color?.usingColorSpace(.deviceRGB) else { return false }
+        return rgb.greenComponent - rgb.redComponent > 0.1
+    }
+
     // MARK: - Tests
 
     @MainActor
@@ -175,5 +195,99 @@ final class FilePaneEditOverlayTests: XCTestCase {
         reload(coordinator, cwd: repo.root, kind: .normal, token: 1)
         XCTAssertTrue(backgrounds(container).isEmpty,
                       "reverting removes the overlay at the same token")
+    }
+
+    // MARK: - Interleaved diff (added + removed lines)
+
+    /// A substitution shows BOTH sides: the old line in red, the new line in
+    /// green — the GitHub unified view.
+    @MainActor
+    func testSubstitutionShowsRemovedAndAddedLines() {
+        let repo = Repo()
+        repo.write("one\ntwo\nthree\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "init"])
+        repo.write("one\nTWO\nthree\n")
+        let (container, coordinator) = makePane()
+        reload(coordinator, cwd: repo.root, kind: .modified, token: 1)
+
+        let removed = addedLineRange(container, "two")
+        let added = addedLineRange(container, "TWO")
+        XCTAssertNotEqual(removed.location, NSNotFound, "the old line is shown")
+        XCTAssertNotEqual(added.location, NSNotFound, "the new line is shown")
+        XCTAssertTrue(isRed(overlayColor(container, at: removed.location)), "the removed line renders red")
+        XCTAssertTrue(isGreen(overlayColor(container, at: added.location)), "the added line renders green")
+    }
+
+    /// The gap this closed: a change that ONLY deletes lines used to render a
+    /// changed tree row with a completely uncolored pane. The removed lines
+    /// must be shown, in red.
+    @MainActor
+    func testDeletionOnlyChangeShowsTheRemovedLinesInRed() {
+        let repo = Repo()
+        repo.write("one\ntwo\nthree\nfour\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "init"])
+        repo.write("one\nfour\n")
+        let (container, coordinator) = makePane()
+        reload(coordinator, cwd: repo.root, kind: .modified, token: 1)
+
+        for removedLine in ["two", "three"] {
+            let location = addedLineRange(container, removedLine).location
+            XCTAssertNotEqual(location, NSNotFound, "removed line \(removedLine) is displayed")
+            XCTAssertTrue(isRed(overlayColor(container, at: location)), "removed line \(removedLine) renders red")
+        }
+    }
+
+    /// The gutter/overlay keep REAL current-file line numbers through the
+    /// interleaved diff: a removed line maps to nil, the lines after it keep
+    /// their real numbers.
+    @MainActor
+    func testLineMapKeepsRealLineNumbersPastRemovals() {
+        let repo = Repo()
+        repo.write("one\ntwo\nthree\nfour\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "init"])
+        repo.write("one\nfour\n")
+        let (container, coordinator) = makePane()
+        reload(coordinator, cwd: repo.root, kind: .modified, token: 1)
+
+        let codeView = container.codeView
+        XCTAssertEqual(codeView.lineStartOffsets.count, 5, "display shows one, two, three, four + the trailing phantom line")
+        // Display line 1 = real 1 (one), 2/3 = removed, 4 = real 2 (four).
+        XCTAssertEqual(codeView.realLineNumber(forDisplayLine: 1), 1)
+        XCTAssertNil(codeView.realLineNumber(forDisplayLine: 2), "a removed line has no real number")
+        XCTAssertNil(codeView.realLineNumber(forDisplayLine: 3))
+        XCTAssertEqual(codeView.realLineNumber(forDisplayLine: 4), 2)
+        // A real line past the removal resolves to its display line.
+        XCTAssertEqual(codeView.displayLine(forRealLine: 2), 4)
+    }
+
+    /// A reference jump into an interleaved diff still lands on the REAL line
+    /// the link named: real line 2 (`four`) is display line 4 after two
+    /// removed lines, and the ruler anchor marks that display line.
+    @MainActor
+    func testReferenceJumpMapsRealLinePastARemoval() {
+        let (container, _) = makePane()
+        let text = "one\ntwo\nthree\nfour\nfive\n"
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)]
+        )
+        // Display lines: 1=one(real 1), 2/3=removed, 4=four(real 2), 5=five(real 3).
+        let map: [Int?] = [1, nil, nil, 2, 3]
+        container.displayContent(
+            path: "/tmp/a.txt",
+            text: attributed,
+            preserveScroll: false,
+            targetLines: (2, 2),
+            markers: .none,
+            lineNumbers: map
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+
+        let ruler = container.scrollView.verticalRulerView as? CodeLineRulerView
+        XCTAssertEqual(ruler?.anchorLine, 4, "real line 2 resolves to display line 4")
+        XCTAssertNotNil(container.codeView.revealFlashRect, "the reference range flashes")
     }
 }

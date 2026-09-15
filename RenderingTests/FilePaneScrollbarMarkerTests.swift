@@ -48,7 +48,7 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     @MainActor
     func testEditedLinesBecomeTicksAtTheirDocumentFraction() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines([10, 858]))
+        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         let markers = scroller(of: container)?.markers ?? []
@@ -61,8 +61,27 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     }
 
     @MainActor
-    func testWholeFileEditsTintTheTrack() {
+    func testRemovedLinesBecomeRedTicks() {
         let container = makeContainer()
+        container.displayContent(
+            path: "/tmp/x.swift",
+            text: paneText(),
+            preserveScroll: false,
+            targetLines: nil,
+            markers: .lines(added: [10], removed: [858])
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+
+        let markers = scroller(of: container)?.markers ?? []
+        XCTAssertEqual(markers.count, 2, "one tick per edited line (both sides)")
+        XCTAssertEqual(markers[0].color, .systemGreen, "added lines are green")
+        XCTAssertEqual(markers[0].fraction, (10.0 - 0.5) / 900.0, accuracy: 0.001)
+        XCTAssertEqual(markers[1].color, .systemRed, "removed lines are red (matches the text overlay)")
+        XCTAssertEqual(markers[1].fraction, (858.0 - 0.5) / 900.0, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testWholeFileEditsTintTheTrack() {        let container = makeContainer()
         container.displayContent(path: "/tmp/new.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .wholeAdded)
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertNotNil(scroller(of: container)?.wholeTrackColor, "a brand-new file tints the whole track")
@@ -76,7 +95,7 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     @MainActor
     func testEachLoadReplacesThePreviousMap() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines([100]))
+        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [100], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertEqual(scroller(of: container)?.markers.count, 1)
 
@@ -94,7 +113,7 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         // drawing still paints a tick for EVERY marker at its mapped track
         // position — a grouping bug would drop ticks or pile them at one spot.
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines([10, 858]))
+        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         // Scroll to the middle so the knob (which covers whatever it overlaps)
