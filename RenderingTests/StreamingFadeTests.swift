@@ -55,8 +55,40 @@ final class StreamingFadeTests: XCTestCase {
     func testAppendedBatchStartsDimAndThePrefixStaysFinal() {
         guard let (_, storage) = streamingRow() else { return }
         XCTAssertEqual(storage.string, "alpha beta▌")
-        XCTAssertGreaterThan(alpha(storage, at: 0), 0.5, "already-visible text is never dimmed")
-        XCTAssertLessThan(alpha(storage, at: 6), 0.5, "the appended batch fades in from near-invisible")
+        let final = alpha(storage, at: 0)
+        XCTAssertGreaterThan(final, 0.5, "already-visible text is never dimmed")
+        let appended = alpha(storage, at: 6)
+        XCTAssertLessThan(appended, final, "the appended batch fades in from a dimmer color")
+        // The fade floors at a legible alpha: the semantic colors are already
+        // translucent, so fading toward zero read as the background (the
+        // dark-mode thinking-trace bug).
+        XCTAssertGreaterThanOrEqual(appended, 0.45, "the appended batch is never unreadable")
+    }
+
+    /// The thinking trace is the case that surfaced the dark-mode bug: it is
+    /// rendered in `secondaryLabelColor` (alpha ~0.55), so the old absolute
+    /// 0.12 fade floor composited to near-background on a dark background. The
+    /// newest reasoning glyph must stay legible while it arrives, and the
+    /// already-visible trace must sit at its final color.
+    func testThinkingStreamNeverFadesToTheBackground() {
+        guard !DisplayOptions.reduceMotion else { return }
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 200))
+        row.configure(text: "", thinking: "reasoning one", role: .assistant, isStreaming: true)
+        row.layoutSubtreeIfNeeded()
+        row.configure(text: "", thinking: "reasoning one two", role: .assistant, isStreaming: true)
+        row.layoutSubtreeIfNeeded()
+        let storage = textView(of: row).textStorage!
+        XCTAssertGreaterThanOrEqual(
+            alpha(storage, at: storage.length - 2),
+            0.45,
+            "the newest reasoning glyph is dimmed but still readable"
+        )
+        XCTAssertEqual(
+            alpha(storage, at: 0),
+            NSColor.secondaryLabelColor.alphaComponent,
+            accuracy: 0.02,
+            "the already-visible trace sits at its final secondary color"
+        )
     }
 
     // MARK: - A superseded fade settles instead of freezing dim
@@ -68,8 +100,9 @@ final class StreamingFadeTests: XCTestCase {
         row.configure(text: "alpha beta gamma", thinking: nil, role: .assistant, isStreaming: true)
         row.layoutSubtreeIfNeeded()
         XCTAssertEqual(storage.string, "alpha beta gamma▌")
-        XCTAssertGreaterThan(alpha(storage, at: 6), 0.5, "the superseded batch is settled, not frozen dim")
-        XCTAssertLessThan(alpha(storage, at: 11), 0.5, "the new batch is the one fading in")
+        XCTAssertEqual(alpha(storage, at: 6), alpha(storage, at: 0), accuracy: 0.001, "the superseded batch is settled, not frozen dim")
+        XCTAssertLessThan(alpha(storage, at: 11), alpha(storage, at: 0), "the new batch is the one fading in")
+        XCTAssertGreaterThanOrEqual(alpha(storage, at: 11), 0.45, "the new batch is still readable")
     }
 
     func testManySupersededBatchesLeaveNoDimTextBehind() {
@@ -83,18 +116,20 @@ final class StreamingFadeTests: XCTestCase {
             row.layoutSubtreeIfNeeded()
         }
         let storage = textView(of: row).textStorage!
-        // Only the last batch may still be mid-fade; every earlier one settled.
+        // The caret (systemBlue, alpha 0.6) and the last batch may still be
+        // mid-fade; every EARLIER batch must be settled to the final label
+        // color.
         let lastBatch = (storage.string as NSString).range(of: " chunk11")
-        var dimOutsideLastBatch: [NSRange] = []
+        let caret = NSRange(location: storage.length - 1, length: 1)
+        let final = NSColor.labelColor.alphaComponent
+        var unsettled: [NSRange] = []
         storage.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
-            guard let color = value as? NSColor, color.alphaComponent < 0.5 else { return }
+            guard let color = value as? NSColor else { return }
             guard NSIntersectionRange(range, lastBatch).length != range.length else { return }
-            dimOutsideLastBatch.append(range)
+            guard NSIntersectionRange(range, caret).length != range.length else { return }
+            if abs(color.alphaComponent - final) > 0.02 { unsettled.append(range) }
         }
-        XCTAssertTrue(
-            dimOutsideLastBatch.isEmpty,
-            "superseded batches must settle; dim ranges left behind: \(dimOutsideLastBatch)"
-        )
+        XCTAssertTrue(unsettled.isEmpty, "superseded batches must settle; unsettled ranges: \(unsettled)")
     }
 
     // MARK: - Settling the message restores every color

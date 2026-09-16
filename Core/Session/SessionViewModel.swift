@@ -386,6 +386,16 @@ public final class SessionViewModel {
     /// so a VoiceOver user knows the work is done.
     public var onAgentSettled: (() -> Void)?
 
+    /// File-change sync hook: called with the path of a file the agent's
+    /// `edit`/`write` tool just finished writing (fired per completed tool
+    /// call), or with nil when the whole turn settled — the signal that
+    /// anything else that touched files on disk mid-turn (a `bash`-run
+    /// formatter, codegen script, `git checkout`, …) may have changed, so a
+    /// broader, path-less refresh is due. The Client layer wires this to the
+    /// git-status refresh behind the gating button and the file browser
+    /// window (same shape as `onRestoreSteeringToInput` / `onAgentSettled`).
+    public var onFilesChanged: ((String?) -> Void)?
+
     private var eventTask: Task<Void, Never>?
     /// Periodic `get_session_stats` poller while the agent is streaming. pi has
     /// no event that pushes context usage, so the client polls: `get_session_stats`
@@ -521,6 +531,9 @@ public final class SessionViewModel {
             // usage is now accurate.
             await refreshContextStats()
             onAgentSettled?()
+            // The whole turn settled: any disk change (bash-run tools, …) that
+            // has no per-call event surfaces here, path unknown.
+            onFilesChanged?(nil)
 
         case "thinking_level_changed":
             if let level = frame.levelText() { thinkingLevel = level }
@@ -538,6 +551,12 @@ public final class SessionViewModel {
         }.value
         if changed {
             onTranscriptChange?()
+        }
+        // The store folds each frame before this point (awaited, serial), so
+        // consuming the completed-edit signal right after observes exactly
+        // this frame's outcome — an edit/write that just finished writing.
+        if let path = store.consumeCompletedFileEdit() {
+            onFilesChanged?(path)
         }
     }
 

@@ -367,6 +367,34 @@ final class PromptTextView: NSTextView {
         }
         super.keyDown(with: event)
     }
+
+    /// Paste that understands the app's code-reference pasteboard type: when
+    /// the pasteboard carries a `.codeReference` (a selection tagged in the
+    /// read-only file browser with its absolute path + lines), insert the
+    /// RENDERED reference — `[Ref: path:line-line]` + the fenced snippet —
+    /// instead of the raw snippet. Everything else pastes normally (§1.4).
+    ///
+    /// The insertion funnels through the standard text-editing pipeline
+    /// (`insertText` → the coordinator's `shouldChangeTextIn`), so an
+    /// unusually large tagged reference is transparently windowed by the
+    /// existing huge-paste logic exactly as a normal paste would be. Because
+    /// the plain `.string` representation was written alongside the custom
+    /// one, pasting the same copy into any other app still yields just the
+    /// snippet — nothing here is composer-specific in a way that breaks the
+    /// rest of the OS.
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        if let data = pasteboard.data(forType: .codeReference),
+           let reference = try? JSONDecoder().decode(CodeReference.self, from: data) {
+            // Render relative to THIS composer, whichever project the
+            // reference was tagged in (a cross-project paste yields a `..`
+            // walk — the agent and PathCompletion understand that shape).
+            let cwd = promptHandler?.cwd ?? URL(fileURLWithPath: "/")
+            insertText(reference.promptText(relativeTo: cwd), replacementRange: selectedRange())
+            return
+        }
+        super.paste(sender) // normal text/RTF/whatever paste
+    }
 }
 
 /// An `NSTextField` that never participates in hit-testing, so a label that
@@ -790,40 +818,23 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// passes through while a popup menu or sheet is up so Esc closes those
     /// instead of aborting.
     private func installEscapeMonitor() {
-        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        // AppKit invokes these monitor closures directly on the main thread but
+        // OUTSIDE any Swift task context, so they must not be actor-isolated:
+        // a @MainActor closure here gets a compiler-inserted executor entry
+        // check whose object deref crashes at runtime (the crash reports). Each
+        // handler therefore does ONLY pure-event reads, then hands off to a
+        // @MainActor method via `MainActor.assumeIsolated` — the codebase's
+        // established AppKit-boundary pattern (thread-based check, no executor
+        // object deref).
+        let handler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == 53 else { return event }
-            guard let self, let container = self.container, let window = container.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle Esc.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A VISIBLE popup-menu-level window means a dropdown (or the path
-            // completion list) is tracking: let Esc close it instead of
-            // aborting. NB: ordered-out windows are still in NSApp.windows —
-            // the completion window lives hidden at .popUpMenu level for the
-            // whole session and would otherwise swallow every Esc.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            // Prompt input has focus: its own Esc handling (completion → abort)
-            // runs; don't fire the abort twice. Likewise any OTHER text field
-            // being edited (the session search bar) uses Esc for its own
-            // dismissal — the abort stays reserved for non-editing focus (the
-            // transcript, toolbar, empty window chrome). A field editor's
-            // delegate is its NSTextField; the transcript rows' text views are
-            // plain text views, so they fall through and Esc still aborts from
-            // there.
-            if let editor = window.firstResponder as? NSTextView {
-                if editor === container.textView { return event }
-                if editor.delegate is NSTextField { return event }
+            guard let self else { return event }
+            let consume = MainActor.assumeIsolated {
+                self.handleEscapeKey()
             }
-            // Esc is the universal abort: discard a windowed paste (the input
-            // is itself the current "operation" while it is streaming in) and
-            // abort the agent turn.
-            self.abortWindowedPasteIfAny()
-            self.onAbort()
-            // After aborting, focus the prompt input so typing can start
-            // immediately (the next Return sends, or queues as steering if the
-            // turn hasn't fully settled yet).
-            container.window?.makeFirstResponder(container.textView)
-            return nil
+            return consume ? nil : event
         }
+        escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
     }
 
     /// Local key monitor making Ctrl+C discard a windowed paste from anywhere
@@ -837,23 +848,17 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// `discardInput`). Deferred to the text view's own Ctrl+C handling when
     /// the prompt input has focus, so nothing double-fires.
     private func installPasteAbortMonitor() {
-        pasteAbortMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        let handler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == 8, // C
                   event.modifierFlags.contains(.control),
                   !event.modifierFlags.contains(.command) else { return event }
-            guard let self, let container = self.container, let window = container.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle it.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A visible popup-menu-level window (a dropdown / the completion
-            // list) is tracking: don't steal the key from it.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            // Prompt input has focus: its own keyDown handles Ctrl+C.
-            if let editor = window.firstResponder as? NSTextView, editor === container.textView {
-                return event
+            guard let self else { return event }
+            let consume = MainActor.assumeIsolated {
+                self.handlePasteAbortKey()
             }
-            let cleared = self.abortWindowedPasteIfAny()
-            return cleared ? nil : event
+            return consume ? nil : event
         }
+        pasteAbortMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
     }
 
     /// Local key monitor making Cmd+Z / ⇧Cmd+Z undo / redo the prompt input's
@@ -864,32 +869,94 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     /// undo/redo, or focus is elsewhere, the event passes through untouched
     /// (menus, other responders).
     private func installCmdZMonitor() {
-        cmdZMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        let handler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
             guard event.keyCode == 6, // Z
                   event.modifierFlags.contains(.command),
                   !event.modifierFlags.contains(.control),
                   !event.modifierFlags.contains(.option) else { return event }
-            guard let self, let container = self.container, let window = container.window else { return event }
-            // Window not front (or a sheet is up): let the key window handle it.
-            guard window.isKeyWindow, window.attachedSheet == nil else { return event }
-            // A visible popup-menu-level window (a dropdown / the completion
-            // list) is tracking: don't steal the key from it.
-            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return event }
-            // Only while the prompt input itself is being edited: undo/redo is
-            // scoped to the focused input, exactly like a text field's.
-            guard let editor = window.firstResponder as? NSTextView, editor === container.textView else { return event }
-            guard let undo = editor.undoManager else { return event }
+            guard let self else { return event }
             let wantsRedo = event.modifierFlags.contains(.shift)
-            if wantsRedo ? undo.canRedo : undo.canUndo {
-                if wantsRedo {
-                    undo.redo()
-                } else {
-                    undo.undo()
-                }
-                return nil
+            let consume = MainActor.assumeIsolated {
+                self.handleUndoKey(wantsRedo: wantsRedo)
             }
-            return event
+            return consume ? nil : event
         }
+        cmdZMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
+    }
+
+    // MARK: - Window key-monitor actions (main actor)
+
+    /// Esc — the universal abort, decided on the main actor from the
+    /// nonisolated monitor closure (see the note at `installEscapeMonitor`).
+    /// Returns whether the key was consumed (nil to AppKit).
+    @MainActor
+    private func handleEscapeKey() -> Bool {
+        guard let container, let window = container.window else { return false }
+        // Window not front (or a sheet is up): let the key window handle Esc.
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        // A VISIBLE popup-menu-level window means a dropdown (or the path
+        // completion list) is tracking: let Esc close it instead of
+        // aborting. NB: ordered-out windows are still in NSApp.windows —
+        // the completion window lives hidden at .popUpMenu level for the
+        // whole session and would otherwise swallow every Esc.
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        // Prompt input has focus: its own Esc handling (completion → abort)
+        // runs; don't fire the abort twice. Likewise any OTHER text field
+        // being edited (the session search bar) uses Esc for its own
+        // dismissal — the abort stays reserved for non-editing focus (the
+        // transcript, toolbar, empty window chrome). A field editor's
+        // delegate is its NSTextField; the transcript rows' text views are
+        // plain text views, so they fall through and Esc still aborts from
+        // there.
+        if let editor = window.firstResponder as? NSTextView {
+            if editor === container.textView { return false }
+            if editor.delegate is NSTextField { return false }
+        }
+        // Esc is the universal abort: discard a windowed paste (the input
+        // is itself the current "operation" while it is streaming in) and
+        // abort the agent turn.
+        abortWindowedPasteIfAny()
+        onAbort()
+        // After aborting, focus the prompt input so typing can start
+        // immediately (the next Return sends, or queues as steering if the
+        // turn hasn't fully settled yet).
+        container.window?.makeFirstResponder(container.textView)
+        return true
+    }
+
+    /// Ctrl+C (without Cmd) outside the prompt input: terminal-style interrupt
+    /// of the input itself — discards a windowed paste; a plain draft is left
+    /// alone unless the input is focused (its own keyDown handles that).
+    @MainActor
+    private func handlePasteAbortKey() -> Bool {
+        guard let container, let window = container.window else { return false }
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        // Prompt input has focus: its own keyDown handles Ctrl+C.
+        if let editor = window.firstResponder as? NSTextView, editor === container.textView {
+            return false
+        }
+        return abortWindowedPasteIfAny()
+    }
+
+    /// Cmd+Z / ⇧Cmd+Z while the prompt input is focused: undo / redo the
+    /// input's own undo manager (the discard-restore included).
+    @MainActor
+    private func handleUndoKey(wantsRedo: Bool) -> Bool {
+        guard let container, let window = container.window else { return false }
+        guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+        guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+        guard let editor = window.firstResponder as? NSTextView, editor === container.textView else { return false }
+        guard let undo = editor.undoManager else { return false }
+        if wantsRedo ? undo.canRedo : undo.canUndo {
+            if wantsRedo {
+                undo.redo()
+            } else {
+                undo.undo()
+            }
+            return true
+        }
+        return false
     }
 
     var textView: PromptTextView? { container?.textView }

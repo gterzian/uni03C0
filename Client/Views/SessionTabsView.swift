@@ -23,7 +23,7 @@ struct SessionTabsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            tabBar
+            tabPanel
             Divider()
             if let active = activeTab {
                 SessionContent(tab: active)
@@ -88,9 +88,9 @@ struct SessionTabsView: View {
 
     /// "+" — pick a folder to start a new session in. Any folder works, but
     /// the agent's workspace is the projects folder (every project inside it
-    /// is read+write). The panel opens on the right-most tab's folder (a new
-    /// session usually continues from the same project area), falling back to
-    /// the projects root while no tabs exist yet.
+    /// is read+write). The panel opens on the ACTIVE tab's folder (a new
+    /// session usually continues from the project you're looking at), falling
+    /// back to the projects root while no tabs exist yet.
     private func chooseFolderAndAddTab() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -98,7 +98,7 @@ struct SessionTabsView: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Start Session"
         panel.message = "Choose the folder to start a new agent session in. The agent's workspace is your projects folder — every project inside it is read + write."
-        panel.directoryURL = tabs.last?.cwd ?? AppState.shared.projectsRoot
+        panel.directoryURL = activeTab?.cwd ?? AppState.shared.projectsRoot
         if panel.runModal() == .OK, let url = panel.url {
             Task { await addTab(cwd: url) }
         }
@@ -134,9 +134,25 @@ struct SessionTabsView: View {
         .accessibilityHidden(true)
     }
 
-    // MARK: - Tab bar
+    // MARK: - Tab panel
 
-    private var tabBar: some View {
+    /// The whole tab chrome: the outer session tabs (one per folder) plus, for
+    /// the ACTIVE session only, its nested page tabs — Session / Files. The
+    /// nested strip lives in the PANEL (not the session content) so it reads as
+    /// navigation within the active top-level tab: it hangs directly under the
+    /// active pill, shares the panel's background, and disappears when another
+    /// session tab is selected (each session keeps its own page choice).
+    private var tabPanel: some View {
+        VStack(spacing: 0) {
+            outerTabBar
+            if let active = activeTab {
+                nestedPageTabs(active)
+            }
+        }
+        .background(.bar)
+    }
+
+    private var outerTabBar: some View {
         HStack(spacing: 6) {
             ForEach(tabs) { tab in
                 tabPill(tab)
@@ -155,7 +171,91 @@ struct SessionTabsView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(.bar)
+    }
+
+    /// Session / Files — the page tabs of the ACTIVE session, nested under its
+    /// outer pill (see `tabPanel`). The Files tab carries the edited-file count
+    /// (the old "N edited" review-gate signal) so a session with uncommitted
+    /// changes advertises them at the tab level.
+    private func nestedPageTabs(_ tab: SessionTab) -> some View {
+        HStack(spacing: 3) {
+            pageTabButton(
+                title: "Session",
+                icon: "text.bubble",
+                isSelected: tab.page == .conversation,
+                help: "Show the conversation with the agent"
+            ) {
+                tab.page = .conversation
+            }
+            pageTabButton(
+                title: "Files",
+                icon: "folder",
+                isSelected: tab.page == .files,
+                badge: tab.gitChangeCount,
+                help: "Browse the session's files — review what changed"
+            ) {
+                tab.page = .files
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    /// One nested page tab: a compact pill in the outer pills' visual language
+    /// (accent-tinted when selected), with the edited-file count badge on the
+    /// Files tab.
+    private func pageTabButton(
+        title: String,
+        icon: String,
+        isSelected: Bool,
+        badge: Int? = nil,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        // The badge is visual-only; the selected state and the badge count go
+        // into the accessibility label + traits so VoiceOver announces
+        // "Files, 3 edited files, selected" instead of a plain unselected
+        // button (the custom pills carry none of the segmented control's
+        // free semantics — selected state, group traits).
+        let accessibilityLabel: String
+        if let badge, badge > 0 {
+            accessibilityLabel = "\(title), \(badge) edited file\(badge == 1 ? "" : "s")"
+        } else {
+            accessibilityLabel = title
+        }
+        return Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 10))
+                Text(title)
+                    .font(.system(size: 11))
+                    .fontWeight(isSelected ? .semibold : .regular)
+                if let badge, badge > 0 {
+                    Text("\(badge)")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 0.5)
+                        .background(
+                            Color.accentColor.opacity(isSelected ? 0.3 : 0.18),
+                            in: Capsule()
+                        )
+                }
+            }
+            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 3)
+            .background(
+                isSelected ? Color.accentColor.opacity(0.14) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 6)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     /// One tab: the session's folder name, its live status icon (spinner

@@ -26,6 +26,8 @@ let tests: [(name: String, body: () -> Void)] = [
     ("testStreamingRowSettleRendersWhileNotFollowing", { CoordinatorNavigationTests().testStreamingRowSettleRendersWhileNotFollowing() }),
     ("testAppendSchedulesAndSeedsOffMainPremeasure", { CoordinatorNavigationTests().testAppendSchedulesAndSeedsOffMainPremeasure() }),
     ("testStreamingAppendDoesNotSchedulePremeasure", { CoordinatorNavigationTests().testStreamingAppendDoesNotSchedulePremeasure() }),
+    ("testRebindToAnotherSessionRendersItsRows", { CoordinatorNavigationTests().testRebindToAnotherSessionRendersItsRows() }),
+    ("testPageAndSessionSwitchesNeverLeaveBlankTranscript", { CoordinatorNavigationTests().testPageAndSessionSwitchesNeverLeaveBlankTranscript() }),
 ]
 
 var totalFailures = 0
