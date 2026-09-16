@@ -25,18 +25,21 @@ struct SessionContent: View {
     var body: some View {
         let vm = tab.viewModel
         VStack(spacing: 0) {
-            // Both pages stay mounted so switching between them is a pure
+            // Three pages stay mounted so switching between them is a pure
             // visibility flip, never a rebuild:
             //  - The transcript must NOT be torn down on a page switch: a
             //    re-created transcript used to show a blank conversation until
             //    a tab switch forced a reload (the reported bug). It stays
-            //    alive and hidden while the Files page is up; `isPageActive`
-            //    gates its per-delta work (zero while hidden, one catch-up
-            //    pass on return — the occlusion machinery).
+            //    alive and hidden while the Files/Changes pages are up;
+            //    `isPageActive` gates its per-delta work (zero while hidden,
+            //    one catch-up pass on return — the occlusion machinery).
             //  - The file browser is kept alive the same way so its state
             //    (expansion, selection) survives page switches, and its warm
             //    listing starts as soon as the session does; it defers its git
-            //    refreshes while hidden behind the conversation.
+            //    refreshes while hidden behind another page.
+            //  - The Changes page reuses that same store and defers its
+            //    per-file diff loads while hidden, so switching to it is a
+            //    visibility flip and it never loads a diff off-screen.
             ZStack {
                 conversationPage
                     .opacity(tab.page == .conversation ? 1 : 0)
@@ -60,6 +63,18 @@ struct SessionContent: View {
                 .opacity(tab.page == .files ? 1 : 0)
                 .allowsHitTesting(tab.page == .files)
                 .accessibilityHidden(tab.page != .files)
+                GeometryReader { proxy in
+                    ChangesView(
+                        store: tab.fileBrowser,
+                        pageActive: tab.page == .changes,
+                        onOpenInFiles: { tab.openInFileBrowser($0) }
+                    )
+                    .id(tab.id)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+                }
+                .opacity(tab.page == .changes ? 1 : 0)
+                .allowsHitTesting(tab.page == .changes)
+                .accessibilityHidden(tab.page != .changes)
             }
 
             Divider()

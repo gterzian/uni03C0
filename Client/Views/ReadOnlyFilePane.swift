@@ -14,6 +14,15 @@ import SwiftUI
 /// selection that spans a removal still produces a valid in-file reference
 /// (§2.6).
 struct ReadOnlyFilePane: NSViewRepresentable {
+    /// How much of the file the pane shows. `.wholeFile` is the Files page's
+    /// full buffer (with removed lines interleaved); `.hunks` is the Changes
+    /// page's read-through view — only the changed regions plus a few lines of
+    /// context, with a `@@ … @@` header per hunk.
+    enum LoadMode: Hashable, Sendable {
+        case wholeFile
+        case hunks
+    }
+
     let cwd: URL
     /// Path of the file to show, relative to `cwd`.
     let path: String
@@ -47,6 +56,10 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     /// conversation, which used to re-read + re-highlight the open file on
     /// the main thread at every switch.
     var pageActive = true
+    /// `.wholeFile` (default) or `.hunks` (see `LoadMode`). Part of the load
+    /// identity, so a mode change (never happens for one representable
+    /// instance) would reload.
+    var mode: LoadMode = .wholeFile
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -75,6 +88,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             path: path,
             kind: kind,
             token: reloadToken,
+            mode: mode,
             reference: pendingReference?.path == path ? pendingReference : nil,
             onReferenceConsumed: onReferenceConsumed
         )
@@ -129,6 +143,10 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         /// be considered "already displayed" and the pane would keep the
         /// uncolored buffer (the missing added-line overlay).
         private var displayedKind: GitStatus.Kind?
+        /// The load mode the displayed content was built with (`.hunks` buffers
+        /// have a different text than the full file). Part of the display
+        /// identity, so a mode flip can never be deduped away.
+        private var displayedMode: ReadOnlyFilePane.LoadMode?
         /// The absolute path + edit overlay of the content currently displayed
         /// (nil while a placeholder is up). Kept so an appearance change can
         /// re-highlight the SAME buffer WITHOUT re-reading the file: the plain
@@ -146,6 +164,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         private let highlighter = SyntaxHighlighter()
         private let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         private let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
+        private let hunkHeaderColor = NSColor.systemBlue.withAlphaComponent(0.10)
 
         /// One full reload request — everything `launch` needs, captured at
         /// accept time so a deferred (hidden-page) request can be re-launched
@@ -155,6 +174,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             let path: String
             let kind: GitStatus.Kind
             let token: Int
+            let mode: ReadOnlyFilePane.LoadMode
             let reference: FileReferenceLink?
             let onReferenceConsumed: (() -> Void)?
         }
@@ -199,17 +219,18 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             request.path == displayedPath
                 && request.token == displayedToken
                 && request.kind == displayedKind
+                && request.mode == displayedMode
         }
 
-        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
+        func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, mode: ReadOnlyFilePane.LoadMode = .wholeFile, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
             guard container != nil else { return }
             // The KIND is part of the identity: a refresh that reclassifies
             // the open file (clean → modified) arrives with an unchanged
             // token and must still reload, or the pane never gains the edit
-            // overlay (see `displayedKind`).
-            if let accepted, accepted.path == path, accepted.token == token, accepted.kind == kind { return }
+            // overlay (see `displayedKind`). The MODE is likewise part of it.
+            if let accepted, accepted.path == path, accepted.token == token, accepted.kind == kind, accepted.mode == mode { return }
             let request = Pending(
-                cwd: cwd, path: path, kind: kind, token: token,
+                cwd: cwd, path: path, kind: kind, token: token, mode: mode,
                 reference: reference, onReferenceConsumed: onReferenceConsumed
             )
             accepted = request
@@ -251,7 +272,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
 
         private func performLoad(_ request: Pending) async {
             guard let container else { return }
-            let loaded = await PaneContentLoader.load(cwd: request.cwd, path: request.path, kind: request.kind)
+            let loaded = await PaneContentLoader.load(cwd: request.cwd, path: request.path, kind: request.kind, mode: request.mode)
             // The page hid while the file was being read (the load was
             // cancelled): nothing may be applied to an off-screen pane — the
             // apply is main-thread work for a page the user cannot see.
@@ -262,7 +283,8 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             guard let current = accepted,
                   current.path == request.path,
                   current.token == request.token,
-                  current.kind == request.kind else { return }
+                  current.kind == request.kind,
+                  current.mode == request.mode else { return }
             // The target lines ride on the request that captured them (see
             // `reload`) — a whole-file reference has no target lines.
             let targetLines: (start: Int, end: Int)? = request.reference.flatMap { ref in
@@ -305,6 +327,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             displayedPath = request.path
             displayedToken = request.token
             displayedKind = request.kind
+            displayedMode = request.mode
         }
 
         /// Re-runs syntax highlighting for the displayed buffer with the
@@ -338,6 +361,7 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             switch overlay {
             case .none: .none
             case .diff(let added, let removed): .lines(added: added, removed: removed)
+            case .hunks(let added, let removed, _): .lines(added: added, removed: removed)
             case .wholeGreen: .wholeAdded
             case .wholeRed: .wholeDeleted
             }
@@ -379,6 +403,20 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 for range in PaneContentLoader.charRanges(ofLines: removed, in: text) {
                     styled.addAttribute(.backgroundColor, value: deletedColor, range: range)
                 }
+            case .hunks(let added, let removed, let headers):
+                for range in PaneContentLoader.charRanges(ofLines: added, in: text) {
+                    styled.addAttribute(.backgroundColor, value: addedColor, range: range)
+                }
+                for range in PaneContentLoader.charRanges(ofLines: removed, in: text) {
+                    styled.addAttribute(.backgroundColor, value: deletedColor, range: range)
+                }
+                // The `@@ -a,b +c,d @@` lines are chrome, not source: a quiet
+                // wash + secondary color so they separate hunks without
+                // competing with the edit colors.
+                for range in PaneContentLoader.charRanges(ofLines: headers, in: text) {
+                    styled.addAttribute(.backgroundColor, value: hunkHeaderColor, range: range)
+                    styled.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: range)
+                }
             case .wholeGreen:
                 styled.addAttribute(.backgroundColor, value: addedColor, range: whole)
             case .wholeRed:
@@ -411,6 +449,10 @@ private enum PaneOverlay: Sendable {
     /// position (GitHub's unified view), so a deletion is finally visible —
     /// the marker is the red line itself.
     case diff(added: [Int], removed: [Int])
+    /// The Changes page's hunks-only view: same added/removed display lines as
+    /// `.diff`, plus the `@@ … @@` header lines to wash as chrome. The buffer
+    /// carries only the changed regions plus context, not the whole file.
+    case hunks(added: [Int], removed: [Int], headers: [Int])
     /// Every line is new (an untracked-but-added file).
     case wholeGreen
     /// Every line came from HEAD (a deletion).
@@ -443,7 +485,90 @@ private enum PaneContentLoader {
     /// Reads + diffs entirely off the main thread: file IO, a `git show` when
     /// the old side is needed, and `TextDiff` all run on the global executor
     /// here; only the final attributed string is built on main.
-    nonisolated static func load(cwd: URL, path: String, kind: GitStatus.Kind) async -> LoadedContent {
+    nonisolated static func load(cwd: URL, path: String, kind: GitStatus.Kind, mode: ReadOnlyFilePane.LoadMode) async -> LoadedContent {
+        switch mode {
+        case .wholeFile:
+            return await loadWholeFile(cwd: cwd, path: path, kind: kind)
+        case .hunks:
+            return await loadHunks(cwd: cwd, path: path, kind: kind)
+        }
+    }
+
+    /// The Changes page's hunks-only buffer: only the changed regions of the
+    /// file plus a few context lines, framed by `@@ … @@` headers. The
+    /// `lineNumbers` map still records each display line's REAL current-file
+    /// line (nil for a removed line or a header), so copy-tagging from a hunk
+    /// produces a reference into the actual file — never into the diff view.
+    nonisolated private static func loadHunks(cwd: URL, path: String, kind: GitStatus.Kind) async -> LoadedContent {
+        switch kind {
+        case .deleted:
+            // No on-disk content: the whole committed buffer is the old side.
+            guard let head = await GitStatus.headContent(of: path, cwd: cwd) else {
+                return LoadedContent(message: "No committed content for \((path as NSString).lastPathComponent).")
+            }
+            return LoadedContent(displayText: head, overlay: .wholeRed)
+        case .added, .untracked:
+            // Untracked files have no HEAD baseline but are entirely new
+            // content, so the Changes page shows them as all-additions.
+            guard let text = GitStatus.currentContent(of: path, cwd: cwd) else {
+                return LoadedContent(message: "Couldn't read \((path as NSString).lastPathComponent).")
+            }
+            return LoadedContent(displayText: text, overlay: .wholeGreen)
+        case .modified:
+            guard let text = GitStatus.currentContent(of: path, cwd: cwd) else {
+                return LoadedContent(message: "Couldn't read \((path as NSString).lastPathComponent).")
+            }
+            guard let old = await GitStatus.headContent(of: path, cwd: cwd) else {
+                return LoadedContent(displayText: text)
+            }
+            let hunks = TextDiff.hunks(old: old, new: text)
+            guard !hunks.isEmpty else {
+                return LoadedContent(message: "No textual changes in \((path as NSString).lastPathComponent).")
+            }
+            return hunkContent(hunks, trailingNewline: text.hasSuffix("\n"))
+        case .normal:
+            return LoadedContent(message: "\((path as NSString).lastPathComponent) has no changes.")
+        }
+    }
+
+    /// Renders `[TextDiff.Hunk]` into the display buffer: each hunk is one
+    /// header line followed by its lines. The returned line-number map keeps
+    /// every content line pointing at its REAL current-file line, a removed
+    /// line / header pointing at nil — the copy machinery drops nil-mapped
+    /// lines from the snippet, so a selection through a hunk never quotes the
+    /// `@@` chrome or the old side.
+    nonisolated static func hunkContent(_ hunks: [TextDiff.Hunk], trailingNewline: Bool = true) -> LoadedContent {
+        var lines: [String] = []
+        var lineNumbers: [Int?] = []
+        var added: [Int] = []
+        var removed: [Int] = []
+        var headers: [Int] = []
+        for hunk in hunks {
+            lines.append("@@ -\(hunk.oldStart),\(hunk.oldCount) +\(hunk.newStart),\(hunk.newCount) @@")
+            lineNumbers.append(nil)
+            headers.append(lines.count)
+            for line in hunk.lines {
+                lines.append(line.text)
+                lineNumbers.append(line.newLine)
+                switch line.kind {
+                case .added: added.append(lines.count)
+                case .removed: removed.append(lines.count)
+                case .same: break
+                }
+            }
+        }
+        var text = lines.joined(separator: "\n")
+        if trailingNewline, !text.isEmpty { text += "\n" }
+        return LoadedContent(
+            displayText: text,
+            overlay: .hunks(added: added, removed: removed, headers: headers),
+            lineNumbers: lineNumbers
+        )
+    }
+
+    /// The Files page's full buffer: the whole current file (or its last
+    /// committed content) with removed lines interleaved for a modification.
+    nonisolated private static func loadWholeFile(cwd: URL, path: String, kind: GitStatus.Kind) async -> LoadedContent {
         switch kind {
         case .deleted:
             // No on-disk content: the buffer is the last-committed text, and

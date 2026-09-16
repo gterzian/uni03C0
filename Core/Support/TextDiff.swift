@@ -137,6 +137,118 @@ public enum TextDiff {
         result.append(contentsOf: ops.reversed())
     }
 
+    // MARK: - Hunks
+
+    /// One line of a unified-diff hunk, annotated with the 1-based line number
+    /// it has on the old and/or new side. `oldLine` is nil for an added line
+    /// and `newLine` is nil for a removed line; a context (`.same`) line
+    /// carries both.
+    public struct HunkLine: Hashable, Sendable {
+        public let kind: DiffLineKind
+        public let text: String
+        public let oldLine: Int?
+        public let newLine: Int?
+
+        public init(kind: DiffLineKind, text: String, oldLine: Int?, newLine: Int?) {
+            self.kind = kind
+            self.text = text
+            self.oldLine = oldLine
+            self.newLine = newLine
+        }
+    }
+
+    /// A run of changes plus `context` unchanged lines on either side — the
+    /// unit a GitHub-style unified diff shows. `oldStart`/`newStart` are the
+    /// first line of the run on each side (matching the `@@ -a,b +c,d @@`
+    /// header), and the counts are the number of old-side / new-side lines the
+    /// hunk covers.
+    public struct Hunk: Hashable, Sendable {
+        public let oldStart: Int
+        public let oldCount: Int
+        public let newStart: Int
+        public let newCount: Int
+        public let lines: [HunkLine]
+
+        public init(oldStart: Int, oldCount: Int, newStart: Int, newCount: Int, lines: [HunkLine]) {
+            self.oldStart = oldStart
+            self.oldCount = oldCount
+            self.newStart = newStart
+            self.newCount = newCount
+            self.lines = lines
+        }
+    }
+
+    /// Splits the line diff into hunks with `context` unchanged lines around
+    /// each change. Two changes closer than `2 * context` unchanged lines
+    /// merge into one hunk (the standard rule); a gap at least that large
+    /// starts a new hunk, which is what lets the Changes page show only the
+    /// parts of a file that actually changed instead of the whole buffer.
+    public static func hunks(old: String, new: String, context: Int = 3) -> [Hunk] {
+        hunks(oldLines: lines(of: old), newLines: lines(of: new), context: context)
+    }
+
+    public static func hunks(oldLines: [String], newLines: [String], context: Int = 3) -> [Hunk] {
+        let diff = diff(oldLines: oldLines, newLines: newLines)
+        guard !diff.isEmpty else { return [] }
+        let context = max(0, context)
+
+        // Annotate each line with its old/new number and remember the counters
+        // BEFORE each line, so a hunk's header start is exact even when the
+        // hunk opens with an addition or a deletion.
+        var annotated: [HunkLine] = []
+        annotated.reserveCapacity(diff.count)
+        var oldBefore = [Int]()
+        var newBefore = [Int]()
+        oldBefore.reserveCapacity(diff.count + 1)
+        newBefore.reserveCapacity(diff.count + 1)
+        var oldCounter = 1
+        var newCounter = 1
+        for line in diff {
+            oldBefore.append(oldCounter)
+            newBefore.append(newCounter)
+            switch line.kind {
+            case .same:
+                annotated.append(HunkLine(kind: .same, text: line.text, oldLine: oldCounter, newLine: newCounter))
+                oldCounter += 1
+                newCounter += 1
+            case .removed:
+                annotated.append(HunkLine(kind: .removed, text: line.text, oldLine: oldCounter, newLine: nil))
+                oldCounter += 1
+            case .added:
+                annotated.append(HunkLine(kind: .added, text: line.text, oldLine: nil, newLine: newCounter))
+                newCounter += 1
+            }
+        }
+
+        let changed = diff.indices.filter { diff[$0].kind != .same }
+        guard !changed.isEmpty else { return [] }
+
+        // Expand each change by `context` and merge overlapping/adjacent runs.
+        var ranges: [(start: Int, end: Int)] = []
+        for index in changed {
+            let start = max(0, index - context)
+            let end = min(diff.count - 1, index + context)
+            if let last = ranges.last, start <= last.end + 1 {
+                ranges[ranges.count - 1].end = max(last.end, end)
+            } else {
+                ranges.append((start, end))
+            }
+        }
+
+        return ranges.map { range in
+            let slice = annotated[range.start...range.end]
+            let oldCount = slice.reduce(0) { $0 + ($1.oldLine != nil ? 1 : 0) }
+            let newCount = slice.reduce(0) { $0 + ($1.newLine != nil ? 1 : 0) }
+            return Hunk(
+                oldStart: oldBefore[range.start],
+                oldCount: oldCount,
+                newStart: newBefore[range.start],
+                newCount: newCount,
+                lines: Array(slice)
+            )
+        }
+    }
+
     /// Splits text into lines. A trailing newline is not a line of its own
     /// (diff semantics), and a trailing CR is stripped from each line so CRLF
     /// files diff cleanly against LF text.

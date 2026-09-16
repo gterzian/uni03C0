@@ -12,14 +12,16 @@ struct RestoreRequest: Equatable {
     let text: String
 }
 
-/// The nested page a session tab shows — the conversation, or the read-only
-/// file browser for the session's folder. A "tab within the tab": switching
-/// pages swaps the transcript area for the file viewer, while the prompt bar
-/// and the chrome below stay put — so tagging a reference and pasting it into
-/// the prompt happens in the same window.
+/// The nested page a session tab shows — the conversation, the read-only
+/// file browser for the session's folder, or the Changes review surface (the
+/// uncommitted diff of that folder). A "tab within the tab": switching pages
+/// swaps the transcript area for the file viewer or the diff, while the prompt
+/// bar and the chrome below stay put — so tagging a reference and pasting it
+/// into the prompt happens in the same window.
 enum SessionPage: Hashable {
     case conversation
     case files
+    case changes
 }
 
 /// One live session — one tab in the tabbed main window (also used by the
@@ -86,9 +88,9 @@ final class SessionTab: Identifiable {
     var gitChangeCount: Int?
     private var gitCountTask: Task<Void, Never>?
 
-    /// Which nested page this tab currently shows (the Session / Files tabs in
-    /// the tab panel). Persists across outer tab switches — the view
-    /// re-materializes on return, the page choice does not.
+    /// Which nested page this tab currently shows (the Session / Files /
+    /// Changes tabs in the tab panel). Persists across outer tab switches —
+    /// the view re-materializes on return, the page choice does not.
     var page: SessionPage = .conversation
 
     init(cwd: URL, projectsRoot: URL?) {
@@ -150,6 +152,15 @@ final class SessionTab: Identifiable {
     private func openFileReference(_ link: FileReferenceLink) {
         page = .files
         fileBrowser.openReference(link)
+    }
+
+    /// Opens a whole file in the full file browser — the Changes page's
+    /// "click a file name" action. Flips to the Files page (a visibility flip;
+    /// the browser stays mounted) and selects/reveals the file through the
+    /// same store path a `pi-file` reference uses, minus the line target.
+    func openInFileBrowser(_ path: String) {
+        page = .files
+        fileBrowser.openReference(FileReferenceLink(path: path))
     }
 
     func start() async {
