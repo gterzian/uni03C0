@@ -173,10 +173,11 @@ struct SessionTabsView: View {
         .padding(.vertical, 6)
     }
 
-    /// Session / Files — the page tabs of the ACTIVE session, nested under its
-    /// outer pill (see `tabPanel`). The Files tab carries the edited-file count
-    /// (the old "N edited" review-gate signal) so a session with uncommitted
-    /// changes advertises them at the tab level.
+    /// Session / Files / Changes — the page tabs of the ACTIVE session, nested
+    /// under its outer pill (see `tabPanel`). The Files tab carries the
+    /// edited-file count (the old "N edited" review-gate signal) so a session
+    /// with uncommitted changes advertises them at the tab level; the Changes
+    /// tab is the same changeset as a GitHub-style diff review surface.
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
         HStack(spacing: 3) {
             pageTabButton(
@@ -195,6 +196,15 @@ struct SessionTabsView: View {
                 help: "Browse the session's files — review what changed"
             ) {
                 tab.page = .files
+            }
+            pageTabButton(
+                title: "Changes",
+                icon: "plus.forwardslash.minus",
+                isSelected: tab.page == .changes,
+                badge: tab.gitChangeCount,
+                help: "Review the uncommitted diff of this session's folder"
+            ) {
+                tab.page = .changes
             }
             Spacer(minLength: 0)
         }
