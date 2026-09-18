@@ -1,3 +1,4 @@
+import AppKit
 import Core
 import SwiftUI
 
@@ -126,6 +127,24 @@ struct SessionContent: View {
         }
         .sheet(isPresented: $tab.showingHistory) {
             SessionHistorySheet(cwd: tab.cwd, viewModel: vm)
+        }
+        // Opening a review surface re-checks the working tree: the Files tree
+        // and the Changes list are only as fresh as the store's last snapshot,
+        // and an out-of-band change (a git command run in a terminal) produces
+        // no pi file event to refresh it. The pane's own live read then can
+        // never disagree with the list beside it. The same re-check runs when
+        // the app returns to the foreground and when the active outer tab
+        // changes — for the badge as well, which is visible on every page — but
+        // only for the session the user is actually looking at, so a background
+        // tab costs nothing (its own agent events keep it warm).
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            tab.refreshWorkingTree()
+        }
+        .onChange(of: tab.id) { _, _ in
+            tab.refreshWorkingTree()
+        }
+        .onChange(of: tab.page) { _, page in
+            if page != .conversation { tab.refreshWorkingTree() }
         }
         .onChange(of: vm.lastError) { _, error in
             if let error {

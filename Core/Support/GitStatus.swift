@@ -73,13 +73,16 @@ public enum GitStatus {
         case untracked
     }
 
-    /// Posted whenever a session's agent tool touched a file on disk
-    /// (`edit`/`write`, or the turn settled). Payload keys: `"cwd"` (the URL
-    /// of the session folder) and `"path"` (the file that changed, or nil when
-    /// the whole turn settled and any file may have changed). A payload is
-    /// needed (unlike `FontSettings.didChangeNotification`, which posts no
-    /// payload) because more than one project's file browser window can be
-    /// open at once, each caring only about its own `cwd`.
+    /// Posted whenever a session's git state may have changed: an agent tool
+    /// touched a file on disk (`edit`/`write`, or the turn settled), or the
+    /// app re-entered the foreground / opened a review surface to re-check a
+    /// change pi never saw (a `git commit` run in a terminal). Payload keys:
+    /// `"cwd"` (the URL of the session folder) and `"path"` (the file that
+    /// changed, or nil when the whole turn settled, the app returned, or any
+    /// file may have changed). A payload is needed (unlike
+    /// `FontSettings.didChangeNotification`, which posts no payload) because
+    /// more than one project's file browser window can be open at once, each
+    /// caring only about its own `cwd`.
     public static let didChangeNotification = Notification.Name("GitStatus.didChange")
 
     // MARK: - Plumbing

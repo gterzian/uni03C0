@@ -273,9 +273,10 @@ Rules:
   main thread; views never build trees/indexes or run git. Tree nodes are
   **classes**, and the flattened list is memoized on (store version, expansion).
 - First-load auto-expand is capped; ancestor folders of every changed file are
-  always opened.
-- Row stats come from one batched two-pass `git diff --numstat`, never a diff per
-  file.
+  always opened. Row stats come from one batched two-pass `git diff --numstat`,
+  never a diff per file.
+- The store only advances on `GitStatus.didChangeNotification`; a terminal `git
+  commit` emits none, so the active session re-checks on activation and page opens.
 - `pi-file://` links (`FileReferenceLink`) post a cwd-keyed `openFileReference`
   notification; selection/reveal is store state. A reveal anchors the start line
   at the viewport top, flashes the range, and leaves a persistent anchor; the

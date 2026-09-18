@@ -118,12 +118,7 @@ final class SessionTab: Identifiable {
         // fires with nil.
         viewModel.onFilesChanged = { [weak self] path in
             guard let self else { return }
-            self.scheduleGitCountRefresh()
-            NotificationCenter.default.post(
-                name: GitStatus.didChangeNotification,
-                object: nil,
-                userInfo: ["cwd": self.cwd, "path": path as Any]
-            )
+            self.fileStateMayHaveChanged(path: path)
         }
         // A click on an agent-emitted file reference in the transcript (posted
         // by the transcript coordinator, which has no SessionTab): switch to
@@ -185,6 +180,37 @@ final class SessionTab: Identifiable {
         }
         fileBrowser.stop()
         await viewModel.stop()
+    }
+
+    /// Re-checks this folder's git state after something pi did not observe:
+    /// the app returned to the foreground, the session became the active tab,
+    /// or the user opened the Files / Changes review surface. Drives the same
+    /// signal an agent file event does, so the store's snapshot (tree +
+    /// changed list + count badge) and the open content pane can never
+    /// disagree with the working tree.
+    func refreshWorkingTree() {
+        // Deferred one main-queue turn: the callers are SwiftUI update handlers
+        // (onReceive/onChange), and the fan-out mutates other views' state
+        // (pane reload tokens, the store's snapshot). Mutating that synchronously
+        // from inside an update is undefined behavior.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.fileStateMayHaveChanged(path: nil)
+        }
+    }
+
+    /// Fan-out for "this folder may have changed on disk": re-count the
+    /// changed files (the tab badges) and post the cwd-keyed notification
+    /// that refreshes the file browser store and reloads the open panes. `path`
+    /// is the touched file, or nil when the change is unknown / any file may
+    /// have changed (a turn settle, a return to the app).
+    private func fileStateMayHaveChanged(path: String?) {
+        scheduleGitCountRefresh()
+        NotificationCenter.default.post(
+            name: GitStatus.didChangeNotification,
+            object: nil,
+            userInfo: ["cwd": cwd, "path": path as Any]
+        )
     }
 
     func reloadSessions() {
