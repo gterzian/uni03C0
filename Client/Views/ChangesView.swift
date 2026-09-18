@@ -188,6 +188,18 @@ struct ChangesView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
+                // The viewer shows a window into the file; this hands the whole
+                // file to another app (an editor). Hidden for a deleted file.
+                if store.canOpenInDefaultApp(selected) {
+                    Button { store.openInDefaultApp(selected) } label: {
+                        Image(systemName: "arrow.up.forward.app")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Open the full file in the default application")
+                    .accessibilityLabel("Open \(selected) in the default application")
+                }
             } else {
                 Text("Changes")
                     .font(.system(size: 12, weight: .semibold))

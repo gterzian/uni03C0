@@ -1,3 +1,4 @@
+import AppKit
 import Core
 import Foundation
 import Observation
@@ -240,5 +241,23 @@ final class ChangesStore {
     func setTopSection(_ path: String?) {
         guard let path, path != selectedPath else { return }
         selectedPath = path
+    }
+
+    // MARK: - Open in another app
+
+    /// Whether the full file exists on disk to hand to another app (a deleted
+    /// file has no content to open).
+    func canOpenInDefaultApp(_ path: String) -> Bool {
+        entries.contains { $0.path == path && $0.kind != .deleted }
+    }
+
+    /// Opens the file's full, on-disk content in the user's default application
+    /// — the diff viewer shows a window into the file, this hands the whole file
+    /// to an editor. The app process is not sandboxed (the seatbelt policy wraps
+    /// only agent subprocesses), so `NSWorkspace` can launch another app.
+    func openInDefaultApp(_ path: String) {
+        guard canOpenInDefaultApp(path) else { return }
+        let url = URL(fileURLWithPath: path, relativeTo: cwd).standardizedFileURL
+        NSWorkspace.shared.open(url)
     }
 }

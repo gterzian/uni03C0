@@ -223,11 +223,20 @@ struct DiffBrowserView: NSViewRepresentable {
         }
 
         func handleLink(_ url: URL) {
-            guard url.scheme == Self.linkScheme, url.host == "expand", let store else { return }
+            guard url.scheme == Self.linkScheme, let store else { return }
             let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            guard let path = comps?.queryItems?.first(where: { $0.name == "path" })?.value,
-                  let dir = comps?.queryItems?.first(where: { $0.name == "dir" })?.value else { return }
-            store.expand(path: path, direction: dir == "up" ? .up : .down)
+            let path = comps?.queryItems?.first(where: { $0.name == "path" })?.value
+            switch url.host {
+            case "expand":
+                guard let path,
+                      let dir = comps?.queryItems?.first(where: { $0.name == "dir" })?.value else { return }
+                store.expand(path: path, direction: dir == "up" ? .up : .down)
+            case "open":
+                guard let path else { return }
+                store.openInDefaultApp(path)
+            default:
+                break
+            }
         }
 
         func reveal(_ path: String) {
@@ -433,8 +442,33 @@ struct DiffBrowserView: NSViewRepresentable {
                     .font: font, .foregroundColor: NSColor.systemBlue,
                 ]))
             }
+            // A trailing link hands the WHOLE file to another app — the viewer
+            // only ever shows the diff. Omitted for a deleted file (nothing on
+            // disk to open).
+            if entry.kind != .deleted, let url = selfURL(host: "open", path: entry.path) {
+                let linkStart = result.length
+                result.append(NSAttributedString(string: "   ↗ Open in app", attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                    .foregroundColor: NSColor.controlAccentColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                ]))
+                result.addAttribute(.link, value: url, range: NSRange(location: linkStart, length: result.length - linkStart))
+            }
             result.addAttribute(.backgroundColor, value: Self.headerBackground, range: NSRange(location: 0, length: result.length))
             return result
+        }
+
+        /// Builds a `pi-diff://` link for a path.
+        private func selfURL(host: String, path: String, direction: String? = nil) -> URL? {
+            var comps = URLComponents()
+            comps.scheme = Self.linkScheme
+            comps.host = host
+            var items = [URLQueryItem(name: "path", value: path)]
+            if let direction {
+                items.append(URLQueryItem(name: "dir", value: direction))
+            }
+            comps.queryItems = items
+            return comps.url
         }
 
         private func expandLine(hidden: Int, path: String, direction: String, label: String) -> NSAttributedString {
@@ -443,14 +477,7 @@ struct DiffBrowserView: NSViewRepresentable {
                 .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ])
-            var comps = URLComponents()
-            comps.scheme = Self.linkScheme
-            comps.host = "expand"
-            comps.queryItems = [
-                URLQueryItem(name: "path", value: path),
-                URLQueryItem(name: "dir", value: direction),
-            ]
-            if let url = comps.url {
+            if let url = selfURL(host: "expand", path: path, direction: direction) {
                 result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
             }
             return result
