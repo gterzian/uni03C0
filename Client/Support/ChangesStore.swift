@@ -1,0 +1,244 @@
+import Core
+import Foundation
+import Observation
+
+/// The uncommitted-changes store behind the Changes page, and the model for its
+/// one scrollable diff viewer. It owns the changed-file list (for the sidebar),
+/// the loaded per-file diffs, and the per-file top/bottom expansion state, and
+/// it does all the git + file work off the main thread.
+///
+/// The Changes page is gone: this is the only file/diff surface. Bodies stay thin
+/// — the sidebar reads `entries`, and the viewer (an AppKit text view) rebinds
+/// when `documentVersion` changes.
+@MainActor
+@Observable
+final class ChangesStore {
+    let cwd: URL
+
+    // MARK: Changed-file list (sidebar)
+
+    private(set) var entries: [GitStatus.FileEntry] = []
+    private(set) var isLoading = true
+    /// Bumped when `entries` changes.
+    private(set) var listVersion = 0
+    /// Bumped whenever the rendered diff document's inputs change: diffs
+    /// loaded/reloaded, expansion changed, or appearance forced a re-render.
+    private(set) var documentVersion = 0
+    /// Bumped only when diffs are (re)loaded, never on expansion — the viewer's
+    /// per-file highlight cache keys on it, so an unrelated file keeps its
+    /// highlighted segment while another is revealed.
+    private(set) var contentEpoch = 0
+
+    // MARK: Selection + viewer commands
+
+    /// The file the viewer is showing (the section at the top of the viewport,
+    /// kept in sync by the viewer's scroll spy). Clicking a sidebar row writes
+    /// this and requests a scroll.
+    var selectedPath: String?
+    /// One-shot "scroll the viewer to this path's section" request. Consumed by
+    /// the viewer via `consumeReveal()`.
+    var revealPath: String?
+
+    // MARK: The loaded diffs (off-main data, read by the document builder)
+
+    @ObservationIgnored private(set) var diffs: [String: LoadedFileDiff] = [:]
+    /// Extra full-array lines revealed above/below the base window, per path.
+    @ObservationIgnored private var extraUp: [String: Int] = [:]
+    @ObservationIgnored private var extraDown: [String: Int] = [:]
+
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshInFlight = false
+    @ObservationIgnored private var refreshQueued = false
+    @ObservationIgnored private static let refreshSettleDelay: Duration = .milliseconds(350)
+    @ObservationIgnored private var changeObserver: NSObjectProtocol?
+
+    init(cwd: URL) {
+        self.cwd = cwd
+        changeObserver = NotificationCenter.default.addObserver(
+            forName: GitStatus.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            guard (note.userInfo?["cwd"] as? URL) == cwd else { return }
+            let path = note.userInfo?["path"] as? String
+            MainActor.assumeIsolated {
+                self.scheduleRefresh(changedPath: path)
+            }
+        }
+    }
+
+    func stop() {
+        if let changeObserver {
+            NotificationCenter.default.removeObserver(changeObserver)
+            self.changeObserver = nil
+        }
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshQueued = false
+    }
+
+    // MARK: Refresh
+
+    func scheduleRefresh(immediate: Bool = false, changedPath: String? = nil) {
+        if refreshInFlight {
+            refreshQueued = true
+            return
+        }
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            if !immediate {
+                try? await Task.sleep(for: Self.refreshSettleDelay)
+            }
+            guard !Task.isCancelled else { return }
+            await self.refresh(changedPath: changedPath)
+        }
+    }
+
+    /// Re-lists the changed files, then (re)loads their diffs off the main
+    /// thread. When `changedPath` names a file, only that file's diff is
+    /// re-read; a nil path (a turn settled, a `git commit`) reloads them all.
+    func refresh(changedPath: String? = nil) async {
+        if refreshInFlight {
+            refreshQueued = true
+            return
+        }
+        refreshInFlight = true
+        defer { refreshInFlight = false }
+        repeat {
+            refreshQueued = false
+            guard !Task.isCancelled else { return }
+            let cwd = self.cwd
+            let all = await Task.detached(priority: .userInitiated) {
+                await GitStatus.classify(at: cwd)
+            }.value
+            guard !Task.isCancelled else { return }
+            let changed = all.filter { $0.kind != .normal }.sorted { $0.path < $1.path }
+            let paths = Set(changed.map(\.path))
+            entries = changed
+            listVersion &+= 1
+            isLoading = false
+            // Drop diffs for files that are no longer changed.
+            diffs = diffs.filter { paths.contains($0.key) }
+            extraUp = extraUp.filter { paths.contains($0.key) }
+            extraDown = extraDown.filter { paths.contains($0.key) }
+
+            let toLoad: [GitStatus.FileEntry]
+            if let changedPath {
+                // A change event naming one file: reload just that file (empty
+                // when it is no longer changed). A nil path (a turn settled, a
+                // `git commit`) reloads every changed file's diff.
+                toLoad = changed.filter { $0.path == changedPath }
+            } else {
+                toLoad = changed
+            }
+            if !toLoad.isEmpty {
+                let loaded = await self.load(changed: toLoad, cwd: cwd)
+                for diff in loaded {
+                    diffs[diff.path] = diff
+                }
+                contentEpoch &+= 1
+                documentVersion &+= 1
+            }
+        } while refreshQueued
+    }
+
+    /// Loads a batch of files' diffs concurrently, bounded so a large changeset
+    /// does not spawn one git process per file at once.
+    private nonisolated func load(changed: [GitStatus.FileEntry], cwd: URL) async -> [LoadedFileDiff] {
+        var result: [LoadedFileDiff] = []
+        result.reserveCapacity(changed.count)
+        let batchSize = 6
+        var index = 0
+        while index < changed.count {
+            let batch = Array(changed[index..<min(index + batchSize, changed.count)])
+            let loaded = await withTaskGroup(of: LoadedFileDiff.self) { group in
+                for entry in batch {
+                    group.addTask { await DiffLoader.load(cwd: cwd, entry: entry) }
+                }
+                var out: [LoadedFileDiff] = []
+                for await diff in group { out.append(diff) }
+                return out
+            }
+            result.append(contentsOf: loaded)
+            index += batchSize
+        }
+        return result
+    }
+
+    // MARK: Expansion
+
+    enum ExpandDirection { case up, down }
+
+    /// The visible window of a file's interleaved diff, in full-array indices
+    /// (inclusive). The base window is the change span plus a few context lines;
+    /// expansion grows it above/below in compounding blocks until the whole file
+    /// is shown.
+    struct Window: Equatable {
+        let start: Int
+        let end: Int
+    }
+
+    private static let baseContext = 3
+    private static let expandBlockStart = 40
+    private static let expandBlockMax = 4000
+
+    func window(for diff: LoadedFileDiff) -> Window {
+        let count = diff.lines.count
+        guard count > 0 else { return Window(start: 0, end: 0) }
+        let change = diff.changeRange ?? (0...(count - 1))
+        let baseStart = max(0, change.lowerBound - Self.baseContext)
+        let baseEnd = min(count - 1, change.upperBound + Self.baseContext)
+        let start = max(0, baseStart - (extraUp[diff.path] ?? 0))
+        let end = min(count - 1, baseEnd + (extraDown[diff.path] ?? 0))
+        return Window(start: start, end: end)
+    }
+
+    /// Whether there is more of the file to reveal on a side.
+    func canExpand(_ diff: LoadedFileDiff, _ direction: ExpandDirection) -> Bool {
+        let window = window(for: diff)
+        switch direction {
+        case .up: return window.start > 0
+        case .down: return window.end < diff.lines.count - 1
+        }
+    }
+
+    func expand(path: String, direction: ExpandDirection) {
+        guard let diff = diffs[path] else { return }
+        switch direction {
+        case .up:
+            guard canExpand(diff, .up) else { return }
+            extraUp[path] = Self.nextBlock(extraUp[path] ?? 0)
+        case .down:
+            guard canExpand(diff, .down) else { return }
+            extraDown[path] = Self.nextBlock(extraDown[path] ?? 0)
+        }
+        documentVersion &+= 1
+    }
+
+    /// The next compounding reveal block: 40, 80, 160, … capped.
+    private static func nextBlock(_ current: Int) -> Int {
+        guard current > 0 else { return expandBlockStart }
+        return min(current * 2, expandBlockMax)
+    }
+
+    // MARK: Viewer commands
+
+    /// Scrolls the viewer to `path`'s section and marks it selected.
+    func reveal(_ path: String) {
+        selectedPath = path
+        revealPath = path
+    }
+
+    func consumeReveal() {
+        revealPath = nil
+    }
+
+    /// The viewer's scroll spy: which file's section owns the top of the
+    /// viewport. Ignores no-op updates so it never fights a click.
+    func setTopSection(_ path: String?) {
+        guard let path, path != selectedPath else { return }
+        selectedPath = path
+    }
+}

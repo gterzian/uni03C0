@@ -28,8 +28,8 @@ import XCTest
 final class CodeLineRulerTests: XCTestCase {
 
     @MainActor
-    private func makeLoadedPane(lineCount: Int = 900) -> FilePaneContainer {
-        let container = FilePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    private func makeLoadedPane(lineCount: Int = 900) -> CodePaneContainer {
+        let container = CodePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
             styleMask: [.titled],
@@ -43,7 +43,7 @@ final class CodeLineRulerTests: XCTestCase {
         RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         let lines = (1...lineCount).map { "this is line number \($0) of the ruler test — padding padding" }
         let text = lines.joined(separator: "\n") + "\n"
-        container.displayContent(
+        container.displayDocument(
             path: "/tmp/CodeLineRulerTests.swift",
             text: NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
         )
@@ -52,7 +52,7 @@ final class CodeLineRulerTests: XCTestCase {
     }
 
     @MainActor
-    private func ruler(in container: FilePaneContainer) -> CodeLineRulerView {
+    private func ruler(in container: CodePaneContainer) -> CodeLineRulerView {
         container.scrollView.verticalRulerView as! CodeLineRulerView
     }
 
@@ -91,7 +91,7 @@ final class CodeLineRulerTests: XCTestCase {
 
         // A new file (different line count) loads into the same pane.
         let text = (1...40).map { "short file line \($0)" }.joined(separator: "\n") + "\n"
-        container.displayContent(
+        container.displayDocument(
             path: "/tmp/short.swift",
             text: NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
         )
@@ -163,7 +163,7 @@ final class CodeLineRulerTests: XCTestCase {
     /// midpoints don't match their text rows — the stale/misattached
     /// regression).
     @MainActor
-    private func assertLabelsAlignWithTextRows(_ container: FilePaneContainer, file: StaticString = #filePath, line: UInt = #line) {
+    private func assertLabelsAlignWithTextRows(_ container: CodePaneContainer, file: StaticString = #filePath, line: UInt = #line) {
         guard let rep = container.bitmapImageRepForCachingDisplay(in: container.bounds) else {
             XCTFail("could not rasterize the pane", file: file, line: line)
             return

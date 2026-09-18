@@ -392,7 +392,7 @@ public final class SessionViewModel {
     /// anything else that touched files on disk mid-turn (a `bash`-run
     /// formatter, codegen script, `git checkout`, …) may have changed, so a
     /// broader, path-less refresh is due. The Client layer wires this to the
-    /// git-status refresh behind the gating button and the file browser
+    /// git-status refresh behind the gating button and the Changes viewer
     /// window (same shape as `onRestoreSteeringToInput` / `onAgentSettled`).
     public var onFilesChanged: ((String?) -> Void)?
 

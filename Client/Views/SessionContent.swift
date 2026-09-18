@@ -26,52 +26,36 @@ struct SessionContent: View {
     var body: some View {
         let vm = tab.viewModel
         VStack(spacing: 0) {
-            // Three pages stay mounted so switching between them is a pure
+            // Two pages stay mounted so switching between them is a pure
             // visibility flip, never a rebuild:
             //  - The transcript must NOT be torn down on a page switch: a
             //    re-created transcript used to show a blank conversation until
             //    a tab switch forced a reload (the reported bug). It stays
-            //    alive and hidden while the Files/Changes pages are up;
+            //    alive and hidden while the Changes page is up;
             //    `isPageActive` gates its per-delta work (zero while hidden,
             //    one catch-up pass on return — the occlusion machinery).
-            //  - The file browser is kept alive the same way so its state
-            //    (expansion, selection) survives page switches, and its warm
-            //    listing starts as soon as the session does; it defers its git
-            //    refreshes while hidden behind another page.
-            //  - The Changes page reuses that same store and defers its
-            //    per-file diff loads while hidden, so switching to it is a
-            //    visibility flip and it never loads a diff off-screen.
+            //  - The Changes viewer is kept alive the same way so its state
+            //    (scroll position, per-file expansion, selection) survives page
+            //    switches and its warm listing starts as soon as the session
+            //    does; it defers its git refreshes and diff loads while hidden
+            //    behind the conversation, so switching to it is a visibility
+            //    flip and it never loads a diff off-screen.
             ZStack {
                 conversationPage
                     .opacity(tab.page == .conversation ? 1 : 0)
                     .allowsHitTesting(tab.page == .conversation)
                     .accessibilityHidden(tab.page != .conversation)
-                // Same top-level contract as `conversationPage` above: the
-                // page fills exactly the slot offered, never its content. A
-                // bare `.frame(maxHeight: .infinity)` is not enough on its own
-                // here — an `NSViewRepresentable` whose natural (fitting) size
-                // exceeds the slot (the code pane's unbounded text view, the
-                // tree table's row-height total) can still inflate the browser
-                // through it. Pinning the browser to the `GeometryReader`'s
-                // CONCRETE size makes the slot definite before the representables
-                // are measured, so the page can never grow past it — belt to the
-                // `sizeThatFits` braces on `ReadOnlyFilePane`/`FileTreeTable`.
+                // The Changes page stays mounted so switching to it is a pure
+                // visibility flip, never a rebuild; it defers its diff loads and
+                // rebuilds while hidden behind the conversation. The
+                // `GeometryReader` pins it to the slot's CONCRETE size before the
+                // representables are measured, so the unbounded document text
+                // view can never inflate the page past its slot (belt to the
+                // `sizeThatFits` braces on the viewer).
                 GeometryReader { proxy in
-                    FileBrowserView(store: tab.fileBrowser, pageActive: tab.page == .files)
+                    ChangesView(store: tab.changes, pageActive: tab.page == .changes)
                         .id(tab.id)
                         .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
-                }
-                .opacity(tab.page == .files ? 1 : 0)
-                .allowsHitTesting(tab.page == .files)
-                .accessibilityHidden(tab.page != .files)
-                GeometryReader { proxy in
-                    ChangesView(
-                        store: tab.fileBrowser,
-                        pageActive: tab.page == .changes,
-                        onOpenInFiles: { tab.openInFileBrowser($0) }
-                    )
-                    .id(tab.id)
-                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
                 }
                 .opacity(tab.page == .changes ? 1 : 0)
                 .allowsHitTesting(tab.page == .changes)
@@ -128,15 +112,15 @@ struct SessionContent: View {
         .sheet(isPresented: $tab.showingHistory) {
             SessionHistorySheet(cwd: tab.cwd, viewModel: vm)
         }
-        // Opening a review surface re-checks the working tree: the Files tree
-        // and the Changes list are only as fresh as the store's last snapshot,
-        // and an out-of-band change (a git command run in a terminal) produces
-        // no pi file event to refresh it. The pane's own live read then can
-        // never disagree with the list beside it. The same re-check runs when
-        // the app returns to the foreground and when the active outer tab
-        // changes — for the badge as well, which is visible on every page — but
-        // only for the session the user is actually looking at, so a background
-        // tab costs nothing (its own agent events keep it warm).
+        // Opening a review surface re-checks the working tree: the changed list
+        // is only as fresh as the store's last snapshot, and an out-of-band
+        // change (a git command run in a terminal) produces no pi file event to
+        // refresh it. The viewer's own live diff then can never disagree with
+        // the list beside it. The same re-check runs when the app returns to the
+        // foreground and when the active outer tab changes — for the badge as
+        // well, which is visible on every page — but only for the session the
+        // user is actually looking at, so a background tab costs nothing (its
+        // own agent events keep it warm).
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             tab.refreshWorkingTree()
         }
@@ -159,7 +143,7 @@ struct SessionContent: View {
     }
 
     /// The conversation page: transcript (AppKit) + its in-page overlays.
-    /// Kept mounted across page switches (hidden while the Files page is up)
+    /// Kept mounted across page switches (hidden while the Changes page is up)
     /// so the transcript's coordinator, per-session height caches, and scroll
     /// position survive — rebuilding it per switch was the blank-transcript
     /// bug (a fresh table was never told to render already-stored rows until a

@@ -1,11 +1,11 @@
 import AppKit
 import Observation
 
-/// Find-in-buffer state for one read-only code pane — the Files page's open
-/// file or the Changes page's diff. A single buffer is already in memory and
-/// small next to a whole conversation, so unlike the session's batched,
-/// off-main search a query here is one synchronous scan whose hits are plain
-/// `NSRange`s into the displayed buffer.
+/// Find-in-buffer state for the Changes viewer — one buffer holding every
+/// shown file's diff. A single buffer is already in memory and small next to a
+/// whole conversation, so unlike the session's batched, off-main search a query
+/// here is one synchronous scan whose hits are plain `NSRange`s into the
+/// displayed buffer.
 ///
 /// The model owns only the UI-visible state (visibility, query, case
 /// sensitivity, match count/position). The pane registers its container via
@@ -24,7 +24,7 @@ final class CodeSearchModel: CodeSearching {
     /// 0-based index of the current hit, -1 when there are none.
     private(set) var currentIndex = -1
 
-    @ObservationIgnored private weak var container: FilePaneContainer?
+    @ObservationIgnored private weak var container: CodePaneContainer?
     @ObservationIgnored private var matches: [NSRange] = []
 
     // MARK: - CodeSearching (pane-facing)
@@ -38,7 +38,7 @@ final class CodeSearchModel: CodeSearching {
         }
     }
 
-    func attach(_ container: FilePaneContainer) {
+    func attach(_ container: CodePaneContainer) {
         self.container = container
         if isVisible {
             rescan()

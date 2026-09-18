@@ -88,7 +88,7 @@ public struct FileReferenceLink: Hashable, Sendable {
 
 extension Notification.Name {
     /// Posted by the transcript when the user clicks an agent-emitted
-    /// `pi-file://` reference link, so the session's file browser opens the
+    /// `pi-file://` reference link, so the session's Changes viewer reveals the
     /// referenced file. Payload keys (both required): `"cwd"` — the
     /// `URL` of the session folder the link names, so a tab only reacts to
     /// its own links — and `"link"`, the parsed `FileReferenceLink`.

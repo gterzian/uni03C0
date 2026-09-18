@@ -868,7 +868,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// browser; agent-emitted `pi-file://` file references (see
     /// `FileReferenceLink`) go to the row's `onOpenFileReference` handler —
     /// the transcript coordinator posts the cwd-keyed open-file notification
-    /// that switches the session to its Files page and opens the referenced
+    /// that switches the session to its Changes page and reveals the referenced
     /// file. A `pi-file` URL that fails to parse (empty path) is declined so
     /// it reads as dead text rather than doing nothing interesting.
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {

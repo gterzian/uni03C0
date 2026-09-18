@@ -30,8 +30,8 @@ final class FilePaneSearchTests: XCTestCase {
     // MARK: - Highlight paint
 
     @MainActor
-    private func makeContainer() -> FilePaneContainer {
-        let container = FilePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    private func makeContainer() -> CodePaneContainer {
+        let container = CodePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
             styleMask: [.titled],
@@ -48,7 +48,7 @@ final class FilePaneSearchTests: XCTestCase {
     func testSearchHighlightPaintsMatchesAndCurrentInTheStrongerShade() {
         let container = makeContainer()
         let text = NSAttributedString(string: "one two one three one\n")
-        container.displayContent(path: "/tmp/search-highlight.txt", text: text)
+        container.displayDocument(path: "/tmp/search-highlight.txt", text: text)
 
         let ranges = ReadOnlyCodeTextView.searchRanges(of: "one", in: text.string, caseSensitive: true)
         XCTAssertEqual(ranges.count, 3)
@@ -69,7 +69,7 @@ final class FilePaneSearchTests: XCTestCase {
         // Stand in for the edit overlay's added-line green over the first line.
         let green = NSColor.systemGreen
         text.addAttribute(.backgroundColor, value: green, range: NSRange(location: 0, length: 7))
-        container.displayContent(path: "/tmp/search-overlay.txt", text: text)
+        container.displayDocument(path: "/tmp/search-overlay.txt", text: text)
 
         let ranges = ReadOnlyCodeTextView.searchRanges(of: "one", in: text.string, caseSensitive: true)
         container.applySearchHighlight(ranges: ranges, currentIndex: 0)
@@ -90,7 +90,7 @@ final class FilePaneSearchTests: XCTestCase {
     func testReapplyingSearchDoesNotAccumulateOverlays() {
         let container = makeContainer()
         let text = NSAttributedString(string: "one two one three one\n")
-        container.displayContent(path: "/tmp/search-reapply.txt", text: text)
+        container.displayDocument(path: "/tmp/search-reapply.txt", text: text)
         let ranges = ReadOnlyCodeTextView.searchRanges(of: "one", in: text.string, caseSensitive: true)
 
         container.applySearchHighlight(ranges: ranges, currentIndex: 0)
@@ -109,7 +109,7 @@ final class FilePaneSearchTests: XCTestCase {
         let container = makeContainer()
         let lines = (1...400).map { $0 == 300 ? "needle here" : "line \($0) of the scroll test — padding padding" }
         let text = NSAttributedString(string: lines.joined(separator: "\n") + "\n")
-        container.displayContent(path: "/tmp/search-reveal.txt", text: text)
+        container.displayDocument(path: "/tmp/search-reveal.txt", text: text)
 
         let ranges = ReadOnlyCodeTextView.searchRanges(of: "needle", in: text.string, caseSensitive: true)
         XCTAssertEqual(ranges.count, 1)

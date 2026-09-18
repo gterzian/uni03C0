@@ -256,44 +256,47 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 
 ---
 
-## Session pages & file browser (do not break)
+## Session pages & the Changes viewer (do not break)
 
-Both pages stay mounted and swap by visibility; never rebuild the transcript to
-show Files. The session owns its `FileBrowserStore`; the view renders only
-visible rows.
+The conversation and Changes pages stay mounted and swap by visibility; never
+rebuild the transcript to show Changes. The session owns one `ChangesStore`; the
+viewer renders one document built from it, and the sidebar renders only visible
+rows.
 
 Rules:
 
 - A page switch is a visibility flip (opacity + hit-testing), never a rebuild.
-  The transcript representable has **no `.id`** and is rebound; the Files view is
-  `.id`-keyed per tab (its state belongs to that tab).
+  The transcript representable has **no `.id`** and is rebound; the Changes view
+  is `.id`-keyed per tab (its state belongs to that tab).
 - The inactive page does zero work, gated by `pageActive` — no folding, no file
-  IO, no highlighting.
-- All file data comes from the store's `nonisolated` `FileTreeBuilder` off the
-  main thread; views never build trees/indexes or run git. Tree nodes are
-  **classes**, and the flattened list is memoized on (store version, expansion).
-- First-load auto-expand is capped; ancestor folders of every changed file are
-  always opened. Row stats come from one batched two-pass `git diff --numstat`,
-  never a diff per file.
+  IO, no diff loading, no highlighting.
+- Changed files + per-file stats come from `GitStatus.classify` (one batched
+  two-pass `git diff --numstat`), off the main thread. Per-file diffs are loaded
+  by `DiffLoader` off-main (bounded concurrency); a `path`-named change event
+  reloads only that file, a nil event reloads all.
 - The store only advances on `GitStatus.didChangeNotification`; a terminal `git
   commit` emits none, so the active session re-checks on activation and page opens.
-- `pi-file://` links (`FileReferenceLink`) post a cwd-keyed `openFileReference`
-  notification; selection/reveal is store state. A reveal anchors the start line
-  at the viewport top, flashes the range, and leaves a persistent anchor; the
-  reference target travels with its reload task.
-- The vertical scroller doubles as an edit map (`EditMarkerScroller` /
-  `CodePaneEditMarkerScroller`); ticks mirror the overlay exactly.
-- The content pane renders the interleaved diff (removed lines inline in red),
-  not added-lines-only. Loading/chrome spinners are AppKit `SpinnerView`, never a
-  SwiftUI `ProgressView` in a mounted view.
+- The viewer is ONE `CodePaneContainer` (scroll view + `ReadOnlyCodeTextView` +
+  ruler + `CodePaneEditMarkerScroller`) holding every file's diff in path order,
+  built by `DiffBrowserView.Coordinator`. Expansion is a per-file window into the
+  store's interleaved lines, revealed in compounding blocks via `pi-diff://` link
+  rows at the top/bottom; unchanged files keep their highlighted segment (cache
+  keyed on content epoch + window + theme). Never highlight for a hidden page,
+  and keep the viewer's `sizeThatFits` filling the slot, never its content.
+- Search (`CodeSearchModel`) scans the whole viewer buffer — every line currently
+  in the document, visible or not — and re-runs when a file expands.
+- The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
+- `pi-file://` links (`FileReferenceLink`) post a cwd-keyed `openFileReference`;
+  the tab reveals the file in the Changes viewer only when it is in the changeset.
+- Diff egress uses the interleaved view (removed lines inline in red), not
+  added-lines-only. Spinners are AppKit `SpinnerView`, never a SwiftUI
+  `ProgressView` in a mounted view.
 - New `NSEvent` window monitors: use a NONISOLATED `@Sendable` closure handing
   off via `MainActor.assumeIsolated`; an inferred `@MainActor` closure crashes in
   `swift_getObjectType`.
 
 Failed fixes (do not re-introduce):
 
-- Value-type tree nodes flattened per row (deep-copied subtrees; ~800MB and
-  multi-second stalls).
-- Folding the listing / building the tree on the main thread.
-- A SwiftUI `List` (or a per-body flatten) over the expanded tree.
 - Rendering only added lines, so a deletion-only change looked uncolored.
+- Rebuilding the whole viewer document on every scroll-spy tick, or loading all
+  diffs on the main thread.

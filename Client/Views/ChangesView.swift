@@ -1,72 +1,27 @@
 import Core
 import SwiftUI
 
-/// The Changes page — the third nested page of a session tab, alongside the
-/// conversation and the file browser. It is a review surface for exactly the
-/// working tree's uncommitted changes: a list of the changed files on the left
-/// (the navigation) and, on the right, the diff of the selected file rendered
-/// GitHub-PR style — only the changed regions plus a few context lines, one
-/// `@@ … @@` header per hunk. Picking a file in the list switches the diff.
+/// The Changes page — the review surface for the session folder's uncommitted
+/// changes. A list of the changed files on the left (the navigation) and, on
+/// the right, ONE scrollable viewer holding every file's diff in path order.
+/// Scrolling the viewer walks the whole changeset; the list highlights
+/// whichever file's section owns the top of the viewport, and clicking a row
+/// scrolls the viewer to that file.
 ///
-/// The page is a thin reader of the session's `FileBrowserStore` (the changed
-/// list, kinds, and +/− counts are already computed there for the file tree),
-/// and reuses `ReadOnlyFilePane` in `.hunks` mode for the diff itself — so the
-/// gutter, the syntax highlighting, and above all the pasteboard reference
-/// behavior (a copy writes a `CodeReference` pointing at the REAL file and its
-/// real line numbers, never at this diff buffer) are the file browser's own,
-/// not a parallel implementation.
-///
-/// The diff HEADER's file name is a link to the full Files page — the diff is
-/// a lens, not a destination to copy from. The list itself only navigates the
-/// diff.
+/// Each file's diff shows the changed region plus a few context lines, with an
+/// expand control above and below to read further into the file — the reveal
+/// grows in compounding blocks, like the transcript's history fetch. Search
+/// covers every line the viewer is currently showing, whether or not it is in
+/// the viewport, and re-runs as a file expands.
 struct ChangesView: View {
-    let store: FileBrowserStore
+    let store: ChangesStore
     /// Whether the Changes page is the visible page. The view stays mounted
-    /// while hidden, but the diff pane defers its loads (see
-    /// `ReadOnlyFilePane.pageActive`) — no file IO, git show, or highlighting
-    /// for an off-screen page.
+    /// while hidden, but the viewer defers its rebuilds (no file IO, git, or
+    /// syntax highlighting for an off-screen page).
     var pageActive = true
-    /// Opens `path` in the full file browser (switches the session to the
-    /// Files page and reveals the file). Supplied by the owning `SessionTab`.
-    let onOpenInFiles: (String) -> Void
 
-    /// The file whose diff is shown. View state, keyed per tab by the parent's
-    /// `.id(tab.id)`, so it survives page flips but not session switches.
-    @State private var selectedPath: String?
-    /// Memoized changed-file list (mirrors `FileBrowserView.RowMemo`): the
-    /// body reads it many times per pass, and filtering a large dictionary
-    /// every read would be O(files) per read.
-    @State private var listMemo = ChangedListMemo()
-    /// Bumped when a file-change event names the diffed file (or a turn end,
-    /// which does not name one), so a live edit to the file being reviewed
-    /// re-reads its hunks. The file browser has its own token for its own
-    /// selection; sharing one would reload the wrong pane.
-    @State private var reloadToken = 0
-    /// Find-in-diff state for the open hunks buffer (Cmd+F). Owned here so it
-    /// survives page flips, and reset on a session switch with the page.
+    /// Find-in-diff state for the whole viewer (Cmd+F).
     @State private var search = CodeSearchModel()
-
-    /// The changed files in a stable review order (by path). `FileEntry` is a
-    /// value type, so the memo holds copies, never the store's dictionary.
-    private var changedEntries: [GitStatus.FileEntry] {
-        if listMemo.version != store.version {
-            listMemo.version = store.version
-            listMemo.entries = store.fileEntries.values
-                .filter { $0.kind != .normal }
-                .sorted { $0.path < $1.path }
-        }
-        return listMemo.entries
-    }
-
-    private var selectedEntry: GitStatus.FileEntry? {
-        guard let selectedPath else { return nil }
-        return changedEntries.first { $0.path == selectedPath }
-    }
-
-    private var selectedIndex: Int {
-        guard let selectedPath else { return -1 }
-        return changedEntries.firstIndex { $0.path == selectedPath } ?? -1
-    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -77,45 +32,27 @@ struct ChangesView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear { reconcileSelection() }
-        // The page became visible: apply the selection policy against the
-        // latest snapshot (a hidden mount skipped it) — the mirror of the file
-        // browser's activation catch-up.
         .onChange(of: pageActive) { _, active in
             if active { reconcileSelection() }
         }
-        // A refresh can add the first change, remove the selected file (it was
-        // reverted), or reorder nothing (sort is stable). Keep the selection
-        // pointing at a file that still exists.
-        .onChange(of: store.version) { _, _ in
+        .onChange(of: store.listVersion) { _, _ in
             reconcileSelection()
-        }
-        // Reload the open diff when the agent touches the file it shows (or
-        // when a turn settles and any file may have changed). A file the user
-        // isn't reviewing must not reload the pane out from under them.
-        .onReceive(NotificationCenter.default.publisher(for: GitStatus.didChangeNotification)) { note in
-            guard (note.userInfo?["cwd"] as? URL) == store.cwd else { return }
-            let path = note.userInfo?["path"] as? String
-            if path == nil || path == selectedPath {
-                reloadToken &+= 1
-            }
         }
     }
 
     // MARK: - Selection
 
-    /// Points the selection at an existing changed file: keeps it if it is
-    /// still changed, otherwise falls back to the first (or clears when there
-    /// is nothing changed).
+    /// Keeps the selected file valid: keeps it while it is still changed,
+    /// otherwise falls back to the first (or clears when nothing changed).
     private func reconcileSelection() {
-        let entries = changedEntries
-        guard !entries.isEmpty else {
-            selectedPath = nil
+        guard !store.entries.isEmpty else {
+            store.selectedPath = nil
             return
         }
-        if let selectedPath, entries.contains(where: { $0.path == selectedPath }) {
+        if let selected = store.selectedPath, store.entries.contains(where: { $0.path == selected }) {
             return
         }
-        selectedPath = entries.first?.path
+        store.selectedPath = store.entries.first?.path
     }
 
     // MARK: - Changed-files list
@@ -124,7 +61,7 @@ struct ChangesView: View {
         VStack(spacing: 0) {
             listHeader
             Divider()
-            if changedEntries.isEmpty {
+            if store.entries.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "checkmark.circle")
                         .font(.system(size: 26))
@@ -139,20 +76,19 @@ struct ChangesView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                // Keeps the selected row visible when the selection changes
-                // underneath the user (e.g. the reviewed file was reverted and
-                // the fallback picks the first changed file).
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 0) {
-                            ForEach(changedEntries, id: \.path) { entry in
+                            ForEach(store.entries, id: \.path) { entry in
                                 fileRow(entry)
                                     .id(entry.path)
                             }
                         }
                         .padding(4)
                     }
-                    .onChange(of: selectedPath) { _, path in
+                    // The scroll spy moves the selection as the user scrolls the
+                    // viewer: keep the highlighted row visible.
+                    .onChange(of: store.selectedPath) { _, path in
                         guard let path else { return }
                         withAnimation(.easeInOut(duration: 0.15)) {
                             proxy.scrollTo(path, anchor: .center)
@@ -168,8 +104,8 @@ struct ChangesView: View {
             Text("Changed Files")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
-            if !changedEntries.isEmpty {
-                Text("\(changedEntries.count)")
+            if !store.entries.isEmpty {
+                Text("\(store.entries.count)")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 5)
@@ -183,9 +119,9 @@ struct ChangesView: View {
     }
 
     private func fileRow(_ entry: GitStatus.FileEntry) -> some View {
-        let isSelected = entry.path == selectedPath
+        let isSelected = entry.path == store.selectedPath
         return Button {
-            selectedPath = entry.path
+            store.reveal(entry.path)
         } label: {
             HStack(spacing: 6) {
                 kindBadge(entry.kind)
@@ -206,78 +142,60 @@ struct ChangesView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Show the diff for \(entry.path)")
+        .help("Scroll to \(entry.path)")
         .accessibilityLabel("\(entry.path) — show diff")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
-    // MARK: - Diff pane
+    // MARK: - Diff viewer
 
     private var diffArea: some View {
         VStack(spacing: 0) {
-            diffHeader
+            viewerHeader
             Divider()
-            if let entry = selectedEntry {
-                ReadOnlyFilePane(
-                    cwd: store.cwd,
-                    path: entry.path,
-                    kind: entry.kind,
-                    reloadToken: reloadToken,
-                    pageActive: pageActive,
-                    mode: .hunks,
-                    // Cmd+F / Cmd+G drive this page's find bar against the
-                    // diff buffer.
-                    search: search
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+            if store.entries.isEmpty {
                 ContentUnavailableView(
                     "No changes",
                     systemImage: "checkmark.circle",
                     description: Text("The working tree matches HEAD. Edit a file and its diff appears here.")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                DiffBrowserView(
+                    store: store,
+                    documentVersion: store.documentVersion,
+                    revealPath: store.revealPath,
+                    onRevealConsumed: { store.consumeReveal() },
+                    onTopSectionChanged: { store.setTopSection($0) },
+                    pageActive: pageActive,
+                    search: search
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
-    private var diffHeader: some View {
+    private var viewerHeader: some View {
         HStack(spacing: 8) {
-            if let entry = selectedEntry {
-                kindBadge(entry.kind, large: true)
-                Button {
-                    onOpenInFiles(entry.path)
-                } label: {
-                    HStack(spacing: 5) {
-                        Text(entry.path)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Image(systemName: "arrow.up.forward.square")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
-                    .contentShape(Rectangle())
+            if let selected = store.selectedPath {
+                Text(selected)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let index = store.entries.firstIndex(where: { $0.path == selected }) {
+                    Text("\(index + 1) of \(store.entries.count)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.plain)
-                .help("Open the full file in the Files page")
-                statsView(entry)
             } else {
                 Text("Changes")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-            if !changedEntries.isEmpty {
-                Text("\(max(selectedIndex, 0) + 1) of \(changedEntries.count)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            // Find in the diff (Cmd+F) — the counterpart of the Files page's
-            // find bar, scoped to the hunks buffer on screen.
             if search.isVisible {
-                CodeSearchBar(model: search, placeholder: "Find in diff…")
+                CodeSearchBar(model: search, placeholder: "Find in diffs…")
             }
         }
         .padding(.horizontal, 16)
@@ -328,12 +246,4 @@ struct ChangesView: View {
                 .accessibilityHidden(true)
         }
     }
-}
-
-/// Cache for the memoized changed-file list. A class so a body evaluation can
-/// refresh it without writing `@State` (which would re-invalidate the view).
-@MainActor
-private final class ChangedListMemo {
-    var version = -1
-    var entries: [GitStatus.FileEntry] = []
 }

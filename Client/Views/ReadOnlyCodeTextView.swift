@@ -11,11 +11,11 @@ extension NSPasteboard.PasteboardType {
     static let codeReference = NSPasteboard.PasteboardType("com.gterzian.uni03c0.code-reference")
 }
 
-/// A read-only, selectable code text view — the file browser content pane's
-/// real-buffer view (§1.3/§2.6). The buffer is always the actual text of the
-/// file on disk (or, for a deletion, its last-committed content), so line
-/// numbers and selections mean exactly what they say, and the syntax + edit
-/// overlays are attributes layered on top by the pane.
+/// A read-only, selectable code text view — the diff viewer's real-buffer view
+/// (§1.3/§2.6). The buffer is always actual file text (one file's lines, or an
+/// interleaved multi-file diff), so line numbers and selections mean exactly
+/// what they say, and the syntax + edit overlays are attributes layered on top
+/// by the owner.
 ///
 /// Copy is the mechanism behind the frozen reference: `copy(_:)` maps the
 /// selection to 1-based lines via a per-load offset table, and writes the
@@ -24,8 +24,17 @@ extension NSPasteboard.PasteboardType {
 /// and can be compiled directly into the renderer test bundles.
 final class ReadOnlyCodeTextView: NSTextView {
     /// The absolute path of the file whose content the buffer holds (the
-    /// reference's `absolutePath`). Empty until a file is loaded.
+    /// reference's `absolutePath`). Empty until a file is loaded. For a
+    /// multi-file buffer (the diff viewer) this is the fallback when a
+    /// selection falls outside every `sectionPaths` entry.
     private(set) var absolutePath = ""
+    /// For a multi-file buffer (the diff viewer): the character range each
+    /// file's diff lines occupy, so a copy tags the reference with the file the
+    /// selection is actually in. Headers/expand rows are deliberately absent —
+    /// copying them writes a plain string, not a reference.
+    private var sectionPaths: [(range: NSRange, absolutePath: String)] = []
+    /// Clicks on links in the buffer (the diff viewer's expand controls).
+    var onLinkClick: ((URL) -> Void)?
     /// Start offset (UTF-16) of every line, ascending, built once per load.
     /// `lineStartOffsets[k]` is where line k+1 begins; the line's end is the
     /// next entry (or the text length for the last line). The final entry is
@@ -247,6 +256,7 @@ final class ReadOnlyCodeTextView: NSTextView {
     func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
+        sectionPaths = []
         // The whole buffer is being replaced: the previous search paint's
         // ledger points into the OLD storage and must not be replayed onto the
         // new one (the caller re-applies the search after a load).
@@ -274,11 +284,27 @@ final class ReadOnlyCodeTextView: NSTextView {
         lineStartOffsets = offsets
     }
 
+    /// Registers the file each character range belongs to (a multi-file diff
+    /// buffer). Ranges are the files' DIFF LINES only, so copying a header or
+    /// an expand row falls back to a plain copy rather than a bogus reference.
+    func setSectionPaths(_ paths: [(range: NSRange, absolutePath: String)]) {
+        sectionPaths = paths
+    }
+
+    /// The absolute path owning a character index, falling back to
+    /// `absolutePath` for a single-file buffer.
+    private func path(at index: Int) -> String {
+        for entry in sectionPaths where NSLocationInRange(index, entry.range) {
+            return entry.absolutePath
+        }
+        return absolutePath
+    }
+
     /// The 1-based line containing character `index` (0 ≤ index < length).
-    /// `fileprivate` so the line-number ruler (same file) resolves each visible
-    /// fragment to the SAME per-load offset table the copy machinery uses — one
-    /// source of truth for "which line is this" across the pane.
-    fileprivate func lineNumber(forIndex index: Int) -> Int {
+    /// Internal so the diff viewer's container can resolve the scroll spy's
+    /// top-of-viewport line to the section that owns it — one source of truth
+    /// for "which line is this" across the code views.
+    func lineNumber(forIndex index: Int) -> Int {
         let offsets = lineStartOffsets
         var low = 0
         var high = offsets.count - 1
@@ -380,7 +406,7 @@ final class ReadOnlyCodeTextView: NSTextView {
         let endLine = realLineNumber(forIndex: selection.location + selection.length - 1)
         let snippet = realSnippet(for: selection)
         let reference = CodeReference(
-            absolutePath: absolutePath,
+            absolutePath: path(at: selection.location),
             startLine: startLine,
             endLine: endLine,
             snippet: snippet
@@ -413,6 +439,21 @@ final class ReadOnlyCodeTextView: NSTextView {
 extension ReadOnlyCodeTextView: NSTextViewDelegate {
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
         false
+    }
+
+    /// Forwards a link click (the diff viewer's expand controls) to
+    /// `onLinkClick`. Other schemes fall through to AppKit.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let onLinkClick else { return false }
+        if let url = link as? URL {
+            onLinkClick(url)
+            return true
+        }
+        if let string = link as? String, let url = URL(string: string) {
+            onLinkClick(url)
+            return true
+        }
+        return false
     }
 }
 

@@ -2,18 +2,17 @@ import AppKit
 import Core
 import XCTest
 
-/// Pins the file pane's SCROLLBAR edit map (`CodePaneEditMarkerScroller`,
-/// installed by `FilePaneContainer`): edit lines become colored ticks at their
-/// exact document fraction, whole-file edits tint the whole track, and every
-/// load replaces the previous map. The files are loaded WHOLE into the text
-/// view (no incremental loading), so markers are always exact positions —
-/// these tests freeze the mapping arithmetic that would change if that ever
-/// became windowed.
+/// Pins the diff viewer's SCROLLBAR edit map (`CodePaneEditMarkerScroller`,
+/// installed by `CodePaneContainer`): changed display lines become colored ticks
+/// at their exact document fraction, and every document swap replaces the
+/// previous map. The whole document is in the text view (no incremental
+/// loading), so markers are always exact positions — these tests freeze the
+/// mapping arithmetic that would change if that ever became windowed.
 final class FilePaneScrollbarMarkerTests: XCTestCase {
-    /// A container hosting a 900-line file, laid out in an offscreen window.
+    /// A container hosting a 900-line document, laid out in an offscreen window.
     @MainActor
-    private func makeContainer() -> FilePaneContainer {
-        let container = FilePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    private func makeContainer() -> CodePaneContainer {
+        let container = CodePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
             styleMask: [.titled],
@@ -32,44 +31,33 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         return NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
     }
 
-    private func scroller(of container: FilePaneContainer) -> CodePaneEditMarkerScroller? {
+    private func scroller(of container: CodePaneContainer) -> CodePaneEditMarkerScroller? {
         container.scrollView.verticalScroller as? CodePaneEditMarkerScroller
     }
 
     @MainActor
     func testEditMapInstallsAMarkerScroller() {
-        // The scroll view must be using the marker subclass, and assigning a
-        // subclass forces the legacy (always-visible) style — the edit map is
-        // only useful while the bar is shown.
         let container = makeContainer()
-        XCTAssertNotNil(scroller(of: container), "the pane's vertical scroller is the marker subclass")
+        XCTAssertNotNil(scroller(of: container), "the viewer's vertical scroller is the marker subclass")
     }
 
     @MainActor
     func testEditedLinesBecomeTicksAtTheirDocumentFraction() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         let markers = scroller(of: container)?.markers ?? []
         XCTAssertEqual(markers.count, 2, "one tick per edited line")
-        // (line − 0.5) / lineCount — line 10 near the top, 858 near the bottom.
         XCTAssertEqual(markers[0].fraction, (10.0 - 0.5) / 900.0, accuracy: 0.001, "line 10 maps to its document fraction")
         XCTAssertEqual(markers[1].fraction, (858.0 - 0.5) / 900.0, accuracy: 0.001, "line 858 maps to its document fraction")
         XCTAssertEqual(markers[0].color, .systemGreen, "added lines are green (matches the text overlay)")
-        XCTAssertNil(scroller(of: container)?.wholeTrackColor)
     }
 
     @MainActor
     func testRemovedLinesBecomeRedTicks() {
         let container = makeContainer()
-        container.displayContent(
-            path: "/tmp/x.swift",
-            text: paneText(),
-            preserveScroll: false,
-            targetLines: nil,
-            markers: .lines(added: [10], removed: [858])
-        )
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10], removed: [858]))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         let markers = scroller(of: container)?.markers ?? []
@@ -81,43 +69,23 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     }
 
     @MainActor
-    func testWholeFileEditsTintTheTrack() {        let container = makeContainer()
-        container.displayContent(path: "/tmp/new.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .wholeAdded)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
-        XCTAssertNotNil(scroller(of: container)?.wholeTrackColor, "a brand-new file tints the whole track")
-        XCTAssertTrue(scroller(of: container)?.markers.isEmpty ?? false)
-
-        container.displayContent(path: "/tmp/gone.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .wholeDeleted)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
-        XCTAssertNotNil(scroller(of: container)?.wholeTrackColor, "a deleted file tints the whole track (the removed side)")
-    }
-
-    @MainActor
     func testEachLoadReplacesThePreviousMap() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [100], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [100], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertEqual(scroller(of: container)?.markers.count, 1)
 
-        // A plain reload of an unedited file clears the map.
-        container.displayContent(path: "/tmp/clean.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .none)
+        container.displayDocument(path: "/tmp/clean.swift", text: paneText(), markers: .none)
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertTrue(scroller(of: container)?.markers.isEmpty ?? false, "ticks clear on a load with no edits")
-        XCTAssertNil(scroller(of: container)?.wholeTrackColor)
     }
 
     @MainActor
     func testBatchedDrawingPaintsEveryTickAtItsFraction() {
-        // The scroller batches same-color ticks into ONE path + ONE fill (see
-        // `EditMarkerScroller.drawEditMarkers`); this pins that the batched
-        // drawing still paints a tick for EVERY marker at its mapped track
-        // position — a grouping bug would drop ticks or pile them at one spot.
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
-        // Scroll to the middle so the knob (which covers whatever it overlaps)
-        // sits mid-track and neither edge tick hides under it.
         let clip = container.scrollView.contentView
         clip.scroll(to: NSPoint(x: 0, y: 6000))
         container.scrollView.reflectScrolledClipView(clip)
@@ -127,8 +95,6 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         guard let rep = scroller.bitmapImageRepForCachingDisplay(in: scroller.bounds) else { return XCTFail("could not rasterize the scroller") }
         scroller.cacheDisplay(in: scroller.bounds, to: rep)
 
-        // Scan for green-dominant pixels (the added-line tick color) and
-        // collect their row bands.
         let scale = CGFloat(rep.pixelsWide) / scroller.bounds.width
         var bands: [(start: CGFloat, end: CGFloat)] = []
         var inBand = false
@@ -157,8 +123,6 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         guard bands.count == 2 else { return }
         let centers = bands.map { ($0.start + $0.end) / 2 }
         let height = scroller.bounds.height
-        // Line 10 sits at fraction ~0.01, line 858 at ~0.95 of the document —
-        // their ticks must land at the corresponding ends of the track.
         XCTAssertLessThan(centers[0] / height, 0.12, "the top tick paints near the top of the track")
         XCTAssertGreaterThan(centers[1] / height, 0.85, "the bottom tick paints near the bottom of the track")
         XCTAssertLessThan(centers[0], centers[1], "ticks keep document order")

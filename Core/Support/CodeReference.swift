@@ -2,7 +2,7 @@ import Foundation
 
 /// A frozen code reference: an exact `path:line-line` anchor plus the snippet
 /// of code that was visible when the reference was made. Produced by the
-/// read-only code view (file browser content pane) when the user copies a
+/// read-only code view (read-only code view) when the user copies a
 /// selection, carried on the pasteboard in two representations (§1.2), and
 /// rendered into prompt text by whichever composer the paste lands in.
 ///

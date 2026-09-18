@@ -39,8 +39,8 @@ import SwiftUI
 /// reload positioned at the tail.
 struct TranscriptView: NSViewRepresentable {
     let viewModel: SessionViewModel
-    /// Whether the conversation page (not the session's Files page) is the one
-    /// currently shown. The view stays mounted while the Files page is up —
+    /// Whether the conversation page (not the session's Changes page) is the one
+    /// currently shown. The view stays mounted while the Changes page is up —
     /// hidden, doing zero per-delta work — so switching pages never rebuilds
     /// or re-measures the transcript (a rebuilt transcript used to show a
     /// blank conversation until a tab switch forced a reload).
@@ -199,8 +199,8 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// pass happens on return to the foreground (rather than every delta).
     private var needsCatchUp = false
 
-    /// Whether the CONVERSATION page (not the session's Files page) is the one
-    /// currently shown. While the Files page is up the transcript stays mounted
+    /// Whether the CONVERSATION page (not the session's Changes page) is the one
+    /// currently shown. While the Changes page is up the transcript stays mounted
     /// but hidden (a page switch never rebuilds or re-measures it — that was
     /// the blank-transcript bug), so per-delta rendering is gated exactly like
     /// occlusion: zero work, one catch-up pass on return. Also gates the window
@@ -542,7 +542,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// Cmd+Up / Cmd+Down cycled to a user message. Runs on the main actor
     /// (from the nonisolated monitor closure via `MainActor.assumeIsolated`):
     /// every check is main-actor state, and the transcript hotkeys only act
-    /// while the conversation page is up — on the Files page the keys pass
+    /// while the conversation page is up — on the Changes page the keys pass
     /// through to whatever is focused there. Returns whether the event was
     /// consumed (nil to AppKit = consumed).
     @MainActor
@@ -614,7 +614,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// The conversation page became visible again (the user switched back from
-    /// the Files page): one catch-up pass for anything that streamed while the
+    /// the Changes page): one catch-up pass for anything that streamed while the
     /// page was hidden. Runs UNCONDITIONALLY on activation — `applyModelChanges`
     /// is cheap when nothing changed (generation equal, nothing streaming) and
     /// materializing on every activation makes a blank conversation impossible
@@ -1841,7 +1841,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let isCurrent = currentSearchRowID == entry.id
         let caseSensitive = viewModel?.isCaseSensitive ?? false
         // Agent-emitted file references in this row's text open in this
-        // session's file browser (see `openFileReference` below). The row has
+        // session's Changes viewer (see `openFileReference` below). The row has
         // no reference back to the coordinator — the closure is threaded down
         // like the tool cards' expand callback.
         let openReferenceHandler: (FileReferenceLink) -> Void = { [weak self] link in
@@ -2176,11 +2176,11 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     /// A clicked agent-emitted file reference (`pi-file://` link) opens the
-    /// referenced file in this session's file browser. The coordinator has no
+    /// referenced file in this session's Changes viewer. The coordinator has no
     /// `SessionTab` (and never should) — it posts the same cwd-keyed
     /// `NotificationCenter` shape `SessionTab`'s own file-change signal uses,
-    /// and the owning tab's observer switches to the Files page and drives the
-    /// browser store (selection, tree reveal, scroll to the reference line).
+    /// and the owning tab's observer switches to the Changes page and scrolls
+    /// the viewer to the file when it is part of the changeset.
     /// `viewModel` is weak, so it is guarded like every other access.
     private func openFileReference(_ link: FileReferenceLink) {
         guard let cwd = viewModel?.cwd else { return }

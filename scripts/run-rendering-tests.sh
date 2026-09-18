@@ -96,7 +96,8 @@ swiftc -swift-version 6 -default-isolation MainActor \
   Client/Views/CodeCopyButton.swift \
   Client/Views/MarkdownText.swift \
   Client/Views/ReadOnlyCodeTextView.swift \
-  Client/Views/ReadOnlyFilePane.swift \
+  Client/Views/CodePaneContainer.swift \
+  Client/Support/DiffLoading.swift \
   Client/Views/TextRowView.swift \
   RenderingTests/*.swift \
   -I "$CORE_MODS" -I "$SUB_MODS" -I "$SYS_MODS" -I "$SHIM_INC" \

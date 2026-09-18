@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// The find bar for a code pane (the Files page's open file or the Changes
-/// page's diff). The counterpart of the session's `SessionSearchBar`, but for
-/// one in-memory buffer instead of the whole conversation: the match count is
-/// known immediately, so there is no "searching…" state to show. Cmd+F opens
-/// it, Enter / ⇧Enter cycle, Esc closes.
+/// The find bar for the Changes diff viewer. The counterpart of the session's
+/// `SessionSearchBar`, but for one in-memory buffer instead of the whole
+/// conversation: the match count is known immediately, so there is no
+/// "searching…" state to show. Cmd+F opens it, Enter / ⇧Enter cycle, Esc
+/// closes.
 struct CodeSearchBar: View {
     @Bindable var model: CodeSearchModel
     let placeholder: String

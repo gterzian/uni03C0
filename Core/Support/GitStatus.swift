@@ -2,7 +2,7 @@ import Foundation
 import Subprocess
 import System
 
-/// Git plumbing behind the file browser and the "N edited" gating button.
+/// Git plumbing behind the Changes viewer and the "N edited" gating button.
 ///
 /// The app itself is not sandboxed (the seatbelt policy applies to agent
 /// subprocesses only), so spawning git from here is unconstrained; the spawns
@@ -81,7 +81,7 @@ public enum GitStatus {
     /// changed, or nil when the whole turn settled, the app returned, or any
     /// file may have changed). A payload is needed (unlike
     /// `FontSettings.didChangeNotification`, which posts no payload) because
-    /// more than one project's file browser window can be open at once, each
+    /// more than one project's Changes viewer can be open at once, each
     /// caring only about its own `cwd`.
     public static let didChangeNotification = Notification.Name("GitStatus.didChange")
 
