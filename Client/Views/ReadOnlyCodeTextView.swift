@@ -158,6 +158,84 @@ final class ReadOnlyCodeTextView: NSTextView {
         }
     }
 
+    // MARK: - Find-in-buffer highlight
+
+    /// The ranges currently carrying a search-match backdrop, in document
+    /// order (a test hook and the overlay ledger).
+    private(set) var searchHighlightRanges: [NSRange] = []
+    /// Index into `searchHighlightRanges` painted with the stronger "current"
+    /// shade, -1 when none.
+    private(set) var currentSearchHighlightIndex = -1
+    /// The backgrounds that sat under each painted match, captured before the
+    /// search shade replaced them so `clearSearchHighlight` can restore them.
+    /// Without this ledger, clearing would strip the edit overlay's red/green
+    /// line fills wherever a match overlapped one.
+    private var searchOverlay: [(range: NSRange, background: NSColor?)] = []
+
+    /// Paints find-in-buffer highlights over `ranges`: every match in the pale
+    /// shade, `currentIndex` in the stronger one. Any previous search paint is
+    /// restored first, so this is idempotent. Ranges are display-offset ranges
+    /// into the current buffer (an interleaved diff's removed lines included).
+    func applySearchHighlight(ranges: [NSRange], currentIndex: Int) {
+        clearSearchHighlight()
+        guard let storage = textStorage else { return }
+        let length = storage.length
+        for (index, range) in ranges.enumerated() {
+            let clamped = NSIntersectionRange(range, NSRange(location: 0, length: length))
+            guard clamped.length > 0 else { continue }
+            captureSearchOverlay(in: storage, range: clamped)
+            let color = index == currentIndex ? SearchMatchHighlight.current : SearchMatchHighlight.match
+            storage.addAttribute(.backgroundColor, value: color, range: clamped)
+        }
+        searchHighlightRanges = ranges
+        currentSearchHighlightIndex = currentIndex
+    }
+
+    /// Removes the search highlight and restores whatever background the edit
+    /// overlay had underneath it.
+    func clearSearchHighlight() {
+        guard let storage = textStorage else { return }
+        let length = storage.length
+        for entry in searchOverlay where NSMaxRange(entry.range) <= length {
+            if let background = entry.background {
+                storage.addAttribute(.backgroundColor, value: background, range: entry.range)
+            } else {
+                storage.removeAttribute(.backgroundColor, range: entry.range)
+            }
+        }
+        searchOverlay = []
+        searchHighlightRanges = []
+        currentSearchHighlightIndex = -1
+    }
+
+    /// Records the background value under `range` (disjoint per match, so the
+    /// entries never overlap).
+    private func captureSearchOverlay(in storage: NSTextStorage, range: NSRange) {
+        storage.enumerateAttribute(.backgroundColor, in: range) { value, subrange, _ in
+            searchOverlay.append((subrange, value as? NSColor))
+        }
+    }
+
+    /// All non-overlapping occurrences of `query` in `text`, case-insensitive
+    /// by default. The pure half of find-in-buffer — the pane paints and
+    /// scrolls the ranges this returns.
+    nonisolated static func searchRanges(of query: String, in text: String, caseSensitive: Bool) -> [NSRange] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty, !text.isEmpty else { return [] }
+        let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        let ns = text as NSString
+        var ranges: [NSRange] = []
+        var location = 0
+        while location < ns.length {
+            let search = NSRange(location: location, length: ns.length - location)
+            let found = ns.range(of: needle, options: options, range: search)
+            guard found.location != NSNotFound else { break }
+            ranges.append(found)
+            location = found.location + max(found.length, 1)
+        }
+        return ranges
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -169,6 +247,12 @@ final class ReadOnlyCodeTextView: NSTextView {
     func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
+        // The whole buffer is being replaced: the previous search paint's
+        // ledger points into the OLD storage and must not be replayed onto the
+        // new one (the caller re-applies the search after a load).
+        searchOverlay = []
+        searchHighlightRanges = []
+        currentSearchHighlightIndex = -1
         textStorage?.setAttributedString(text)
         rebuildLineOffsets()
         sizeToFit()

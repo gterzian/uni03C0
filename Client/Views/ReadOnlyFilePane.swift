@@ -2,6 +2,26 @@ import AppKit
 import Core
 import SwiftUI
 
+/// The find-in-buffer surface a code pane exposes to the page that owns it.
+/// The concrete implementation (`CodeSearchModel`) is `@Observable`; the pane
+/// depends on this protocol rather than that class so the renderer test bundle
+/// can compile the pane without the Observation macro plugin (blocked in the
+/// test sandbox). The pane only forwards the keyboard find commands and buffer
+/// reloads to the model — the model drives the highlighting and scrolling
+/// through `FilePaneContainer`'s own methods.
+@MainActor
+protocol CodeSearching: AnyObject {
+    var isVisible: Bool { get }
+    func attach(_ container: FilePaneContainer)
+    func toggle()
+    func next()
+    func previous()
+    func close()
+    /// The pane replaced the buffer (a load, a live refresh, a file switch):
+    /// re-run the current query against the new text.
+    func bufferDidChange()
+}
+
 /// The file browser's content pane: a real, current (or, for a deletion,
 /// last-committed) file buffer in a `ReadOnlyCodeTextView`, with edit-coloring
 /// applied as attributes on top of syntax highlighting. For a modification the
@@ -60,6 +80,10 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     /// identity, so a mode change (never happens for one representable
     /// instance) would reload.
     var mode: LoadMode = .wholeFile
+    /// The owning page's find-in-buffer model (nil for a pane with no search
+    /// bar). The pane forwards Cmd+F/Cmd+G to it and re-runs its query after
+    /// every load; the model paints/scrolls through the container.
+    var search: (any CodeSearching)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -68,6 +92,11 @@ struct ReadOnlyFilePane: NSViewRepresentable {
     func makeNSView(context: Context) -> FilePaneContainer {
         let container = FilePaneContainer()
         context.coordinator.container = container
+        // Cmd+F / Cmd+G while this pane's page is the visible one. A local key
+        // monitor (the transcript coordinator's technique) so it always acts
+        // on the pane actually on screen; the coordinator bails unless its
+        // page is active and its window is key.
+        context.coordinator.installKeyMonitor()
         // A light/dark change (app toggle or system) must re-highlight the
         // open file: Highlightr caches the resolved theme once, so the pane
         // asks its coordinator to rebuild the attributed buffer.
@@ -92,6 +121,11 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             reference: pendingReference?.path == path ? pendingReference : nil,
             onReferenceConsumed: onReferenceConsumed
         )
+        context.coordinator.setSearch(search)
+    }
+
+    static func dismantleNSView(_ nsView: FilePaneContainer, coordinator: Coordinator) {
+        coordinator.teardown()
     }
 
     /// The pane fills whatever slot SwiftUI gives it; it must NEVER size itself
@@ -161,6 +195,10 @@ struct ReadOnlyFilePane: NSViewRepresentable {
         /// A light/dark change arrived while the Files page was hidden: run the
         /// re-highlight once on activation instead of for an off-screen pane.
         private var pendingAppearanceRefresh = false
+        /// The owning page's find-in-buffer model (see `ReadOnlyFilePane.search`).
+        private weak var search: (any CodeSearching)?
+        /// The local key monitor forwarding Cmd+F/Cmd+G to `search`.
+        private var keyMonitor: Any?
         private let highlighter = SyntaxHighlighter()
         private let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         private let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
@@ -212,6 +250,15 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 if let accepted, !isDisplayed(accepted) {
                     deferred = accepted
                 }
+                // The page is hidden while its find field held focus: hand
+                // focus back to the pane, so keystrokes don't land in an
+                // invisible field (the query is kept for when the page
+                // returns).
+                if let container, let window = container.window,
+                   let editor = window.firstResponder as? NSTextView,
+                   editor.delegate is NSSearchField {
+                    window.makeFirstResponder(container.codeView)
+                }
             }
         }
 
@@ -220,6 +267,72 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 && request.token == displayedToken
                 && request.kind == displayedKind
                 && request.mode == displayedMode
+        }
+
+        // MARK: - Find in buffer
+
+        /// Binds the owning page's search model: the model attaches to this
+        /// pane's container so it can search/highlight/scroll the live buffer.
+        /// A no-op when the same model is already bound.
+        func setSearch(_ model: (any CodeSearching)?) {
+            if let existing = search, let model, existing === model { return }
+            if search == nil, model == nil { return }
+            search = model
+            if let model, let container {
+                model.attach(container)
+            }
+        }
+
+        /// Installs the Cmd+F / Cmd+G local key monitor. See
+        /// `handleSearchShortcut` for the gating.
+        func installKeyMonitor() {
+            guard keyMonitor == nil else { return }
+            let handler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
+                let key = event.keyCode
+                guard key == 3 || key == 5, // F / G
+                      event.modifierFlags.contains(.command),
+                      !event.modifierFlags.contains(.option),
+                      !event.modifierFlags.contains(.control) else { return event }
+                guard let self else { return event }
+                let isShift = event.modifierFlags.contains(.shift)
+                let consume = MainActor.assumeIsolated {
+                    self.handleSearchShortcut(key: key, isShift: isShift)
+                }
+                return consume ? nil : event
+            }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
+        }
+
+        /// Cmd+F toggles this pane's find bar, Cmd+G / ⇧Cmd+G cycle its
+        /// matches. Only the pane whose page is actually visible handles the
+        /// key (the other page's pane is mounted but hidden, exactly like the
+        /// transcript's page gating), and only while this window is key — so
+        /// the key never reaches a background tab's pane. The transcript's own
+        /// Cmd+F monitor consumes first when the conversation is showing.
+        @MainActor
+        private func handleSearchShortcut(key: UInt16, isShift: Bool) -> Bool {
+            guard isActive, let search, let container else { return false }
+            guard container.window?.isKeyWindow == true, container.window?.attachedSheet == nil else { return false }
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+            switch key {
+            case 3: // Cmd+F
+                search.toggle()
+                return true
+            case 5: // Cmd+G / ⇧Cmd+G
+                guard search.isVisible else { return false }
+                if isShift { search.previous() } else { search.next() }
+                return true
+            default:
+                return false
+            }
+        }
+
+        /// Removes the key monitor (view dismantled).
+        func teardown() {
+            if let keyMonitor {
+                NSEvent.removeMonitor(keyMonitor)
+                self.keyMonitor = nil
+            }
         }
 
         func reload(cwd: URL, path: String, kind: GitStatus.Kind, token: Int, mode: ReadOnlyFilePane.LoadMode = .wholeFile, reference: FileReferenceLink?, onReferenceConsumed: (() -> Void)?) {
@@ -328,6 +441,9 @@ struct ReadOnlyFilePane: NSViewRepresentable {
             displayedToken = request.token
             displayedKind = request.kind
             displayedMode = request.mode
+            // The buffer changed under an active find: re-run the query on the
+            // new text (a file switch or a live refresh keeps the search).
+            search?.bufferDidChange()
         }
 
         /// Re-runs syntax highlighting for the displayed buffer with the
@@ -353,6 +469,9 @@ struct ReadOnlyFilePane: NSViewRepresentable {
                 markers: paneMarkers(for: displayedOverlay),
                 lineNumbers: displayedLineNumbers
             )
+            // The re-render replaced the buffer, dropping the search paint:
+            // restore it with the current appearance's shades.
+            search?.bufferDidChange()
         }
 
         /// The scrollbar edit map for an overlay — the same mapping the load
@@ -928,5 +1047,60 @@ final class FilePaneContainer: NSView {
         codeView.load(path: "", text: NSAttributedString(string: ""))
         statusLabel.stringValue = message
         statusLabel.isHidden = false
+    }
+
+    // MARK: - Find in buffer
+
+    /// Paints find-in-buffer highlights in the code view (see
+    /// `ReadOnlyCodeTextView.applySearchHighlight`).
+    func applySearchHighlight(ranges: [NSRange], currentIndex: Int) {
+        codeView.applySearchHighlight(ranges: ranges, currentIndex: currentIndex)
+    }
+
+    /// Removes the find-in-buffer highlights, restoring the edit overlay.
+    func clearSearchHighlight() {
+        codeView.clearSearchHighlight()
+    }
+
+    /// Scrolls a match (a display-offset range into the current buffer) to the
+    /// vertical center of the viewport. Uses the layout manager's own rects
+    /// and AppKit's view conversion, exactly like the reference reveal, so the
+    /// match lands centered whatever the tiling offset.
+    func revealSearchMatch(_ range: NSRange) {
+        guard let layoutManager = codeView.layoutManager,
+              let textContainer = codeView.textContainer,
+              range.location >= 0, range.length > 0,
+              NSMaxRange(range) <= (codeView.string as NSString).length else { return }
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        layoutManager.ensureLayout(forGlyphRange: glyphRange)
+        let box = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        let matchCenterInClip = scrollView.contentView.convert(
+            NSPoint(x: 0, y: box.midY + codeView.textContainerInset.height),
+            from: codeView
+        ).y
+        let clip = scrollView.contentView
+        let target = max(0, matchCenterInClip - clip.bounds.height / 2)
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: target))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    /// The character index at the top of the viewport — where a fresh find
+    /// starts, so Cmd+F deep in a file lands on the next match below rather
+    /// than yanking to line 1.
+    var topVisibleCharacterIndex: Int {
+        guard let layoutManager = codeView.layoutManager,
+              let textContainer = codeView.textContainer,
+              layoutManager.numberOfGlyphs > 0 else { return 0 }
+        let clip = scrollView.contentView
+        let topInCodeView = clip.convert(NSPoint(x: 0, y: clip.bounds.minY), to: codeView)
+        let point = NSPoint(
+            x: codeView.textContainerInset.width,
+            y: max(0, topInCodeView.y - codeView.textContainerInset.height)
+        )
+        // A point past the last line resolves to the one-past-the-end glyph
+        // index, which `characterIndexForGlyph(at:)` rejects: clamp into the
+        // glyph range (the search only needs a lower bound anyway).
+        let glyphIndex = min(max(layoutManager.glyphIndex(for: point, in: textContainer), 0), layoutManager.numberOfGlyphs - 1)
+        return layoutManager.characterIndexForGlyph(at: glyphIndex)
     }
 }

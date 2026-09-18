@@ -42,6 +42,9 @@ struct ChangesView: View {
     /// re-reads its hunks. The file browser has its own token for its own
     /// selection; sharing one would reload the wrong pane.
     @State private var reloadToken = 0
+    /// Find-in-diff state for the open hunks buffer (Cmd+F). Owned here so it
+    /// survives page flips, and reset on a session switch with the page.
+    @State private var search = CodeSearchModel()
 
     /// The changed files in a stable review order (by path). `FileEntry` is a
     /// value type, so the memo holds copies, never the store's dictionary.
@@ -221,7 +224,10 @@ struct ChangesView: View {
                     kind: entry.kind,
                     reloadToken: reloadToken,
                     pageActive: pageActive,
-                    mode: .hunks
+                    mode: .hunks,
+                    // Cmd+F / Cmd+G drive this page's find bar against the
+                    // diff buffer.
+                    search: search
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -267,6 +273,11 @@ struct ChangesView: View {
                 Text("\(max(selectedIndex, 0) + 1) of \(changedEntries.count)")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+            }
+            // Find in the diff (Cmd+F) — the counterpart of the Files page's
+            // find bar, scoped to the hunks buffer on screen.
+            if search.isVisible {
+                CodeSearchBar(model: search, placeholder: "Find in diff…")
             }
         }
         .padding(.horizontal, 16)

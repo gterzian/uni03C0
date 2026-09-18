@@ -69,6 +69,10 @@ struct FileBrowserView: View {
     /// Memoized flattened rows (see `rows`) — a class so body evaluations can
     /// refresh it without writing `@State` (which would re-invalidate).
     @State private var rowMemo = RowMemo()
+    /// Find-in-buffer state for the open file (Cmd+F). Owned here so it
+    /// survives page flips with the rest of the page's view state, and reset
+    /// with the page on a session switch.
+    @State private var search = CodeSearchModel()
 
     /// First listing auto-expands everything only up to this many files.
     /// Beyond that, a large project starts collapsed at its top level (expand
@@ -458,6 +462,11 @@ struct FileBrowserView: View {
             // pane's top edge and hosts the reopen toggle when the tree is
             // collapsed.
             Spacer(minLength: 0)
+            // Find in the open file (Cmd+F): the same affordance as the
+            // session's find bar, scoped to the one buffer on screen.
+            if search.isVisible {
+                CodeSearchBar(model: search, placeholder: "Find in file…")
+            }
         }
         .padding(.leading, columnVisibility != .all ? 10 : 16)
         .padding(.trailing, 12)
@@ -482,7 +491,10 @@ struct FileBrowserView: View {
                     // (the conversation is up): no file IO / git show / syntax
                     // highlight for a page nothing renders (see
                     // `ReadOnlyFilePane.pageActive`).
-                    pageActive: pageActive
+                    pageActive: pageActive,
+                    // Cmd+F / Cmd+G drive this page's find bar against this
+                    // pane's buffer.
+                    search: search
                 )
                 // A flexible slot in this VStack (the placeholder branch below
                 // declares the same). The pane now fills it exactly: its
