@@ -27,6 +27,11 @@ nonisolated struct DiffDocument: @unchecked Sendable {
     let sections: [CodeSection]
     let fullIndices: [Int?]
     let markers: PaneMarkers
+    /// The document's exact laid-out text height (sum of each line's font
+    /// height, insets excluded), computed off-main by the builder. The view
+    /// pins its frame to this: TextKit's lazily-estimated used rect would
+    /// otherwise move the scroller and the edit map mid-scroll.
+    let contentHeight: CGFloat
     /// `[0, offset-after-each-newline]`, computed off-main as the lines are
     /// appended, so applying the document does not rescan the whole buffer for
     /// line starts on the main thread.
@@ -397,6 +402,7 @@ struct DiffBrowserView: NSViewRepresentable {
                 lineNumbers: doc.lineNumbers,
                 sections: doc.sections,
                 markers: doc.markers,
+                contentHeight: doc.contentHeight,
                 restoreCharacterIndex: restore,
                 lineStartOffsets: doc.lineStartOffsets
             )
@@ -521,25 +527,34 @@ nonisolated enum DiffDocumentBuilder {
         let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
         let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        // Exact per-line heights: the document loads PLAIN (background only),
+        // so a paragraph's height is its font's line height. Expand/placeholder
+        // rows are 11pt, code lines 12pt — a fixed "lines × pitch" would drift.
+        let codeLineHeight = ReadOnlyCodeTextView.lineHeight(for: font)
+        let smallLineHeight = ReadOnlyCodeTextView.lineHeight(
+            for: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        )
         let text = NSMutableAttributedString()
         var lineNumbers: [Int?] = []
         var fullIndices: [Int?] = []
         var sections: [CodeSection] = []
         var addedLines: [Int] = []
         var removedLines: [Int] = []
+        var contentHeight: CGFloat = 0
 
-        func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?) -> (line: Int, start: Int) {
+        func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?, lineHeight: CGFloat) -> (line: Int, start: Int) {
             if !lineNumbers.isEmpty { text.append(NSAttributedString(string: "\n")) }
             let start = text.length
             text.append(attributed)
             lineNumbers.append(lineNumber)
             fullIndices.append(fullIndex)
+            contentHeight += lineHeight
             return (lineNumbers.count, start)
         }
 
         for file in input.files {
             guard let diff = file.diff, let window = file.window else {
-                _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, fullIndex: nil)
+                _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 continue
             }
             // The file's identity lives in the viewer header above the pane, so
@@ -548,7 +563,7 @@ nonisolated enum DiffDocumentBuilder {
             let sectionStart = lineNumbers.count + 1
 
             if diff.message == nil, window.start > 0 {
-                _ = appendLine(expandLine(hidden: window.start, path: file.path, direction: "up", label: "above"), lineNumber: nil, fullIndex: nil)
+                _ = appendLine(expandLine(hidden: window.start, path: file.path, direction: "up", label: "above"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
             }
 
             var diffStart = -1
@@ -570,7 +585,7 @@ nonisolated enum DiffDocumentBuilder {
                     case .same:
                         break
                     }
-                    let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index)
+                    let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index, lineHeight: codeLineHeight)
                     if diffStart < 0 { diffStart = appended.start }
                     diffEnd = appended.start + attributed.length
                     if diffFirstLine < 0 { diffFirstLine = appended.line }
@@ -580,7 +595,7 @@ nonisolated enum DiffDocumentBuilder {
                 }
             } else if let message = diff.message {
                 let placeholder = placeholderLine(message)
-                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil)
+                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 diffStart = appended.start
                 diffEnd = appended.start + placeholder.length
                 diffFirstLine = appended.line
@@ -589,7 +604,7 @@ nonisolated enum DiffDocumentBuilder {
 
             if diff.message == nil, window.end < diff.lines.count - 1 {
                 let hidden = diff.lines.count - 1 - window.end
-                _ = appendLine(expandLine(hidden: hidden, path: file.path, direction: "down", label: "below"), lineNumber: nil, fullIndex: nil)
+                _ = appendLine(expandLine(hidden: hidden, path: file.path, direction: "down", label: "below"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
             }
 
             let sectionEnd = lineNumbers.count
@@ -617,6 +632,7 @@ nonisolated enum DiffDocumentBuilder {
             sections: sections,
             fullIndices: fullIndices,
             markers: .lines(added: addedLines, removed: removedLines),
+            contentHeight: contentHeight,
             // Same algorithm as the text view's own scan, run here off-main
             // (the view is the single source of truth for the invariant).
             lineStartOffsets: ReadOnlyCodeTextView.lineStartOffsets(in: text.string)

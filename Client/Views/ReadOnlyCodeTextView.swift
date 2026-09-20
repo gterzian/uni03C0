@@ -42,6 +42,14 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the trailing "phantom" line non-empty in the table but unreachable via
     /// `lineNumber(forIndex:)` (guarded by `index < length`).
     private(set) var lineStartOffsets: [Int] = [0]
+    /// The document's EXACT laid-out height, insets included, when the caller
+    /// knows it (the off-main diff builder sums each line's font height as it
+    /// assembles the document). Under `allowsNonContiguousLayout`, `sizeToFit`
+    /// and `usedRect` report an ESTIMATE that grows as more of a large document
+    /// is laid out, so a view that sized itself would move the scroller and the
+    /// edit map under the reader mid-scroll. While this is set the view refuses
+    /// every height change (see `setFrameSize`). nil = the view sizes itself.
+    private(set) var fixedContentHeight: CGFloat?
     /// For an interleaved diff buffer, the REAL current-file line number of
     /// each 1-based DISPLAY line (`nil` for a removed line, which is old-side
     /// content). nil → the buffer is the real file and display line == real
@@ -253,7 +261,7 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// Loads a file's content (syntax + edit attributes already applied by the
     /// pane) and rebuilds the line-offset table. `lineNumbers` is the real-line
     /// map for an interleaved diff (nil for a plain, non-diff buffer).
-    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil) {
+    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil, contentHeight: CGFloat? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
         sectionPaths = []
@@ -272,9 +280,34 @@ final class ReadOnlyCodeTextView: NSTextView {
         } else {
             rebuildLineOffsets()
         }
+        // Pin the height BEFORE sizing, so `sizeToFit` may still fit the width
+        // but can never install TextKit's lazy estimate as the document height.
+        let pinnedHeight = contentHeight.map { $0 + textContainerInset.height * 2 }
+        fixedContentHeight = pinnedHeight
         sizeToFit()
+        if let pinnedHeight { setFrameSize(NSSize(width: frame.width, height: pinnedHeight)) }
         // New file: show the top.
         scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    /// Keeps a caller-supplied exact height (`load(contentHeight:)`) even as
+    /// TextKit lays out more of the document and re-offers its estimated used
+    /// rect: the width may still track the text, the height never moves.
+    override func setFrameSize(_ newSize: NSSize) {
+        if let fixedContentHeight {
+            super.setFrameSize(NSSize(width: newSize.width, height: fixedContentHeight))
+        } else {
+            super.setFrameSize(newSize)
+        }
+    }
+
+    /// TextKit's line-fragment height for a line set in `font` — exactly
+    /// `NSLayoutManager.defaultLineHeight(for:)`, computed from the font
+    /// metrics so the off-main diff builder can total a document's height
+    /// without a layout manager. The pane mixes a 12pt code font with an 11pt
+    /// expand/placeholder font, so a fixed "lines × pitch" would not do.
+    nonisolated static func lineHeight(for font: NSFont) -> CGFloat {
+        ceil(font.ascender - font.descender + font.leading)
     }
 
     private func rebuildLineOffsets() {

@@ -25,9 +25,9 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         return container
     }
 
-    private func paneText() -> NSAttributedString {
-        let lines = (1...900).map { "this is line number \($0) of the pane test — padding padding" }
-        let text = lines.joined(separator: "\n") + "\n"
+    private func paneText(lineCount: Int = 900, trailingNewline: Bool = true) -> NSAttributedString {
+        let lines = (1...lineCount).map { "this is line number \($0) of the pane test — padding padding" }
+        let text = lines.joined(separator: "\n") + (trailingNewline ? "\n" : "")
         return NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
     }
 
@@ -126,5 +126,96 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         XCTAssertLessThan(centers[0] / height, 0.12, "the top tick paints near the top of the track")
         XCTAssertGreaterThan(centers[1] / height, 0.85, "the bottom tick paints near the bottom of the track")
         XCTAssertLessThan(centers[0], centers[1], "ticks keep document order")
+    }
+
+    // MARK: - Pinned document height (the scroller/map geometry)
+
+    /// `allowsNonContiguousLayout` makes `sizeToFit`/`usedRect` report an
+    /// ESTIMATE that grows as more of a large document is laid out, so an
+    /// auto-sizing text view shrank the document mid-scroll — which slid the
+    /// scroller and the edit map out from under the reader. A supplied exact
+    /// height must be pinned for the life of the document.
+    @MainActor
+    func testPinnedDocumentHeightStaysExactWhileScrolling() {
+        let container = makeContainer()
+        let view = container.codeView
+        let lineHeight = ReadOnlyCodeTextView.lineHeight(for: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+        let lineCount = 900
+        let textHeight = CGFloat(lineCount) * lineHeight
+        let expected = textHeight + view.textContainerInset.height * 2
+
+        container.displayDocument(
+            path: "/tmp/x.swift",
+            text: paneText(lineCount: lineCount, trailingNewline: false),
+            markers: .lines(added: [10, 858], removed: []),
+            contentHeight: textHeight
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(view.frame.height, expected, accuracy: 0.5, "the pinned height IS the document height")
+        XCTAssertEqual(scroller(of: container)?.knobProportion ?? 0,
+                       container.scrollView.contentView.bounds.height / expected,
+                       accuracy: 0.005,
+                       "the knob reflects the exact document height, not TextKit's estimate")
+
+        let clip = container.scrollView.contentView
+        for y in [expected / 3, expected / 2, max(0, expected - clip.bounds.height)] {
+            clip.scroll(to: NSPoint(x: 0, y: y))
+            container.scrollView.reflectScrolledClipView(clip)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            XCTAssertEqual(view.frame.height, expected, accuracy: 0.5,
+                           "laying out more of the document must not resize it")
+        }
+        // The document is fully scrollable: the bottom sits at the exact content
+        // height (an underestimated height left the last lines unreachable).
+        XCTAssertEqual(clip.bounds.minY, expected - clip.bounds.height, accuracy: 1.0,
+                       "the last line is reachable at the exact document height")
+    }
+
+    /// The diff document mixes the 12pt code font with the 11pt expand row
+    /// font, so the builder sums each line's own height. The total must equal
+    /// TextKit's laid-out height exactly, or the pinning is off by the
+    /// difference.
+    @MainActor
+    func testPinnedHeightEqualsTheLaidOutHeightForMixedFonts() {
+        let code = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let small = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let text = NSMutableAttributedString()
+        var height: CGFloat = 0
+        for index in 1...600 {
+            if index > 1 { text.append(NSAttributedString(string: "\n")) }
+            if index % 10 == 0 {
+                text.append(NSAttributedString(string: "  ⌃  \(index) more lines below — click to expand", attributes: [.font: small]))
+                height += ReadOnlyCodeTextView.lineHeight(for: small)
+            } else {
+                text.append(NSAttributedString(string: "code line \(index) — padding padding", attributes: [.font: code]))
+                height += ReadOnlyCodeTextView.lineHeight(for: code)
+            }
+        }
+
+        let container = makeContainer()
+        container.displayDocument(path: "/tmp/mix.swift", text: text, contentHeight: height)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let view = container.codeView
+        XCTAssertEqual(view.frame.height, height + view.textContainerInset.height * 2, accuracy: 0.5)
+
+        view.layoutManager?.ensureLayout(for: view.textContainer!)
+        XCTAssertEqual(view.layoutManager!.usedRect(for: view.textContainer!).height, height, accuracy: 0.5,
+                       "the builder's per-line font sum is exactly TextKit's laid-out height")
+    }
+
+    /// `ReadOnlyCodeTextView.lineHeight` is what the off-main builder totals,
+    /// so it must stay equal to TextKit's own line height for the fonts the
+    /// differ uses.
+    @MainActor
+    func testLineHeightMatchesTextKit() {
+        let layoutManager = NSLayoutManager()
+        for size in [10.0, 11.0, 12.0] as [CGFloat] {
+            let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            XCTAssertEqual(ReadOnlyCodeTextView.lineHeight(for: font),
+                           layoutManager.defaultLineHeight(for: font),
+                           accuracy: 0.001,
+                           "line height at \(size)pt")
+        }
     }
 }
