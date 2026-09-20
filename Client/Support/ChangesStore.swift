@@ -25,10 +25,6 @@ final class ChangesStore {
     /// Bumped whenever the rendered diff document's inputs change: diffs
     /// loaded/reloaded, expansion changed, or appearance forced a re-render.
     private(set) var documentVersion = 0
-    /// Bumped only when diffs are (re)loaded, never on expansion — the viewer's
-    /// per-file highlight cache keys on it, so an unrelated file keeps its
-    /// highlighted segment while another is revealed.
-    private(set) var contentEpoch = 0
 
     // MARK: Selection + viewer commands
 
@@ -117,8 +113,11 @@ final class ChangesStore {
             guard !Task.isCancelled else { return }
             let changed = all.filter { $0.kind != .normal }.sorted { $0.path < $1.path }
             let paths = Set(changed.map(\.path))
-            entries = changed
-            listVersion &+= 1
+            let previousPaths = Set(diffs.keys)
+            if entries != changed {
+                entries = changed
+                listVersion &+= 1
+            }
             isLoading = false
             // Drop diffs for files that are no longer changed.
             diffs = diffs.filter { paths.contains($0.key) }
@@ -134,14 +133,20 @@ final class ChangesStore {
             } else {
                 toLoad = changed
             }
+            // Re-checking the working tree is cheap for the UI only if an
+            // UNCHANGED reload is a no-op: bump `documentVersion` (and so
+            // rebuild the document) only when the file set moved or a diff's
+            // content actually changed. Re-opening Changes then costs no
+            // highlighting, no rebuild, and no scroll jump.
+            var needsRebuild = previousPaths != paths
             if !toLoad.isEmpty {
                 let loaded = await self.load(changed: toLoad, cwd: cwd)
-                for diff in loaded {
+                for diff in loaded where diffs[diff.path] != diff {
                     diffs[diff.path] = diff
+                    needsRebuild = true
                 }
-                contentEpoch &+= 1
-                documentVersion &+= 1
             }
+            if needsRebuild { documentVersion &+= 1 }
         } while refreshQueued
     }
 
@@ -176,7 +181,7 @@ final class ChangesStore {
     /// (inclusive). The base window is the change span plus a few context lines;
     /// expansion grows it above/below in compounding blocks until the whole file
     /// is shown.
-    struct Window: Equatable {
+    struct Window: Equatable, Sendable {
         let start: Int
         let end: Int
     }

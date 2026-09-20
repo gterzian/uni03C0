@@ -7,7 +7,7 @@ import Foundation
 /// file with removed lines re-inserted at their original position — so the
 /// viewer can slice any window out of it (the top/bottom expansion) without
 /// re-running the diff.
-nonisolated struct LoadedFileDiff: Sendable {
+nonisolated struct LoadedFileDiff: Equatable, Sendable {
     let path: String
     let kind: GitStatus.Kind
     let lines: [DiffLine]

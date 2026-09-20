@@ -7,10 +7,8 @@ rules, sandbox constraints, commands, and paid-for gotchas — not a design doc.
 
 - Keep: an instruction, a constraint, a command, a non-obvious failure mode.
 - Cut: type-by-type descriptions, architecture narration, feature inventories,
-  "how it works" prose, test inventories, design rationale. The code and commit
-  messages are the source of truth for those.
-- Prefer one imperative line over a paragraph. Record history only when it
-  prevents a regression.
+  "how it works" prose, design rationale — the code and commits are the source.
+- Prefer one imperative line; record history only when it prevents a regression.
 - **Budget: keep this file under 300 lines.** Adding a section means deleting at
   least as much stale text. If a change only makes the file longer, the
   information belongs in a code comment or a commit message instead.
@@ -79,14 +77,12 @@ read-only mirror. **Never alter what pi records or sends for the same actions.**
 - A prompt is the user's text verbatim (only whitespace trimming, as the TUI
   does). No re-sends, retries, or duplicates; `ProcessController.send` writes
   each request exactly once.
-- Rendering caches (heights, expansion, fonts, diffs) are pure UI: never
-  serialized, sent, or written, and nothing derived from them may feed back into
-  what pi records.
+- Rendering caches (heights, expansion, fonts, diffs) are pure UI: never sent,
+  and nothing derived from them may feed back into what pi records.
 - One deliberate deviation: queued steering flushes as ONE combined prompt,
   appended in order — never re-sent, split, or reordered.
 
-When adding a feature ask: *does this change what pi would record or send?* If
-yes, find another way.
+Ask before a feature: does it change what pi records or sends? If yes, find another way.
 
 ## Naming
 
@@ -120,10 +116,9 @@ app is titled "uni03C0".
   module plus `swiftc`.
 - **CoordinatorTests:** `scripts/run-coordinator-tests.sh`
   (`TEST_FILTER=<substr>` for a subset).
-- `--disable-sandbox` is required because SPM otherwise evaluates the manifest
-  under its own `sandbox-exec`, which the policy denies. xcodebuild only works
-  from a terminal; if its package resolution fails inside the sandbox, run
-  `./run.sh` once in the terminal, then it succeeds in the sandbox.
+- `--disable-sandbox` is required (SPM's manifest `sandbox-exec` is denied).
+  xcodebuild works only from a terminal; if package resolution fails in the
+  sandbox, run `./run.sh` once in the terminal.
 
 Writing tests: RenderingTests are plain `XCTestCase` subclasses on the main
 actor; use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`. Keep the
@@ -265,11 +260,10 @@ rows.
 
 Rules:
 
-- A page switch is a visibility flip (opacity + hit-testing), never a rebuild.
-  The transcript representable has **no `.id`** and is rebound; the Changes view
-  is `.id`-keyed per tab (its state belongs to that tab).
-- The inactive page does zero work, gated by `pageActive` — no folding, no file
-  IO, no diff loading, no highlighting.
+- A page switch is a visibility flip (opacity + hit-testing), never a rebuild:
+  transcript has **no `.id`** and is rebound; Changes is `.id`-keyed per tab.
+- The inactive page does zero work, gated by `pageActive` — no file IO, no diff
+  loading, no highlighting.
 - Changed files + per-file stats come from `GitStatus.classify` (one batched
   two-pass `git diff --numstat`), off the main thread. Per-file diffs are loaded
   by `DiffLoader` off-main (bounded concurrency); a `path`-named change event
@@ -277,12 +271,13 @@ Rules:
 - The store only advances on `GitStatus.didChangeNotification`; a terminal `git
   commit` emits none, so the active session re-checks on activation and page opens.
 - The viewer is ONE `CodePaneContainer` (scroll view + `ReadOnlyCodeTextView` +
-  ruler + `CodePaneEditMarkerScroller`) holding every file's diff in path order,
-  built by `DiffBrowserView.Coordinator`. Expansion is a per-file window into the
-  store's interleaved lines, revealed in compounding blocks via `pi-diff://` link
-  rows at the top/bottom; unchanged files keep their highlighted segment (cache
-  keyed on content epoch + window + theme). Never highlight for a hidden page,
-  and keep the viewer's `sizeThatFits` filling the slot, never its content.
+  ruler + edit-map scroller) holding every file's diff in path order. The
+  document is built by `DiffDocumentBuilder` on a worker thread — never on the
+  main actor (highlight.js is ~200ms/1000 lines) — and applied in one main-actor
+  hop by `DiffBrowserView.Coordinator`, with an AppKit spinner over the build.
+  Expansion is a per-file window via `pi-diff://` link rows; unchanged files
+  keep their highlighted segment (cache keyed on CONTENT + theme). Never build
+  for a hidden page; `sizeThatFits` fills the slot, never the content.
 - Search (`CodeSearchModel`) scans the whole viewer buffer — every line currently
   in the document, visible or not — and re-runs when a file expands.
 - The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
@@ -300,3 +295,5 @@ Failed fixes (do not re-introduce):
 - Rendering only added lines, so a deletion-only change looked uncolored.
 - Rebuilding the whole viewer document on every scroll-spy tick, or loading all
   diffs on the main thread.
+- Syntax-highlighting the diff document on the main thread — opening Changes on a
+  large project beachballs (highlight.js is a synchronous JS pass per file).

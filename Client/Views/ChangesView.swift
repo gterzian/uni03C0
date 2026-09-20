@@ -178,27 +178,23 @@ struct ChangesView: View {
     private var viewerHeader: some View {
         HStack(spacing: 8) {
             if let selected = store.selectedPath {
-                Text(selected)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                // The title IS the open-in-default-app affordance: the viewer
+                // shows a diff window, so the title hands the whole file to an
+                // editor. Plain text for a deleted file (nothing on disk).
+                if store.canOpenInDefaultApp(selected) {
+                    FileTitleLink(path: selected) { store.openInDefaultApp(selected) }
+                } else {
+                    Text(selected)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
                 if let index = store.entries.firstIndex(where: { $0.path == selected }) {
                     Text("\(index + 1) of \(store.entries.count)")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                }
-                // The viewer shows a window into the file; this hands the whole
-                // file to another app (an editor). Hidden for a deleted file.
-                if store.canOpenInDefaultApp(selected) {
-                    Button { store.openInDefaultApp(selected) } label: {
-                        Image(systemName: "arrow.up.forward.app")
-                            .font(.system(size: 11))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Open the full file in the default application")
-                    .accessibilityLabel("Open \(selected) in the default application")
+                        .accessibilityLabel("File \(index + 1) of \(store.entries.count)")
                 }
             } else {
                 Text("Changes")
@@ -257,5 +253,36 @@ struct ChangesView: View {
                 .foregroundStyle(.blue)
                 .accessibilityHidden(true)
         }
+    }
+}
+
+/// The viewer header's file title, acting as a link to the file's default
+/// application. It reads as one accessible link (`.isLink` plus a label that
+/// names the action, so VoiceOver announces "link" and activating it opens the
+/// file), underlines and shows the pointing-hand cursor on hover, and carries a
+/// tooltip. A plain `Button` keeps the keyboard/`Space` activation SwiftUI
+/// already gives controls.
+private struct FileTitleLink: View {
+    let path: String
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(path)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.primary)
+                .underline(hovering)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .onHover { hovering = $0 }
+        .help("Open \(path) in the default application")
+        .accessibilityAddTraits(.isLink)
+        .accessibilityLabel("Open \(path) in the default application")
     }
 }

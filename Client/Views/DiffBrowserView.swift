@@ -2,28 +2,58 @@ import AppKit
 import Core
 import SwiftUI
 
+/// The `pi-diff://` scheme the viewer's expand controls link with.
+nonisolated enum DiffLink {
+    static let scheme = "pi-diff"
+}
+
 /// One built diff document: the attributed text for the one big scrollable
 /// area, the per-display-line real-line map (for the gutter), the file
 /// sections (scroll spy + reveal + reference-tagged copies), the full-array
 /// index of each display line (rebuild anchoring), and the scrollbar edit map.
-struct DiffDocument {
-    var text: NSAttributedString
-    var lineNumbers: [Int?]
-    var sections: [CodeSection]
-    var fullIndices: [Int?]
-    var markers: PaneMarkers
+///
+/// `@unchecked Sendable`: the builder produces this on a worker thread and the
+/// coordinator applies it on the main actor. `text` is immutable once built,
+/// and every other member is a plain `Sendable` value, so reads across the hop
+/// are safe (the audited assertion the box makes).
+nonisolated struct DiffDocument: @unchecked Sendable {
+    let text: NSAttributedString
+    let lineNumbers: [Int?]
+    let sections: [CodeSection]
+    let fullIndices: [Int?]
+    let markers: PaneMarkers
+}
+
+/// Everything the document builder needs, snapshotted on the main actor: each
+/// changed file, its loaded diff (nil while still loading), and its visible
+/// window (nil when there is no diff yet). All `Sendable`, so the snapshot
+/// crosses to the builder untouched.
+nonisolated struct DiffBuildFile: Sendable {
+    let path: String
+    let diff: LoadedFileDiff?
+    let window: ChangesStore.Window?
+}
+
+nonisolated struct DiffBuildInput: Sendable {
+    let files: [DiffBuildFile]
+    let dark: Bool
 }
 
 /// The Changes page's diff viewer: ONE scroll view holding every changed
-/// file's diff, in path order, with a per-file header and top/bottom expand
-/// controls. It replaces the old per-file pane — the whole sidebar of changed
-/// files is one continuous read, and the sidebar highlights whichever file's
-/// section owns the top of the viewport.
+/// file's diff, in path order, with top/bottom expand controls. It replaces
+/// the old per-file pane — the whole sidebar of changed files is one
+/// continuous read, and the sidebar highlights whichever file's section owns
+/// the top of the viewport. The document carries no per-file title row: the
+/// viewer header above the pane names the file (and opens it) for the whole
+/// changeset.
 ///
-/// All document building happens here (main actor, because syntax highlighting
-/// is), on demand: `updateNSView` rebuilds only when the store's
-/// `documentVersion` changes. Expansion edits the store's per-file window and
-/// bumps that version; unchanged files are served from the highlight cache.
+/// The document is built by `DiffDocumentBuilder` OFF the main actor —
+/// highlight.js is by far the expensive part (one synchronous JS pass per
+/// file, ~200ms/1000 lines), so opening Changes on a large project must never
+/// run it on the main thread. `updateNSView` kicks off a build only when the
+/// store's `documentVersion` changes and applies the finished document in one
+/// main-actor hop; expansion edits the store's per-file window and bumps that
+/// version.
 struct DiffBrowserView: NSViewRepresentable {
     let store: ChangesStore
     /// Bumped by the store whenever the document's inputs change (diffs
@@ -99,27 +129,32 @@ struct DiffBrowserView: NSViewRepresentable {
         private var appliedRevealPath: String?
         private var isActive = true
         private var needsRebuild = false
-        private let highlighter = SyntaxHighlighter()
+        /// The off-main document builder (owns the syntax highlighter and its
+        /// per-file cache). One build at a time; a superseded build's result is
+        /// discarded by the version check in `apply`.
+        private let builder = DiffDocumentBuilder()
+        private var buildTask: Task<Void, Never>?
         private var document: DiffDocument?
-        /// Per-file highlighted diff-lines cache: keyed by path, valid for one
-        /// (content epoch, window, appearance) triple. Expansion re-highlights
-        /// only the file whose window changed.
-        private var highlightCache: [String: (key: String, attributed: NSAttributedString)] = [:]
         private var keyMonitor: Any?
-
-        private static let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
-        private static let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
-        private static let headerBackground = NSColor.labelColor.withAlphaComponent(0.07)
-        private static let linkScheme = "pi-diff"
 
         // MARK: Lifecycle
 
         func setActive(_ active: Bool) {
             guard isActive != active else { return }
             isActive = active
-            if active, needsRebuild {
-                needsRebuild = false
-                rebuild()
+            if active {
+                if needsRebuild {
+                    needsRebuild = false
+                    rebuild()
+                }
+            } else {
+                // Abandon an in-flight build: a hidden page does no highlighting
+                // work and never applies a document nothing shows. The version
+                // was already recorded as applied, so flag a catch-up rebuild.
+                if buildTask != nil { needsRebuild = true }
+                buildTask?.cancel()
+                buildTask = nil
+                container?.setBusy(false)
             }
         }
 
@@ -166,12 +201,14 @@ struct DiffBrowserView: NSViewRepresentable {
                 needsRebuild = true
                 return
             }
-            // Theme change: drop the cache so every file re-highlights.
-            highlightCache.removeAll()
+            // The highlight cache keys on the appearance, so a light/dark change
+            // simply re-highlights; no cache reset is needed.
             rebuild()
         }
 
         func teardown() {
+            buildTask?.cancel()
+            buildTask = nil
             if let keyMonitor {
                 NSEvent.removeMonitor(keyMonitor)
                 self.keyMonitor = nil
@@ -223,7 +260,7 @@ struct DiffBrowserView: NSViewRepresentable {
         }
 
         func handleLink(_ url: URL) {
-            guard url.scheme == Self.linkScheme, let store else { return }
+            guard url.scheme == DiffLink.scheme, let store else { return }
             let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
             let path = comps?.queryItems?.first(where: { $0.name == "path" })?.value
             switch url.host {
@@ -231,9 +268,6 @@ struct DiffBrowserView: NSViewRepresentable {
                 guard let path,
                       let dir = comps?.queryItems?.first(where: { $0.name == "dir" })?.value else { return }
                 store.expand(path: path, direction: dir == "up" ? .up : .down)
-            case "open":
-                guard let path else { return }
-                store.openInDefaultApp(path)
             default:
                 break
             }
@@ -247,10 +281,33 @@ struct DiffBrowserView: NSViewRepresentable {
 
         // MARK: Rebuild
 
+        /// Snapshots the store's inputs on the main actor and starts an off-main
+        /// build. The finished document is applied in one main-actor hop — if the
+        /// document version has not moved on, and the page is still visible.
         private func rebuild() {
             guard let container, let store else { return }
+            let version = appliedDocumentVersion
+            let input = DiffBuildInput(files: snapshot(store), dark: currentDark())
+            buildTask?.cancel()
+            container.setBusy(true)
+            let builder = self.builder
+            buildTask = Task.detached(priority: .userInitiated) { [weak self] in
+                let doc = builder.build(input)
+                guard !Task.isCancelled else { return }
+                await MainActor.run { self?.apply(doc, version: version) }
+            }
+        }
+
+        private func apply(_ doc: DiffDocument, version: Int) {
+            guard version == appliedDocumentVersion else { return }
+            guard isActive, let container else {
+                needsRebuild = true
+                self.container?.setBusy(false)
+                return
+            }
+            // Capture the anchor NOW (the container still shows the old
+            // document): a scroll during the off-main build must not be lost.
             let anchor = captureAnchor()
-            let doc = build(store: store)
             document = doc
             let restore = anchor.flatMap { restoreCharacterIndex(for: $0, in: doc) }
             container.displayDocument(
@@ -261,8 +318,26 @@ struct DiffBrowserView: NSViewRepresentable {
                 markers: doc.markers,
                 restoreCharacterIndex: restore
             )
+            container.setBusy(false)
             // The buffer was replaced: re-run an active find against it.
             search?.bufferDidChange()
+        }
+
+        /// The main-actor snapshot of the store's changed files and their loaded
+        /// diffs/windows, for the off-main builder.
+        private func snapshot(_ store: ChangesStore) -> [DiffBuildFile] {
+            store.entries.map { entry in
+                let diff = store.diffs[entry.path]
+                return DiffBuildFile(
+                    path: entry.path,
+                    diff: diff,
+                    window: diff.map { store.window(for: $0) }
+                )
+            }
+        }
+
+        private func currentDark() -> Bool {
+            NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
 
         /// The (path, full-array line) at the top of the viewport, so a rebuild
@@ -291,204 +366,202 @@ struct DiffBrowserView: NSViewRepresentable {
             }
             return nil
         }
+    }
+}
 
-        // MARK: Document building
+/// Builds one diff document off the main thread.
+///
+/// This is the diff viewer's counterpart to the transcript's off-main height
+/// pre-measurement: the expensive work (highlight.js, one synchronous JS pass
+/// per file) runs here on a worker thread, and the finished document crosses
+/// back to the main actor in a single hop. `@unchecked Sendable` is justified
+/// by `lock`: every mutation (the highlighter's JS context and the per-file
+/// cache) happens under it, so the non-Sendable `Highlightr` is never touched
+/// concurrently, and `build` returns an immutable `DiffDocument`.
+///
+/// The cache is keyed by the window's CONTENT and appearance, not a content
+/// epoch: re-listing the working tree and finding a file unchanged reuses its
+/// highlighted segment, so a page open or a no-op refresh never re-highlights
+/// the whole changeset.
+nonisolated final class DiffDocumentBuilder: @unchecked Sendable {
+    private let lock = NSLock()
+    /// Created on the first (off-main) build, never on the main actor — a
+    /// `var` rather than `lazy` (a nonisolated `lazy var` is rejected) but
+    /// always touched under `lock`.
+    private var highlighter: SyntaxHighlighter?
+    private var cache: [String: (key: String, attributed: NSAttributedString)] = [:]
 
-        private func build(store: ChangesStore) -> DiffDocument {
-            let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            let text = NSMutableAttributedString()
-            var lineNumbers: [Int?] = []
-            var fullIndices: [Int?] = []
-            var sections: [CodeSection] = []
-            var addedLines: [Int] = []
-            var removedLines: [Int] = []
+    func build(_ input: DiffBuildInput) -> DiffDocument {
+        lock.lock()
+        defer { lock.unlock() }
 
-            func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?) -> (line: Int, start: Int) {
-                if !lineNumbers.isEmpty { text.append(NSAttributedString(string: "\n")) }
-                let start = text.length
-                text.append(attributed)
-                lineNumbers.append(lineNumber)
-                fullIndices.append(fullIndex)
-                return (lineNumbers.count, start)
+        let addedColor = NSColor.systemGreen.withAlphaComponent(0.18)
+        let deletedColor = NSColor.systemRed.withAlphaComponent(0.16)
+        let text = NSMutableAttributedString()
+        var lineNumbers: [Int?] = []
+        var fullIndices: [Int?] = []
+        var sections: [CodeSection] = []
+        var addedLines: [Int] = []
+        var removedLines: [Int] = []
+
+        func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?) -> (line: Int, start: Int) {
+            if !lineNumbers.isEmpty { text.append(NSAttributedString(string: "\n")) }
+            let start = text.length
+            text.append(attributed)
+            lineNumbers.append(lineNumber)
+            fullIndices.append(fullIndex)
+            return (lineNumbers.count, start)
+        }
+
+        for file in input.files {
+            guard let diff = file.diff, let window = file.window else {
+                _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, fullIndex: nil)
+                continue
+            }
+            // The file's identity lives in the viewer header above the pane, so
+            // the document opens straight onto the diff — no repeated
+            // path/stats/extras row under it.
+            let sectionStart = lineNumbers.count + 1
+
+            if diff.message == nil, window.start > 0 {
+                _ = appendLine(expandLine(hidden: window.start, path: file.path, direction: "up", label: "above"), lineNumber: nil, fullIndex: nil)
             }
 
-            for entry in store.entries {
-                guard let diff = store.diffs[entry.path] else {
-                    _ = appendLine(placeholderLine("Loading \(entry.path)…"), lineNumber: nil, fullIndex: nil)
-                    continue
-                }
-                let headerRow = appendLine(headerLine(entry), lineNumber: nil, fullIndex: nil)
-                let sectionStart = headerRow.line
-
-                if diff.message == nil, store.canExpand(diff, .up) {
-                    let hidden = store.window(for: diff).start
-                    _ = appendLine(expandLine(hidden: hidden, path: entry.path, direction: "up", label: "above"), lineNumber: nil, fullIndex: nil)
-                }
-
-                var diffStart = -1
-                var diffEnd = -1
-                if diff.message == nil, diff.displayLineCount > 0 {
-                    let window = store.window(for: diff)
-                    let lines = highlightedLines(diff: diff, window: window, dark: dark, contentEpoch: store.contentEpoch)
-                    for index in window.start...window.end {
-                        let line = diff.lines[index]
-                        let attributed = NSMutableAttributedString(attributedString: lines[index - window.start])
-                        normalizeFont(attributed)
-                        switch line.kind {
-                        case .added:
-                            attributed.addAttribute(.backgroundColor, value: Self.addedColor, range: NSRange(location: 0, length: attributed.length))
-                        case .removed:
-                            attributed.addAttribute(.backgroundColor, value: Self.deletedColor, range: NSRange(location: 0, length: attributed.length))
-                        case .same:
-                            break
-                        }
-                        let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index)
-                        if diffStart < 0 { diffStart = appended.start }
-                        diffEnd = appended.start + attributed.length
-                        if line.kind == .added { addedLines.append(appended.line) }
-                        if line.kind == .removed { removedLines.append(appended.line) }
+            var diffStart = -1
+            var diffEnd = -1
+            if diff.message == nil, !diff.lines.isEmpty {
+                let lines = highlightedLines(diff: diff, window: window, dark: input.dark)
+                for index in window.start...window.end {
+                    let line = diff.lines[index]
+                    let attributed = NSMutableAttributedString(attributedString: lines[index - window.start])
+                    normalizeFont(attributed)
+                    switch line.kind {
+                    case .added:
+                        attributed.addAttribute(.backgroundColor, value: addedColor, range: NSRange(location: 0, length: attributed.length))
+                    case .removed:
+                        attributed.addAttribute(.backgroundColor, value: deletedColor, range: NSRange(location: 0, length: attributed.length))
+                    case .same:
+                        break
                     }
-                } else if let message = diff.message {
-                    _ = appendLine(placeholderLine(message), lineNumber: nil, fullIndex: nil)
+                    let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index)
+                    if diffStart < 0 { diffStart = appended.start }
+                    diffEnd = appended.start + attributed.length
+                    if line.kind == .added { addedLines.append(appended.line) }
+                    if line.kind == .removed { removedLines.append(appended.line) }
                 }
-
-                if diff.message == nil, store.canExpand(diff, .down) {
-                    let window = store.window(for: diff)
-                    let hidden = diff.displayLineCount - 1 - window.end
-                    _ = appendLine(expandLine(hidden: hidden, path: entry.path, direction: "down", label: "below"), lineNumber: nil, fullIndex: nil)
-                }
-
-                let sectionEnd = lineNumbers.count
-                let diffRange: NSRange
-                if diffStart >= 0 {
-                    diffRange = NSRange(location: diffStart, length: max(diffEnd - diffStart, 0))
-                } else {
-                    diffRange = NSRange(location: headerRow.start, length: 0)
-                }
-                sections.append(CodeSection(path: entry.path, lineRange: sectionStart...sectionEnd, diffCharRange: diffRange))
+            } else if let message = diff.message {
+                let placeholder = placeholderLine(message)
+                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil)
+                diffStart = appended.start
+                diffEnd = appended.start + placeholder.length
             }
 
-            return DiffDocument(
-                text: text,
-                lineNumbers: lineNumbers,
-                sections: sections,
-                fullIndices: fullIndices,
-                markers: .lines(added: addedLines, removed: removedLines)
-            )
-        }
-
-        /// The syntax-highlighted lines of a file's current window, cached so an
-        /// expansion only re-highlights the file whose window changed.
-        private func highlightedLines(diff: LoadedFileDiff, window: ChangesStore.Window, dark: Bool, contentEpoch: Int) -> [NSAttributedString] {
-            let key = "\(contentEpoch)|\(diff.path)|\(diff.lines.count)|\(window.start)|\(window.end)|\(dark)"
-            if let cached = highlightCache[diff.path], cached.key == key {
-                return splitLines(cached.attributed)
+            if diff.message == nil, window.end < diff.lines.count - 1 {
+                let hidden = diff.lines.count - 1 - window.end
+                _ = appendLine(expandLine(hidden: hidden, path: file.path, direction: "down", label: "below"), lineNumber: nil, fullIndex: nil)
             }
-            let slice = window.start...window.end
-            let plain = slice.map { diff.lines[$0].text }.joined(separator: "\n")
-            let language = SyntaxHighlighter.language(forPath: diff.path)
-            let base = highlighter.highlight(plain, as: language)
-                ?? NSAttributedString(string: plain, attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                    .foregroundColor: NSColor.labelColor,
-                ])
-            let normalized = NSMutableAttributedString(attributedString: base)
-            normalized.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: normalized.length))
-            highlightCache[diff.path] = (key, normalized)
-            return splitLines(normalized)
+
+            let sectionEnd = lineNumbers.count
+            // A section with no lines (an empty new file) has no position to
+            // anchor the scroll spy or a reveal on; skip it.
+            guard sectionEnd >= sectionStart, diffStart >= 0 else { continue }
+            let diffRange = NSRange(location: diffStart, length: max(diffEnd - diffStart, 0))
+            sections.append(CodeSection(path: file.path, lineRange: sectionStart...sectionEnd, diffCharRange: diffRange))
         }
 
-        /// Splits a highlighted window back into its lines (the newline
-        /// separators used to build it are dropped).
-        private func splitLines(_ attributed: NSAttributedString) -> [NSAttributedString] {
-            let string = attributed.string as NSString
-            var result: [NSAttributedString] = []
-            var location = 0
-            while location <= string.length {
-                let search = NSRange(location: location, length: string.length - location)
-                let found = string.range(of: "\n", options: [], range: search)
-                let end = found.location == NSNotFound ? string.length : found.location
-                result.append(attributed.attributedSubstring(from: NSRange(location: location, length: end - location)))
-                if found.location == NSNotFound { break }
-                location = found.location + 1
-            }
-            return result
-        }
+        return DiffDocument(
+            text: text,
+            lineNumbers: lineNumbers,
+            sections: sections,
+            fullIndices: fullIndices,
+            markers: .lines(added: addedLines, removed: removedLines)
+        )
+    }
 
-        private func normalizeFont(_ attributed: NSMutableAttributedString) {
-            let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-            attributed.addAttribute(.font, value: font, range: NSRange(location: 0, length: attributed.length))
+    /// The syntax-highlighted lines of a file's current window, cached so an
+    /// expansion (or an unchanged reload) only re-highlights the file whose
+    /// content changed.
+    private func highlightedLines(diff: LoadedFileDiff, window: ChangesStore.Window, dark: Bool) -> [NSAttributedString] {
+        let plain = (window.start...window.end).map { diff.lines[$0].text }.joined(separator: "\n")
+        let key = "\(dark)|\(plain)"
+        if let cached = cache[diff.path], cached.key == key {
+            return splitLines(cached.attributed)
         }
-
-        private func headerLine(_ entry: GitStatus.FileEntry) -> NSAttributedString {
-            let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
-            let result = NSMutableAttributedString(string: entry.path, attributes: [
-                .font: font,
+        let language = SyntaxHighlighter.language(forPath: diff.path)
+        let base = resolvedHighlighter().highlight(plain, as: language, dark: dark)
+            ?? NSAttributedString(string: plain, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
                 .foregroundColor: NSColor.labelColor,
             ])
-            if let stats = entry.stats, stats.added + stats.deleted > 0 {
-                if stats.added > 0 {
-                    result.append(NSAttributedString(string: "  +\(stats.added)", attributes: [
-                        .font: font, .foregroundColor: NSColor.systemGreen,
-                    ]))
-                }
-                if stats.deleted > 0 {
-                    result.append(NSAttributedString(string: "  −\(stats.deleted)", attributes: [
-                        .font: font, .foregroundColor: NSColor.systemRed,
-                    ]))
-                }
-            } else if entry.kind == .untracked {
-                result.append(NSAttributedString(string: "  new", attributes: [
-                    .font: font, .foregroundColor: NSColor.systemBlue,
-                ]))
-            }
-            // A trailing link hands the WHOLE file to another app — the viewer
-            // only ever shows the diff. Omitted for a deleted file (nothing on
-            // disk to open).
-            if entry.kind != .deleted, let url = selfURL(host: "open", path: entry.path) {
-                let linkStart = result.length
-                result.append(NSAttributedString(string: "   ↗ Open in app", attributes: [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                    .foregroundColor: NSColor.controlAccentColor,
-                    .underlineStyle: NSUnderlineStyle.single.rawValue,
-                ]))
-                result.addAttribute(.link, value: url, range: NSRange(location: linkStart, length: result.length - linkStart))
-            }
-            result.addAttribute(.backgroundColor, value: Self.headerBackground, range: NSRange(location: 0, length: result.length))
-            return result
-        }
+        let normalized = NSMutableAttributedString(attributedString: base)
+        normalized.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: normalized.length))
+        cache[diff.path] = (key, normalized)
+        return splitLines(normalized)
+    }
 
-        /// Builds a `pi-diff://` link for a path.
-        private func selfURL(host: String, path: String, direction: String? = nil) -> URL? {
-            var comps = URLComponents()
-            comps.scheme = Self.linkScheme
-            comps.host = host
-            var items = [URLQueryItem(name: "path", value: path)]
-            if let direction {
-                items.append(URLQueryItem(name: "dir", value: direction))
-            }
-            comps.queryItems = items
-            return comps.url
+    /// Splits a highlighted window back into its lines (the newline separators
+    /// used to build it are dropped).
+    private func splitLines(_ attributed: NSAttributedString) -> [NSAttributedString] {
+        let string = attributed.string as NSString
+        var result: [NSAttributedString] = []
+        var location = 0
+        while location <= string.length {
+            let search = NSRange(location: location, length: string.length - location)
+            let found = string.range(of: "\n", options: [], range: search)
+            let end = found.location == NSNotFound ? string.length : found.location
+            result.append(attributed.attributedSubstring(from: NSRange(location: location, length: end - location)))
+            if found.location == NSNotFound { break }
+            location = found.location + 1
         }
+        return result
+    }
 
-        private func expandLine(hidden: Int, path: String, direction: String, label: String) -> NSAttributedString {
-            let text = "  ⌃  \(hidden) more line\(hidden == 1 ? "" : "s") \(label) — click to expand"
-            let result = NSMutableAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
-            if let url = selfURL(host: "expand", path: path, direction: direction) {
-                result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
-            }
-            return result
-        }
+    /// The highlighting engine, created on first use (off-main, under the
+    /// builder's lock). Highlightr loads and evaluates highlight.min.js —
+    /// doing that at `DiffDocumentBuilder` construction would run it on the
+    /// main actor when the coordinator is created.
+    private func resolvedHighlighter() -> SyntaxHighlighter {
+        if let highlighter { return highlighter }
+        let created = SyntaxHighlighter()
+        highlighter = created
+        return created
+    }
 
-        private func placeholderLine(_ text: String) -> NSAttributedString {
-            NSAttributedString(string: text, attributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
+    private func normalizeFont(_ attributed: NSMutableAttributedString) {
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        attributed.addAttribute(.font, value: font, range: NSRange(location: 0, length: attributed.length))
+    }
+
+    /// Builds a `pi-diff://` link for a path.
+    private func selfURL(host: String, path: String, direction: String? = nil) -> URL? {
+        var comps = URLComponents()
+        comps.scheme = DiffLink.scheme
+        comps.host = host
+        var items = [URLQueryItem(name: "path", value: path)]
+        if let direction {
+            items.append(URLQueryItem(name: "dir", value: direction))
         }
+        comps.queryItems = items
+        return comps.url
+    }
+
+    private func expandLine(hidden: Int, path: String, direction: String, label: String) -> NSAttributedString {
+        let text = "  ⌃  \(hidden) more line\(hidden == 1 ? "" : "s") \(label) — click to expand"
+        let result = NSMutableAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
+        if let url = selfURL(host: "expand", path: path, direction: direction) {
+            result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
+        }
+        return result
+    }
+
+    private func placeholderLine(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ])
     }
 }
 

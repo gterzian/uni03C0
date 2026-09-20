@@ -32,8 +32,9 @@ enum PaneMarkers: Sendable {
 
 /// One file's slice of the diff viewer's document: where its lines live in the
 /// document, and which characters belong to its diff (for reference-tagged
-/// copies). `lineRange` spans the section's header and expand rows too, so the
-/// scroll spy attributes a viewport parked on a header to the right file.
+/// copies). `lineRange` spans the section's diff and expand lines too, so the
+/// scroll spy attributes a viewport parked anywhere in the section to the
+/// right file.
 struct CodeSection: Sendable {
     let path: String
     let lineRange: ClosedRange<Int>
@@ -49,6 +50,12 @@ final class CodePaneContainer: NSView {
     let scrollView = NSScrollView()
     let codeView = ReadOnlyCodeTextView(frame: .zero, textContainer: nil)
     private let statusLabel = NSTextField(labelWithString: "")
+    /// Small in-app spinner shown while the document builder highlights
+    /// off-main. An AppKit `NSProgressIndicator` (never a SwiftUI spinner) so
+    /// nothing invalidates the shell graph per frame — the same rule the
+    /// transcript's reload overlay follows. `PassthroughIndicator` never eats a
+    /// scroll/click over its small frame.
+    private let busyIndicator = PassthroughIndicator()
 
     /// Called when the view's effective appearance changes (an app light/dark
     /// toggle or a system appearance change), so the owner can rebuild the
@@ -123,8 +130,15 @@ final class CodePaneContainer: NSView {
         statusLabel.isHidden = true
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        busyIndicator.style = .spinning
+        busyIndicator.controlSize = .small
+        busyIndicator.isDisplayedWhenStopped = false
+        busyIndicator.isHidden = true
+        busyIndicator.translatesAutoresizingMaskIntoConstraints = false
+
         addSubview(scrollView)
         addSubview(statusLabel)
+        addSubview(busyIndicator)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -133,6 +147,8 @@ final class CodePaneContainer: NSView {
             statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
             statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
             statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+            busyIndicator.centerXAnchor.constraint(equalTo: centerXAnchor),
+            busyIndicator.topAnchor.constraint(equalTo: topAnchor, constant: 12),
         ])
 
         // The scroll spy rides the clip view's bounds changes.
@@ -178,6 +194,19 @@ final class CodePaneContainer: NSView {
         } else {
             scrollToTop()
         }
+    }
+
+    /// Shows/hides the in-app spinner for an off-main document build. Unlike
+    /// `showPlaceholder` this never clears the displayed document, so a rebuild
+    /// (expansion, appearance, refresh) keeps the reader's content on screen
+    /// until the new document is ready.
+    func setBusy(_ busy: Bool) {
+        if busy {
+            busyIndicator.startAnimation(nil)
+        } else {
+            busyIndicator.stopAnimation(nil)
+        }
+        busyIndicator.isHidden = !busy
     }
 
     /// Centered status text (loading / no changed files / unreadable) over a
@@ -259,7 +288,7 @@ final class CodePaneContainer: NSView {
             ?? sections.last?.path
     }
 
-    /// The character index of a path's section header (for a reveal jump), or
+    /// The character index of a path's section start (for a reveal jump), or
     /// nil when the path is not in the document.
     func characterIndex(forPath path: String) -> Int? {
         guard let section = sections.first(where: { $0.path == path }) else { return nil }
@@ -306,4 +335,11 @@ final class CodePaneContainer: NSView {
                 .sorted { $0.fraction < $1.fraction }
         }
     }
+}
+
+/// A spinner that never consumes a mouse event: it floats over the code view,
+/// and a scroll or click landing on its small frame must reach the text view
+/// underneath.
+private final class PassthroughIndicator: NSProgressIndicator {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

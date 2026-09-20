@@ -5,9 +5,8 @@ import AppKit
 /// two members the diff document builder calls are these. Rendering tests
 /// never exercise highlighting — the viewer is driven with already-attributed
 /// text.
-@MainActor
-final class SyntaxHighlighter {
+nonisolated final class SyntaxHighlighter {
     static func language(forPath path: String) -> String? { nil }
 
-    func highlight(_ code: String, as language: String?) -> NSAttributedString? { nil }
+    func highlight(_ code: String, as language: String?, dark: Bool) -> NSAttributedString? { nil }
 }
