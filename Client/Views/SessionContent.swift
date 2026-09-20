@@ -116,16 +116,16 @@ struct SessionContent: View {
         // is only as fresh as the store's last snapshot, and an out-of-band
         // change (a git command run in a terminal) produces no pi file event to
         // refresh it. The viewer's own live diff then can never disagree with
-        // the list beside it. The same re-check runs when the app returns to the
-        // foreground and when the active outer tab changes — for the badge as
-        // well, which is visible on every page — but only for the session the
-        // user is actually looking at, so a background tab costs nothing (its
-        // own agent events keep it warm).
+        // the list beside it. The full re-check runs when the app returns to the
+        // foreground and when a review surface opens; a TAB switch only
+        // re-counts the badge (the count is visible on every page) — reloading
+        // every diff on a switch is the tab-switch recompute, and the incoming
+        // tab's viewer re-applies its cached document instead.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             tab.refreshWorkingTree()
         }
         .onChange(of: tab.id) { _, _ in
-            tab.refreshWorkingTree()
+            tab.refreshGitCount()
         }
         .onChange(of: tab.page) { _, page in
             if page != .conversation { tab.refreshWorkingTree() }

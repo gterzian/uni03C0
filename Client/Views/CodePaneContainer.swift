@@ -199,7 +199,8 @@ final class CodePaneContainer: NSView {
         lineNumbers: [Int?]? = nil,
         sections: [CodeSection] = [],
         markers: PaneMarkers = .none,
-        restoreCharacterIndex: Int? = nil
+        restoreCharacterIndex: Int? = nil,
+        lineStartOffsets: [Int]? = nil
     ) {
         statusLabel.isHidden = true
         codeView.isHidden = false
@@ -207,7 +208,7 @@ final class CodePaneContainer: NSView {
         (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
         self.sections = sections
 
-        codeView.load(path: path, text: text, lineNumbers: lineNumbers)
+        codeView.load(path: path, text: text, lineNumbers: lineNumbers, lineStartOffsets: lineStartOffsets)
         // The document is every file's diff in one buffer: each file's diff
         // lines map to that file's canonical absolute path, so a copy inside
         // the diff tags a reference to the FILE (never to "the diff").

@@ -869,6 +869,40 @@ extension CoordinatorNavigationTests {
         XCTAssertTrue(aText.contains("answer A0"), "A's rows must render on return, got: \(aText.prefix(160))")
     }
 
+    /// Switching back to a session whose window heights are already cached
+    /// must schedule NOTHING for the background measurer — otherwise every
+    /// tab switch re-typesets the whole window off-main (the reported
+    /// high-CPU-on-tab-switch regression).
+    func testRebindToACachedSessionSchedulesNoPremeasure() {
+        let vmA = SessionViewModel()
+        let vmB = SessionViewModel()
+        foldTurn(vmA.store, user: "question A0", reply: "answer A0")
+        foldTurn(vmA.store, user: "question A1", reply: "answer A1")
+        foldTurn(vmB.store, user: "question B0", reply: "answer B0")
+
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vmA)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 600)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop() // first visit: A's window is pre-measured and cached
+        XCTAssertGreaterThan(coordinator.heightCacheForTesting(vmA)?.count ?? 0, 0,
+            "precondition: A's first visit seeds its window heights")
+
+        // Away and back. B's first visit measures (its rows are new); A's
+        // return must find every window row cached and schedule nothing.
+        coordinator.rebind(viewModel: vmB)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        coordinator.rebind(viewModel: vmA)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        XCTAssertFalse(coordinator.premeasureInFlight,
+            "a rebind to an already-measured session must not run the background measurer")
+        XCTAssertTrue(coordinator.pendingPremeasure.isEmpty,
+            "no row should be scheduled when the whole window is already cached")
+    }
+
     /// The text currently rendered by the materialized (visible) rows —
     /// nil cells skipped.
     private func visibleText(_ coordinator: Coordinator) -> String {

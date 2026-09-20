@@ -187,6 +187,18 @@ final class SessionTab: Identifiable {
         }
     }
 
+    /// Badge-only refresh for a tab switch: re-count the changed files without
+    /// reloading every diff. A tab switch remounts the incoming session's
+    /// Changes page, so re-reading and re-diffing the whole changeset on every
+    /// switch is pure recompute — the diff store re-syncs on a pi file event,
+    /// on app activation, and when a review surface opens. Deferred like
+    /// `refreshWorkingTree` (called from a SwiftUI update handler).
+    func refreshGitCount() {
+        Task { @MainActor [weak self] in
+            self?.scheduleGitCountRefresh()
+        }
+    }
+
     /// Fan-out for "this folder may have changed on disk": re-count the
     /// changed files (the tab badge) and post the cwd-keyed notification that
     /// refreshes the Changes store (changed list + diffs). `path` is the touched

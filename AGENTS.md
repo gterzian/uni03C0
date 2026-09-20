@@ -232,8 +232,8 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 
 - Replacing the whole text storage every batch instead of the append-only
   `applyAttributedString` delta.
-- Clearing the height cache on session switch — off-main pre-measure keeps the
-  tab switch free of synchronous re-measure.
+- Clearing the height cache on session switch, or pre-measuring rows already
+  cached for the same tag+width (a rebind re-offers the whole window).
 - Serving `heightOfRow` with a fresh full measure of growing text.
 - A streaming crossfade that doesn't settle to the built string's colors:
   superseded batches must be settled, the last step must restore the captured
@@ -251,7 +251,7 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 ## Session pages & the Changes viewer (do not break)
 
 The conversation and Changes pages stay mounted and swap by visibility — never
-rebuild the transcript for Changes. The session owns one `ChangesStore`.
+rebuild the transcript for Changes.
 
 Rules:
 
@@ -263,8 +263,9 @@ Rules:
   two-pass `git diff --numstat`), off the main thread. Per-file diffs are loaded
   by `DiffLoader` off-main (bounded concurrency); a `path`-named change event
   reloads only that file, a nil event reloads all.
-- The store only advances on `GitStatus.didChangeNotification`; a terminal `git
-  commit` emits none, so the active session re-checks on activation and page opens.
+- The store only advances on `GitStatus.didChangeNotification` (a terminal `git
+  commit` emits none); a tab switch re-counts the badge only and the viewer
+  re-applies its cached document — never a full reload/rebuild on a switch.
 - The viewer is ONE `CodePaneContainer` (scroll view + `ReadOnlyCodeTextView` +
   ruler + edit-map scroller) holding every file's diff in path order. The
   document is assembled PLAIN off the main actor (`DiffDocumentBuilder`); syntax
@@ -275,8 +276,7 @@ Rules:
   `CodeSection` carries the file's canonical absolute path, so a copy tags a
   `CodeReference` to the FILE (real current-file lines, removed lines dropped),
   clamped to the owning section.
-- Search (`CodeSearchModel`) scans the whole viewer buffer — every line currently
-  in the document, visible or not — and re-runs when a file expands.
+- Search (`CodeSearchModel`) scans the whole viewer buffer and re-runs on expansion.
 - The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
 - `pi-file://` links reveal the file only when it is in the changeset (unchanged
   → dead), at the named line; a pre-document reveal defers to the next build.
@@ -290,8 +290,8 @@ Rules:
 Failed fixes (do not re-introduce):
 
 - Rendering only added lines, so a deletion-only change looked uncolored.
-- Rebuilding the whole viewer document on every scroll-spy tick, or loading all
-  diffs on the main thread.
+- Rebuilding the whole viewer document on every scroll-spy tick or tab switch,
+  or loading all diffs on the main thread.
 - Highlighting all of the diff document, or on the main thread: color only the
   visible range, off-main.
 - One edit-map tick per edited line per scroller repaint: coalesce per point row

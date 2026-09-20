@@ -723,9 +723,23 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// SAME `TranscriptText.measuredHeight` as the main-thread path, so a
     /// seeded height is indistinguishable from a synchronously measured one —
     /// the "one measurement function" invariant is preserved.
+    ///
+    /// Rows already cached for the same content tag AND width are skipped: a
+    /// rebind/reload re-offers the WHOLE window, so without this every tab
+    /// switch re-typeset every settled row off-main (the tab-switch CPU
+    /// regression) even though nothing changed. Appends still measure because
+    /// their rows are new; a settled tag (streaming bit flips) or a width
+    /// change still measures.
     private func schedulePremeasure(entries: [TranscriptEntry]) {
         guard let key = activeSessionKey else { return }
-        let specs = entries.compactMap { measureSpec(for: $0) }
+        let width = rowWidth(in: tableView)
+        let specs = entries.compactMap { entry -> RowMeasureSpec? in
+            if let cached = heights.cached(for: entry.id, width: width),
+               cached.tag == Self.contentTag(for: entry) {
+                return nil
+            }
+            return measureSpec(for: entry)
+        }
         guard !specs.isEmpty else { return }
         pendingPremeasure.append((key, specs))
         pumpPremeasure()

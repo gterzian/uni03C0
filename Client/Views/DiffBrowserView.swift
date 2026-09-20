@@ -27,6 +27,10 @@ nonisolated struct DiffDocument: @unchecked Sendable {
     let sections: [CodeSection]
     let fullIndices: [Int?]
     let markers: PaneMarkers
+    /// `[0, offset-after-each-newline]`, computed off-main as the lines are
+    /// appended, so applying the document does not rescan the whole buffer for
+    /// line starts on the main thread.
+    let lineStartOffsets: [Int]
 }
 
 /// Everything the document builder needs, snapshotted on the main actor: each
@@ -179,7 +183,17 @@ struct DiffBrowserView: NSViewRepresentable {
             if active {
                 if needsRebuild {
                     needsRebuild = false
-                    rebuild()
+                    // A pending rebuild may only be a remount's catch-up: if
+                    // this store already built the current document, re-apply
+                    // it rather than rebuilding the whole changeset.
+                    if let cached = store?.builtDocument(for: appliedDocumentVersion) {
+                        let version = appliedDocumentVersion
+                        Task { @MainActor [weak self] in
+                            self?.apply(cached, version: version)
+                        }
+                    } else {
+                        rebuild()
+                    }
                 } else {
                     scheduleHighlight(immediate: true)
                 }
@@ -220,7 +234,18 @@ struct DiffBrowserView: NSViewRepresentable {
             if documentVersion != appliedDocumentVersion {
                 appliedDocumentVersion = documentVersion
                 if isActive {
-                    rebuild()
+                    // A remount (the Changes page is `.id`-keyed per tab) must
+                    // not rebuild the whole changeset off-main: re-apply the
+                    // document this store already built, if it matches. Deferred
+                    // one main turn — `displayDocument` swaps the whole text
+                    // storage, which must not run inside `updateNSView`.
+                    if let cached = store.builtDocument(for: documentVersion) {
+                        Task { @MainActor [weak self] in
+                            self?.apply(cached, version: documentVersion)
+                        }
+                    } else {
+                        rebuild()
+                    }
                 } else {
                     needsRebuild = true
                 }
@@ -364,6 +389,7 @@ struct DiffBrowserView: NSViewRepresentable {
             // document): a scroll during the off-main build must not be lost.
             let anchor = captureAnchor()
             document = doc
+            store?.cacheBuiltDocument(doc, version: version)
             let restore = anchor.flatMap { restoreCharacterIndex(for: $0, in: doc) }
             container.displayDocument(
                 path: "",
@@ -371,7 +397,8 @@ struct DiffBrowserView: NSViewRepresentable {
                 lineNumbers: doc.lineNumbers,
                 sections: doc.sections,
                 markers: doc.markers,
-                restoreCharacterIndex: restore
+                restoreCharacterIndex: restore,
+                lineStartOffsets: doc.lineStartOffsets
             )
             container.setBusy(false)
             // A reveal that arrived before this document existed lands now.
@@ -589,7 +616,10 @@ nonisolated enum DiffDocumentBuilder {
             lineNumbers: lineNumbers,
             sections: sections,
             fullIndices: fullIndices,
-            markers: .lines(added: addedLines, removed: removedLines)
+            markers: .lines(added: addedLines, removed: removedLines),
+            // Same algorithm as the text view's own scan, run here off-main
+            // (the view is the single source of truth for the invariant).
+            lineStartOffsets: ReadOnlyCodeTextView.lineStartOffsets(in: text.string)
         )
     }
 

@@ -253,7 +253,7 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// Loads a file's content (syntax + edit attributes already applied by the
     /// pane) and rebuilds the line-offset table. `lineNumbers` is the real-line
     /// map for an interleaved diff (nil for a plain, non-diff buffer).
-    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil) {
+    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
         sectionPaths = []
@@ -264,14 +264,29 @@ final class ReadOnlyCodeTextView: NSTextView {
         searchHighlightRanges = []
         currentSearchHighlightIndex = -1
         textStorage?.setAttributedString(text)
-        rebuildLineOffsets()
+        // The caller (the diff builder) can pass the offsets it already knows,
+        // so applying a large document does not rescan it for line starts on
+        // the main thread. Empty/invalid input falls back to the scan.
+        if let lineStartOffsets, !lineStartOffsets.isEmpty {
+            self.lineStartOffsets = lineStartOffsets
+        } else {
+            rebuildLineOffsets()
+        }
         sizeToFit()
         // New file: show the top.
         scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
     private func rebuildLineOffsets() {
-        let ns = string as NSString
+        lineStartOffsets = Self.lineStartOffsets(in: string)
+    }
+
+    /// The start offset (UTF-16) of every line, ascending, as
+    /// `[0, offset-after-each-newline]`. Pure and reusable: the diff builder
+    /// computes it off-main so applying a large document does not rescan the
+    /// whole buffer for line starts on the main thread.
+    nonisolated static func lineStartOffsets(in text: String) -> [Int] {
+        let ns = text as NSString
         let length = ns.length
         var offsets: [Int] = [0]
         var search = 0
@@ -281,7 +296,7 @@ final class ReadOnlyCodeTextView: NSTextView {
             offsets.append(found.location + 1)
             search = found.location + 1
         }
-        lineStartOffsets = offsets
+        return offsets
     }
 
     /// Registers the file each character range belongs to (a multi-file diff

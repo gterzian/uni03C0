@@ -39,6 +39,14 @@ final class ChangesStore {
     /// `#L…` of an agent's `pi-file` link), nil for a whole-file reveal.
     var revealLine: Int?
 
+    /// The assembled document for `documentVersion`, from the viewer's off-main
+    /// builder. The Changes page is `.id`-keyed per tab, so a tab switch
+    /// remounts the viewer; re-applying this instead of rebuilding avoids the
+    /// off-main rebuild, the busy spinner, and re-scanning the buffer on the
+    /// main thread. Invalidated whenever a refresh advances `documentVersion`.
+    @ObservationIgnored private var cachedDocument: DiffDocument?
+    @ObservationIgnored private var cachedDocumentVersion = -1
+
     // MARK: The loaded diffs (off-main data, read by the document builder)
 
     @ObservationIgnored private(set) var diffs: [String: LoadedFileDiff] = [:]
@@ -149,7 +157,13 @@ final class ChangesStore {
                     needsRebuild = true
                 }
             }
-            if needsRebuild { documentVersion &+= 1 }
+            if needsRebuild {
+                documentVersion &+= 1
+                // The old document no longer matches its version: drop it so a
+                // remount cannot re-apply stale bytes and the memory is freed.
+                cachedDocument = nil
+                cachedDocumentVersion = -1
+            }
         } while refreshQueued
     }
 
@@ -233,6 +247,19 @@ final class ChangesStore {
     }
 
     // MARK: Viewer commands
+
+    /// Records the viewer's freshly built document, so a later remount of the
+    /// Changes page (a tab switch) re-applies it without rebuilding.
+    func cacheBuiltDocument(_ document: DiffDocument, version: Int) {
+        cachedDocument = document
+        cachedDocumentVersion = version
+    }
+
+    /// The cached document when it matches `version`, else nil (the viewer
+    /// then builds a fresh one).
+    func builtDocument(for version: Int) -> DiffDocument? {
+        cachedDocumentVersion == version ? cachedDocument : nil
+    }
 
     /// Scrolls the viewer to `path`'s section (optionally to a real file line
     /// inside it) and marks it selected.
