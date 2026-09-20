@@ -31,13 +31,16 @@ enum PaneMarkers: Sendable {
 }
 
 /// One file's slice of the diff viewer's document: where its lines live in the
-/// document, and which characters belong to its diff (for reference-tagged
-/// copies). `lineRange` spans the section's diff and expand lines too, so the
-/// scroll spy attributes a viewport parked anywhere in the section to the
-/// right file.
+/// document, which of those lines are actual diff lines (the visible-range
+/// highlighter colors only these, never the expand/placeholder rows), and which
+/// characters belong to its diff (for reference-tagged copies). `lineRange`
+/// spans the section's diff and expand lines too, so the scroll spy attributes
+/// a viewport parked anywhere in the section to the right file.
 struct CodeSection: Sendable {
     let path: String
     let lineRange: ClosedRange<Int>
+    /// Display lines holding real diff lines (excludes expand/placeholder rows).
+    let diffLineRange: ClosedRange<Int>
     let diffCharRange: NSRange
 }
 
@@ -113,6 +116,11 @@ final class CodePaneContainer: NSView {
         codeView.isHorizontallyResizable = true
         codeView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         codeView.autoresizingMask = []
+        // A large changeset's document must stay lazily laid out: with
+        // non-contiguous layout `sizeToFit` no longer forces a full-document
+        // pass (which cost seconds at 100k+ lines) and TextKit lays out the
+        // visible band on demand, the same lazy model the ruler already uses.
+        codeView.layoutManager?.allowsNonContiguousLayout = true
         codeView.onLinkClick = { [weak self] url in self?.onLinkClick?(url) }
         scrollView.documentView = codeView
 
@@ -277,6 +285,68 @@ final class CodePaneContainer: NSView {
         return layoutManager.characterIndexForGlyph(at: glyphIndex)
     }
 
+    // MARK: - Visible range (lazy highlighting)
+
+    /// The 1-based display lines currently inside the viewport, or nil when
+    /// there is no text. Used to highlight ONLY what is on screen; the bounds
+    /// force layout of the visible band alone (never the whole document).
+    var visibleDisplayLineRange: ClosedRange<Int>? {
+        guard let layoutManager = codeView.layoutManager,
+              let textContainer = codeView.textContainer,
+              layoutManager.numberOfGlyphs > 0 else { return nil }
+        let length = (codeView.string as NSString).length
+        guard length > 0 else { return nil }
+        let visibleInCodeView = clipView.convert(clipView.bounds, to: codeView)
+        let inset = codeView.textContainerInset
+        let band = NSRect(
+            x: 0,
+            y: visibleInCodeView.minY - inset.height,
+            width: max(codeView.bounds.width, 1),
+            height: max(visibleInCodeView.height, 1)
+        )
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: band, in: textContainer)
+        guard glyphRange.length > 0 else { return nil }
+        let charRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+        let first = codeView.lineNumber(forIndex: min(charRange.location, length - 1))
+        let last = codeView.lineNumber(forIndex: min(NSMaxRange(charRange), length - 1))
+        return first...max(first, last)
+    }
+
+    /// The character range of a run of display lines, excluding the trailing
+    /// newline. nil when the range is out of bounds.
+    func characterRange(forDisplayLines range: ClosedRange<Int>) -> NSRange? {
+        let offsets = codeView.lineStartOffsets
+        let length = (codeView.string as NSString).length
+        guard range.lowerBound >= 1, range.lowerBound <= offsets.count else { return nil }
+        let start = offsets[range.lowerBound - 1]
+        let end: Int
+        if range.upperBound < offsets.count {
+            end = offsets[range.upperBound] - 1
+        } else {
+            end = length
+        }
+        guard end >= start, end <= length else { return nil }
+        return NSRange(location: start, length: end - start)
+    }
+
+    /// Applies syntax foreground colors to the visible range. Only
+    /// `foregroundColor` is copied, so the uniform monospaced font (and the
+    /// added/removed line backgrounds) stay exactly as built.
+    func applyHighlights(_ chunks: [HighlightedChunk]) {
+        guard let storage = codeView.textStorage else { return }
+        storage.beginEditing()
+        defer { storage.endEditing() }
+        for chunk in chunks {
+            let length = chunk.attributed.length
+            chunk.attributed.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: length), options: []) { value, runRange, _ in
+                guard let color = value as? NSColor else { return }
+                let docRange = NSRange(location: chunk.range.location + runRange.location, length: runRange.length)
+                guard NSMaxRange(docRange) <= storage.length else { return }
+                storage.addAttribute(.foregroundColor, value: color, range: docRange)
+            }
+        }
+    }
+
     // MARK: - Sections
 
     /// The path owning the top of the viewport (the scroll spy).
@@ -316,9 +386,12 @@ final class CodePaneContainer: NSView {
             scroller.clearMarkers()
         case .lines(let added, let removed):
             scroller.wholeTrackColor = nil
-            var lineCount = 0
-            for character in text where character == "\n" { lineCount += 1 }
-            if !text.isEmpty, !text.hasSuffix("\n") { lineCount += 1 }
+            // The line table was rebuilt by `load` just above: reuse it rather
+            // than re-scanning a multi-megabyte string on the main thread.
+            // A trailing newline leaves a "phantom" final offset, which is not
+            // a real line.
+            let offsets = codeView.lineStartOffsets
+            let lineCount = text.isEmpty ? 0 : (text.hasSuffix("\n") ? offsets.count - 1 : offsets.count)
             guard lineCount > 0 else {
                 scroller.markers = []
                 return
@@ -330,9 +403,21 @@ final class CodePaneContainer: NSView {
                     color: color
                 )
             }
-            scroller.markers = (added.compactMap { marker($0, .systemGreen) }
-                + removed.compactMap { marker($0, .systemRed) })
-                .sorted { $0.fraction < $1.fraction }
+            // `added`/`removed` are in ascending line order, so this is a merge
+            // of two sorted runs (no O(n log n) sort of a huge changeset).
+            var result: [CodePaneEditMarkerScroller.Marker] = []
+            result.reserveCapacity(added.count + removed.count)
+            var i = 0, j = 0
+            while i < added.count || j < removed.count {
+                let takeAdded: Bool
+                if j >= removed.count { takeAdded = true }
+                else if i >= added.count { takeAdded = false }
+                else { takeAdded = added[i] <= removed[j] }
+                let line = takeAdded ? added[i] : removed[j]
+                if takeAdded { i += 1 } else { j += 1 }
+                if let m = marker(line, takeAdded ? .systemGreen : .systemRed) { result.append(m) }
+            }
+            scroller.markers = result
         }
     }
 }

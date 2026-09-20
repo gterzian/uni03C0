@@ -120,11 +120,10 @@ app is titled "uni03C0".
   xcodebuild works only from a terminal; if package resolution fails in the
   sandbox, run `./run.sh` once in the terminal.
 
-Writing tests: RenderingTests are plain `XCTestCase` subclasses on the main
-actor; use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`. Keep the
-load-bearing invariant asserted: `TranscriptText.measuredHeight` must equal the
-cell's layout-manager height; pass the **same** parameters to `configure` and
-`measuredHeight`. Tests never spawn a real `pi` or hit a live model.
+Writing tests: use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`; keep
+`TranscriptText.measuredHeight` equal to the cell's layout-manager height (pass
+the **same** parameters to `configure` and `measuredHeight`). Tests never spawn a
+real `pi` or hit a live model.
 
 ---
 
@@ -179,15 +178,13 @@ cell's layout-manager height; pass the **same** parameters to `configure` and
 - **Never** use `paragraphSpacingBefore`/`paragraphSpacing` for block
   separation: on this SDK they inflate **every line fragment** of a multi-line
   paragraph (verified). `MarkdownText` uses explicit empty spacer lines.
-- **Soft breaks parse to a SPACE, not `\n`.** `AttributedString(markdown:)`
-  emits an intra-paragraph newline as a `.softBreak` run whose text is a space;
-  re-emit a real `\n` for soft and hard (`.lineBreak`) breaks, or multi-line
-  prose collapses.
-- **`AttributedString(markdown:)` has no table extension.** `MarkdownText`
-  detects GFM header + delimiter rows (never inside a fence) and renders
-  tab-stop-positioned lines inside the row's one attributed string, so the
-  measurement invariant holds. Use `NSTextTab`s at column edges (a right-aligned
-  stop lands text flush); space padding drifts, and a leading tab stop at 0 is
+- **Soft breaks parse to a SPACE, not `\n`.** `AttributedString(markdown:)` emits
+  an intra-paragraph newline as a `.softBreak` run whose text is a space; re-emit
+  a real `\n` for soft and hard (`.lineBreak`) breaks or multi-line prose collapses.
+- **`AttributedString(markdown:)` has no table extension.** `MarkdownText` detects
+  GFM header + delimiter rows (never inside a fence) and renders tab-stop lines in
+  the row's one attributed string, so the measurement invariant holds. Use
+  `NSTextTab`s at column edges; space padding drifts, and a leading stop at 0 is
   skipped, so add a leading tab only when column 1 is not left-aligned. Keep the
   no-`|` fast path on the streaming hot path.
 - **Row-height under-measure clips the TOP.** The text view is flipped but the
@@ -272,12 +269,12 @@ Rules:
   commit` emits none, so the active session re-checks on activation and page opens.
 - The viewer is ONE `CodePaneContainer` (scroll view + `ReadOnlyCodeTextView` +
   ruler + edit-map scroller) holding every file's diff in path order. The
-  document is built by `DiffDocumentBuilder` on a worker thread — never on the
-  main actor (highlight.js is ~200ms/1000 lines) — and applied in one main-actor
-  hop by `DiffBrowserView.Coordinator`, with an AppKit spinner over the build.
-  Expansion is a per-file window via `pi-diff://` link rows; unchanged files
-  keep their highlighted segment (cache keyed on CONTENT + theme). Never build
-  for a hidden page; `sizeThatFits` fills the slot, never the content.
+  document is assembled PLAIN off the main actor (`DiffDocumentBuilder`); syntax
+  colors are applied only to the VISIBLE display lines (`DiffHighlighter`, off
+  the main actor, coalesced on a 120ms scroll gate) — per file and within a
+  file, so a large changeset never colors what is off screen. Non-contiguous
+  layout keeps `sizeToFit` from a full-document pass; never build for a hidden
+  page, and `sizeThatFits` fills the slot, never the content.
 - Search (`CodeSearchModel`) scans the whole viewer buffer — every line currently
   in the document, visible or not — and re-runs when a file expands.
 - The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
@@ -295,5 +292,8 @@ Failed fixes (do not re-introduce):
 - Rendering only added lines, so a deletion-only change looked uncolored.
 - Rebuilding the whole viewer document on every scroll-spy tick, or loading all
   diffs on the main thread.
-- Syntax-highlighting the diff document on the main thread — opening Changes on a
-  large project beachballs (highlight.js is a synchronous JS pass per file).
+- Highlighting all of the diff document, or on the main thread: color only the
+  visible range, off-main.
+- One edit-map tick per edited line per scroller repaint: coalesce per point row
+  and cache the paths.
+- `sizeToFit` without `allowsNonContiguousLayout`: full-document layout is seconds.

@@ -712,8 +712,22 @@ class EditMarkerScroller: NSScroller {
 
     /// The edit ticks, in ascending document order.
     var markers: [Marker] = [] {
-        didSet { needsDisplay = true }
+        didSet {
+            markersRevision &+= 1
+            needsDisplay = true
+        }
     }
+
+    /// Bumped on every `markers` change, so the built tick paths can be cached
+    /// across scroller repaints (the knob moves on every scroll, but the ticks
+    /// do not).
+    private var markersRevision = 0
+    private struct FillsKey: Equatable {
+        let revision: Int
+        let minY, midX, height, knobHeight: CGFloat
+    }
+    private var fillsKey: FillsKey?
+    private var cachedFills: [(color: NSColor, path: NSBezierPath)] = []
 
     /// Clears both the ticks and the whole-track tint.
     func clearMarkers() {
@@ -726,16 +740,27 @@ class EditMarkerScroller: NSScroller {
         drawEditMarkers(in: slotRect)
     }
 
+    /// Device-RGB key for batching same-colored ticks. `NSColor` hash/equality
+    /// across dynamically-constructed colors (the hue-blended row tints) is not
+    /// a contract to rely on for dictionary keys, but equal components are
+    /// exactly "paint these together".
+    private struct ColorKey: Hashable {
+        let r, g, b, a: CGFloat
+        init(_ color: NSColor) {
+            let rgb = color.usingColorSpace(.deviceRGB) ?? color
+            r = rgb.redComponent
+            g = rgb.greenComponent
+            b = rgb.blueComponent
+            a = rgb.alphaComponent
+        }
+    }
+
     /// Paints the edit map into the slot, UNDER the knob (the knob is drawn
     /// afterwards by the default `drawKnob`, so it covers any tick it overlaps
     /// — a tick whose edit is currently on screen disappears under the knob,
     /// exactly the \"you are here\" read). The scroller is flipped (top-down):
     /// slot y grows downward, matching the document.
     private func drawEditMarkers(in slotRect: NSRect) {
-        let tickWidth: CGFloat = 4
-        let tickHeight: CGFloat = 5
-        let x = slotRect.midX - tickWidth / 2
-
         if let wholeTrackColor {
             wholeTrackColor.withAlphaComponent(0.28).setFill()
             NSBezierPath(roundedRect: slotRect, xRadius: slotRect.width / 2, yRadius: slotRect.width / 2).fill()
@@ -744,53 +769,61 @@ class EditMarkerScroller: NSScroller {
         guard !markers.isEmpty else { return }
         // Map a document fraction to the slot position whose knob-top would
         // land there: the knob travels over (slotHeight - knobHeight) as the
-        // viewport travels over the scrollable document.
-        // The knob's height at the current scroll (its travel range over the
-        // track is slotHeight - knobHeight). rect(for:) is the authoritative
-        // source when available; knobProportion is the fallback.
+        // viewport travels over the scrollable document. `rect(for:)` is the
+        // authoritative source when available; `knobProportion` is the fallback.
         let knobHeight = rect(for: .knob).height > 0 ? rect(for: .knob).height : knobProportion * slotRect.height
-        let travel = max(slotRect.height - knobHeight, 1)
 
-        // Batch the ticks by color: every same-color tick appends its rounded
-        // rect as a SUBPATH of one path, then each color gets exactly ONE
-        // fill. The old loop issued a path allocation + setFill + fill per
-        // marker, so a file with many edited lines (or a tree with many
-        // edited rows) meant that many tiny state changes and rasterized
-        // fills on every scroller repaint.
-        //
-        // Keyed by device-RGB components rather than the `NSColor` object:
-        // `NSColor` hash/equality across dynamically-constructed colors (the
-        // hue-blended row tints) is not a contract to rely on for dictionary
-        // keys, but equal components are exactly "paint these together".
-        struct ColorKey: Hashable {
-            let r, g, b, a: CGFloat
-            init(_ color: NSColor) {
-                let rgb = color.usingColorSpace(.deviceRGB) ?? color
-                r = rgb.redComponent
-                g = rgb.greenComponent
-                b = rgb.blueComponent
-                a = rgb.alphaComponent
-            }
+        // Only the TICKS depend on `markers`; the knob moves on every scroll,
+        // so the built paths are cached and re-filled until the tick set or the
+        // slot geometry changes. See `buildFills` for the one-rect-per-pixel
+        // coalescing that keeps a huge changeset from drawing tens of thousands
+        // of subpaths on every repaint.
+        let key = FillsKey(revision: markersRevision, minY: slotRect.minY, midX: slotRect.midX, height: slotRect.height, knobHeight: knobHeight)
+        if fillsKey != key {
+            cachedFills = buildFills(in: slotRect, knobHeight: knobHeight)
+            fillsKey = key
         }
-        var fills: [ColorKey: (color: NSColor, path: NSBezierPath)] = [:]
-        fills.reserveCapacity(min(markers.count, 8))
-        for marker in markers {
-            // Fraction along the scrollable document, clamped to the track.
-            let f = min(max(marker.fraction, 0), 1)
-            let y = slotRect.minY + f * travel - tickHeight / 2
-            let key = ColorKey(marker.color)
-            let entry = fills[key] ?? (marker.color, NSBezierPath())
-            entry.path.appendRoundedRect(
-                NSRect(x: x, y: y, width: tickWidth, height: tickHeight),
-                xRadius: tickWidth / 2,
-                yRadius: tickWidth / 2
-            )
-            fills[key] = entry
-        }
-        for entry in fills.values {
+        for entry in cachedFills {
             entry.color.setFill()
             entry.path.fill()
         }
+    }
+
+    /// Builds one batched path per tick color, coalescing ticks that land on
+    /// the same point row. A changed file alone can contribute one tick per
+    /// edited line — tens of thousands for a large changeset — and they land
+    /// on at most one per point of track, so the coalesced map is visually
+    /// identical while being ~100× cheaper to rasterize.
+    private func buildFills(in slotRect: NSRect, knobHeight: CGFloat) -> [(color: NSColor, path: NSBezierPath)] {
+        let tickWidth: CGFloat = 4
+        let tickHeight: CGFloat = 5
+        let x = slotRect.midX - tickWidth / 2
+        let travel = max(slotRect.height - knobHeight, 1)
+
+        var order: [ColorKey] = []
+        var colorByKey: [ColorKey: NSColor] = [:]
+        var rowsByKey: [ColorKey: Set<Int>] = [:]
+        var pathByKey: [ColorKey: NSBezierPath] = [:]
+        for marker in markers {
+            let f = min(max(marker.fraction, 0), 1)
+            let y = slotRect.minY + f * travel - tickHeight / 2
+            let row = Int(y.rounded())
+            let key = ColorKey(marker.color)
+            if colorByKey[key] == nil {
+                colorByKey[key] = marker.color
+                rowsByKey[key] = []
+                pathByKey[key] = NSBezierPath()
+                order.append(key)
+            }
+            if rowsByKey[key]!.insert(row).inserted {
+                pathByKey[key]!.appendRoundedRect(
+                    NSRect(x: x, y: CGFloat(row), width: tickWidth, height: tickHeight),
+                    xRadius: tickWidth / 2,
+                    yRadius: tickWidth / 2
+                )
+            }
+        }
+        return order.map { (colorByKey[$0]!, pathByKey[$0]!) }
     }
 }
 
