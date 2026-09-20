@@ -30,6 +30,15 @@ enum PaneMarkers: Sendable {
     case lines(added: [Int], removed: [Int])
 }
 
+/// A highlighted chunk, with its position in the document. Consumed by
+/// `CodePaneContainer.applyHighlights`; declared here (with its consumer)
+/// rather than in `DiffBrowserView` so the container compiles into the
+/// renderer test bundle, which does not build the whole Changes page.
+nonisolated struct HighlightedChunk: @unchecked Sendable {
+    let range: NSRange
+    let attributed: NSAttributedString
+}
+
 /// One file's slice of the diff viewer's document: where its lines live in the
 /// document, which of those lines are actual diff lines (the visible-range
 /// highlighter colors only these, never the expand/placeholder rows), and which
@@ -37,7 +46,12 @@ enum PaneMarkers: Sendable {
 /// spans the section's diff and expand lines too, so the scroll spy attributes
 /// a viewport parked anywhere in the section to the right file.
 struct CodeSection: Sendable {
+    /// Session-relative path (the form the sidebar and the agent use).
     let path: String
+    /// Canonical absolute path of the same file. The diff document is a
+    /// multi-file buffer, so this is what a reference-tagged copy writes into
+    /// the `CodeReference` (the reference must name the FILE, never the diff).
+    let absolutePath: String
     let lineRange: ClosedRange<Int>
     /// Display lines holding real diff lines (excludes expand/placeholder rows).
     let diffLineRange: ClosedRange<Int>
@@ -194,7 +208,10 @@ final class CodePaneContainer: NSView {
         self.sections = sections
 
         codeView.load(path: path, text: text, lineNumbers: lineNumbers)
-        codeView.setSectionPaths(sections.map { ($0.diffCharRange, $0.path) })
+        // The document is every file's diff in one buffer: each file's diff
+        // lines map to that file's canonical absolute path, so a copy inside
+        // the diff tags a reference to the FILE (never to "the diff").
+        codeView.setSectionPaths(sections.map { ($0.diffCharRange, $0.absolutePath) })
         applyMarkers(markers, in: text.string)
 
         if let restoreCharacterIndex, restoreCharacterIndex < (codeView.string as NSString).length {
@@ -359,12 +376,28 @@ final class CodePaneContainer: NSView {
     }
 
     /// The character index of a path's section start (for a reveal jump), or
-    /// nil when the path is not in the document.
-    func characterIndex(forPath path: String) -> Int? {
+    /// nil when the path is not in the document. When `line` is given (the
+    /// 1-based real file line an agent's `pi-file` link named), the nearest
+    /// display line showing that real line wins — falling back to the section
+    /// start when the target is outside the currently shown diff window.
+    func characterIndex(forPath path: String, line: Int? = nil) -> Int? {
         guard let section = sections.first(where: { $0.path == path }) else { return nil }
-        let line = section.lineRange.lowerBound
-        guard line >= 1, line - 1 < codeView.lineStartOffsets.count else { return nil }
-        return codeView.lineStartOffsets[line - 1]
+        var target = section.lineRange.lowerBound
+        if let line {
+            // The section's display lines carry real file line numbers (nil for
+            // a removed line), monotonically non-decreasing, so walk to the
+            // last display line at or before the target and stop at the first
+            // that overshoots. Never consults `displayLine(forRealLine:)`: that
+            // searches the WHOLE multi-file map, where every file's real line
+            // numbers restart — it would land on an earlier file with the same
+            // line number.
+            for display in section.lineRange {
+                guard let real = codeView.realLineNumber(forDisplayLine: display) else { continue }
+                if real <= line { target = display } else { break }
+            }
+        }
+        guard target >= 1, target - 1 < codeView.lineStartOffsets.count else { return nil }
+        return codeView.lineStartOffsets[target - 1]
     }
 
     // MARK: - Search

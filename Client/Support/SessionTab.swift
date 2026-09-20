@@ -136,14 +136,15 @@ final class SessionTab: Identifiable {
     }
 
     /// Opens a clicked agent file reference: flip to the Changes page (a pure
-    /// visibility flip) and scroll its viewer to the referenced file when that
-    /// file is part of the uncommitted changeset. A reference to an unchanged
-    /// file has nowhere to land (the repo is no longer browsable) and is left
-    /// alone.
+    /// visibility flip) and scroll its viewer to the referenced file — landing
+    /// on the referenced line when the link named one and that line is part of
+    /// the shown diff window. A reference to a file with no uncommitted change
+    /// has no diff section to land on (the viewer is the only file surface) and
+    /// is left alone: the agent is taught to reference only changed files.
     private func openFileReference(_ link: FileReferenceLink) {
         guard changes.entries.contains(where: { $0.path == link.path }) else { return }
         page = .changes
-        changes.reveal(link.path)
+        changes.reveal(link.path, line: link.startLine)
     }
 
     func start() async {

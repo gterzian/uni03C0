@@ -165,6 +165,7 @@ struct ChangesView: View {
                     store: store,
                     documentVersion: store.documentVersion,
                     revealPath: store.revealPath,
+                    revealLine: store.revealLine,
                     onRevealConsumed: { store.consumeReveal() },
                     onTopSectionChanged: { store.setTopSection($0) },
                     pageActive: pageActive,

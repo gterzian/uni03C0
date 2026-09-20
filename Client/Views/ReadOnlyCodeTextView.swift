@@ -291,13 +291,16 @@ final class ReadOnlyCodeTextView: NSTextView {
         sectionPaths = paths
     }
 
-    /// The absolute path owning a character index, falling back to
-    /// `absolutePath` for a single-file buffer.
-    private func path(at index: Int) -> String {
+    /// The file section owning a character index, with its diff-character
+    /// range, falling back to the whole buffer for a single-file view. nil
+    /// when the index is not in any file's diff lines (an expand/placeholder
+    /// row), which `copy` treats as "do a plain copy".
+    private func section(at index: Int) -> (path: String, range: NSRange)? {
         for entry in sectionPaths where NSLocationInRange(index, entry.range) {
-            return entry.absolutePath
+            return (entry.absolutePath, entry.range)
         }
-        return absolutePath
+        guard !absolutePath.isEmpty else { return nil }
+        return (absolutePath, NSRange(location: 0, length: (string as NSString).length))
     }
 
     /// The 1-based line containing character `index` (0 ≤ index < length).
@@ -348,16 +351,38 @@ final class ReadOnlyCodeTextView: NSTextView {
 
     /// The REAL current-file line number of a character index (the copy
     /// reference's line). A character on a removed line maps to the nearest
-    /// real line before it, so a selection spanning a removal still produces a
-    /// valid in-file reference.
+    /// real line in the SAME file section — preferring one before it, then one
+    /// after — so a selection spanning a removal still produces a valid
+    /// in-file reference and never borrows the previous file's line numbers
+    /// (in the multi-file diff every file's real numbers restart).
     func realLineNumber(forIndex index: Int) -> Int {
         let display = lineNumber(forIndex: index)
+        let (lower, upper) = sectionDisplayBounds(containing: index)
         var candidate = display
-        while candidate >= 1 {
+        while candidate >= lower {
             if let real = realLineNumber(forDisplayLine: candidate) { return real }
             candidate -= 1
         }
-        return 1
+        // A leading removal run: take the first real line below it.
+        candidate = display + 1
+        while candidate <= upper {
+            if let real = realLineNumber(forDisplayLine: candidate) { return real }
+            candidate += 1
+        }
+        return lower
+    }
+
+    /// The inclusive display-line bounds of the file section owning `index`,
+    /// or the whole buffer for a single-file view.
+    private func sectionDisplayBounds(containing index: Int) -> (lower: Int, upper: Int) {
+        let length = (string as NSString).length
+        for entry in sectionPaths where NSLocationInRange(index, entry.range) {
+            let lower = lineNumber(forIndex: entry.range.location)
+            let endIndex = max(entry.range.location, entry.range.location + entry.range.length - 1)
+            let upper = lineNumber(forIndex: min(endIndex, max(length - 1, 0)))
+            return (lower, upper)
+        }
+        return (1, max(lineStartOffsets.count, 1))
     }
 
     /// The selected text with any interleaved removed lines dropped, so a
@@ -387,12 +412,28 @@ final class ReadOnlyCodeTextView: NSTextView {
 
     override func copy(_ sender: Any?) {
         let selection = selectedRange()
-        // Nothing selected (just a caret), or no file loaded: fall back to
-        // normal copy behavior instead of writing a zero-width nonsense
-        // reference.
+        // Nothing selected (just a caret), or the selection is not inside a
+        // loaded file's diff lines (an expand/placeholder row): fall back to
+        // normal copy behavior instead of writing a zero-width or bogus
+        // reference. In the Changes viewer the buffer holds every changed
+        // file's diff, so the owning file comes from the per-section ranges;
+        // for a single-file buffer it is `absolutePath`.
         guard selection.length > 0,
               Range(selection, in: string) != nil,
-              !absolutePath.isEmpty else {
+              let section = section(at: selection.location) else {
+            super.copy(sender)
+            return
+        }
+        // Clamp the selection to the owning file's diff lines: a drag that
+        // runs past the section into the next file (or a trailing expand row)
+        // must never pull another file's text into this file's snippet. A
+        // trailing newline is naturally dropped (the section's range ends at
+        // the last diff character), so a selection through the newline still
+        // ends on its own line.
+        let sectionEnd = section.range.location + section.range.length
+        let clampedEnd = min(selection.location + selection.length, sectionEnd)
+        let clamped = NSRange(location: selection.location, length: max(0, clampedEnd - selection.location))
+        guard clamped.length > 0 else {
             super.copy(sender)
             return
         }
@@ -402,11 +443,18 @@ final class ReadOnlyCodeTextView: NSTextView {
         // when the buffer is an interleaved diff (removed lines map to the
         // nearest real line around them), and the snippet drops the removed
         // lines so the frozen reference always quotes text that is in the file.
-        let startLine = realLineNumber(forIndex: selection.location)
-        let endLine = realLineNumber(forIndex: selection.location + selection.length - 1)
-        let snippet = realSnippet(for: selection)
+        let startLine = realLineNumber(forIndex: clamped.location)
+        let endLine = realLineNumber(forIndex: clamped.location + clamped.length - 1)
+        let snippet = realSnippet(for: clamped)
+        // A selection made up entirely of removed (old-side) lines has no
+        // current-file content to freeze: a reference to it would quote an
+        // empty fenced block. Paste the removed text plainly instead.
+        guard !snippet.isEmpty else {
+            super.copy(sender)
+            return
+        }
         let reference = CodeReference(
-            absolutePath: path(at: selection.location),
+            absolutePath: section.path,
             startLine: startLine,
             endLine: endLine,
             snippet: snippet

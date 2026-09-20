@@ -250,10 +250,8 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 
 ## Session pages & the Changes viewer (do not break)
 
-The conversation and Changes pages stay mounted and swap by visibility; never
-rebuild the transcript to show Changes. The session owns one `ChangesStore`; the
-viewer renders one document built from it, and the sidebar renders only visible
-rows.
+The conversation and Changes pages stay mounted and swap by visibility — never
+rebuild the transcript for Changes. The session owns one `ChangesStore`.
 
 Rules:
 
@@ -272,14 +270,16 @@ Rules:
   document is assembled PLAIN off the main actor (`DiffDocumentBuilder`); syntax
   colors are applied only to the VISIBLE display lines (`DiffHighlighter`, off
   the main actor, coalesced on a 120ms scroll gate) — per file and within a
-  file, so a large changeset never colors what is off screen. Non-contiguous
-  layout keeps `sizeToFit` from a full-document pass; never build for a hidden
-  page, and `sizeThatFits` fills the slot, never the content.
+  file, so a large changeset never colors what is off screen. Never build for a
+  hidden page; `sizeThatFits` fills the slot, never the content. Each
+  `CodeSection` carries the file's canonical absolute path, so a copy tags a
+  `CodeReference` to the FILE (real current-file lines, removed lines dropped),
+  clamped to the owning section.
 - Search (`CodeSearchModel`) scans the whole viewer buffer — every line currently
   in the document, visible or not — and re-runs when a file expands.
 - The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
-- `pi-file://` links (`FileReferenceLink`) post a cwd-keyed `openFileReference`;
-  the tab reveals the file in the Changes viewer only when it is in the changeset.
+- `pi-file://` links reveal the file only when it is in the changeset (unchanged
+  → dead), at the named line; a pre-document reveal defers to the next build.
 - Diff egress uses the interleaved view (removed lines inline in red), not
   added-lines-only. Spinners are AppKit `SpinnerView`, never a SwiftUI
   `ProgressView` in a mounted view.

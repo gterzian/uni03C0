@@ -35,6 +35,9 @@ final class ChangesStore {
     /// One-shot "scroll the viewer to this path's section" request. Consumed by
     /// the viewer via `consumeReveal()`.
     var revealPath: String?
+    /// One-shot target line within `revealPath` (1-based real file line, the
+    /// `#L…` of an agent's `pi-file` link), nil for a whole-file reveal.
+    var revealLine: Int?
 
     // MARK: The loaded diffs (off-main data, read by the document builder)
 
@@ -231,14 +234,17 @@ final class ChangesStore {
 
     // MARK: Viewer commands
 
-    /// Scrolls the viewer to `path`'s section and marks it selected.
-    func reveal(_ path: String) {
+    /// Scrolls the viewer to `path`'s section (optionally to a real file line
+    /// inside it) and marks it selected.
+    func reveal(_ path: String, line: Int? = nil) {
         selectedPath = path
         revealPath = path
+        revealLine = line
     }
 
     func consumeReveal() {
         revealPath = nil
+        revealLine = nil
     }
 
     /// The viewer's scroll spy: which file's section owns the top of the

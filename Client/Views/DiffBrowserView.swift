@@ -40,6 +40,9 @@ nonisolated struct DiffBuildFile: Sendable {
 }
 
 nonisolated struct DiffBuildInput: Sendable {
+    /// The session folder, needed to turn each file's cwd-relative path into
+    /// the canonical absolute path a reference-tagged copy records.
+    let cwd: URL
     let files: [DiffBuildFile]
 }
 
@@ -50,12 +53,6 @@ nonisolated struct HighlightChunk: Sendable {
     let range: NSRange
     let text: String
     let language: String?
-}
-
-/// A highlighted chunk, with its position in the document.
-nonisolated struct HighlightedChunk: @unchecked Sendable {
-    let range: NSRange
-    let attributed: NSAttributedString
 }
 
 /// The Changes page's diff viewer: ONE scroll view holding every changed
@@ -79,6 +76,9 @@ struct DiffBrowserView: NSViewRepresentable {
     let documentVersion: Int
     /// One-shot: scroll to this path's section.
     let revealPath: String?
+    /// One-shot: the 1-based real file line to land on within `revealPath`
+    /// (an agent link's `#L…`), or nil for a whole-file reveal.
+    var revealLine: Int? = nil
     var onRevealConsumed: () -> Void = {}
     /// The store's scroll spy: the path whose section owns the viewport top.
     var onTopSectionChanged: (String?) -> Void = { _ in }
@@ -117,6 +117,7 @@ struct DiffBrowserView: NSViewRepresentable {
             store: store,
             documentVersion: documentVersion,
             revealPath: revealPath,
+            revealLine: revealLine,
             onRevealConsumed: onRevealConsumed,
             onTopSectionChanged: onTopSectionChanged
         )
@@ -144,7 +145,18 @@ struct DiffBrowserView: NSViewRepresentable {
         private var onRevealConsumed: (() -> Void)?
         private var onTopSectionChanged: ((String?) -> Void)?
         private var appliedDocumentVersion = -1
-        private var appliedRevealPath: String?
+        /// The reveal request already applied, as (path, line), so a second
+        /// link to the same file at a different line still jumps.
+        private struct RevealKey: Equatable {
+            let path: String
+            let line: Int?
+        }
+        private var appliedReveal: RevealKey?
+        /// A reveal whose target is not in the current document yet (the
+        /// first build is still pending). Applied once the rebuild lands, so
+        /// a link clicked before the Changes page was ever shown still lands
+        /// on its file.
+        private var pendingReveal: RevealKey?
         private var isActive = true
         private var needsRebuild = false
         private var buildTask: Task<Void, Never>?
@@ -197,6 +209,7 @@ struct DiffBrowserView: NSViewRepresentable {
             store: ChangesStore,
             documentVersion: Int,
             revealPath: String?,
+            revealLine: Int?,
             onRevealConsumed: @escaping () -> Void,
             onTopSectionChanged: @escaping (String?) -> Void
         ) {
@@ -212,13 +225,23 @@ struct DiffBrowserView: NSViewRepresentable {
                     needsRebuild = true
                 }
             }
-            if let revealPath, revealPath != appliedRevealPath {
-                appliedRevealPath = revealPath
-                reveal(revealPath)
+            if let revealPath {
+                let request = RevealKey(path: revealPath, line: revealLine)
+                if request != appliedReveal {
+                    appliedReveal = request
+                    // Land immediately when the target's section is already in
+                    // the built document; otherwise remember the request and
+                    // land once the rebuild applies (see `apply`).
+                    if container?.sections.contains(where: { $0.path == revealPath }) == true {
+                        pendingReveal = nil
+                        reveal(revealPath, line: revealLine)
+                    } else {
+                        pendingReveal = request
+                    }
+                }
                 onRevealConsumed()
-            }
-            if revealPath == nil {
-                appliedRevealPath = nil
+            } else {
+                appliedReveal = nil
             }
         }
 
@@ -304,8 +327,8 @@ struct DiffBrowserView: NSViewRepresentable {
             }
         }
 
-        func reveal(_ path: String) {
-            guard let container, let index = container.characterIndex(forPath: path) else { return }
+        func reveal(_ path: String, line: Int?) {
+            guard let container, let index = container.characterIndex(forPath: path, line: line) else { return }
             container.scrollCharacterToTop(index)
             onTopSectionChanged?(path)
         }
@@ -319,7 +342,7 @@ struct DiffBrowserView: NSViewRepresentable {
         private func rebuild() {
             guard let container, let store else { return }
             let version = appliedDocumentVersion
-            let input = DiffBuildInput(files: snapshot(store))
+            let input = DiffBuildInput(cwd: store.cwd, files: snapshot(store))
             buildTask?.cancel()
             highlightTask?.cancel()
             container.setBusy(true)
@@ -351,6 +374,11 @@ struct DiffBrowserView: NSViewRepresentable {
                 restoreCharacterIndex: restore
             )
             container.setBusy(false)
+            // A reveal that arrived before this document existed lands now.
+            if let pending = pendingReveal {
+                pendingReveal = nil
+                reveal(pending.path, line: pending.line)
+            }
             // The buffer was replaced: re-run an active find against it, then
             // color whatever is on screen.
             search?.bufferDidChange()
@@ -542,8 +570,14 @@ nonisolated enum DiffDocumentBuilder {
             // anchor the scroll spy or a reveal on; skip it.
             guard sectionEnd >= sectionStart, diffStart >= 0, diffFirstLine > 0 else { continue }
             let diffRange = NSRange(location: diffStart, length: max(diffEnd - diffStart, 0))
+            // The section's file, canonical (filesystem stat, off-main): a copy
+            // tags a reference with this, so the reference names the FILE.
+            let absolutePath = SandboxPolicy.canonicalize(
+                URL(fileURLWithPath: file.path, relativeTo: input.cwd).path
+            )
             sections.append(CodeSection(
                 path: file.path,
+                absolutePath: absolutePath,
                 lineRange: sectionStart...sectionEnd,
                 diffLineRange: diffFirstLine...diffLastLine,
                 diffCharRange: diffRange
