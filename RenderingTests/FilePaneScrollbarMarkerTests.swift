@@ -81,6 +81,25 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     }
 
     @MainActor
+    func testMarkerFractionsOverrideTheLineCountFallback() {
+        let container = makeContainer()
+        // The document mixes font sizes, so the builder supplies each line's
+        // real center fraction; the container must use it, not line/count.
+        container.displayDocument(
+            path: "/tmp/x.swift",
+            text: paneText(lineCount: 3),
+            markers: .lines(added: [2], removed: []),
+            markerFractions: [0.1, 0.9, 0.95]
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+
+        let markers = scroller(of: container)?.markers ?? []
+        XCTAssertEqual(markers.count, 1)
+        XCTAssertEqual(markers[0].fraction, 0.9, accuracy: 0.0001,
+                       "the builder's measured fraction wins over the uniform fallback")
+    }
+
+    @MainActor
     func testBatchedDrawingPaintsEveryTickAtItsFraction() {
         let container = makeContainer()
         container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10, 858], removed: []))
@@ -210,7 +229,7 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     @MainActor
     func testLineHeightMatchesTextKit() {
         let layoutManager = NSLayoutManager()
-        for size in [10.0, 11.0, 12.0] as [CGFloat] {
+        for size in [5.0, 10.0, 11.0, 12.0] as [CGFloat] {
             let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
             XCTAssertEqual(ReadOnlyCodeTextView.lineHeight(for: font),
                            layoutManager.defaultLineHeight(for: font),

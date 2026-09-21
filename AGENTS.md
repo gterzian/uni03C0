@@ -9,9 +9,8 @@ rules, sandbox constraints, commands, and paid-for gotchas — not a design doc.
 - Cut: type-by-type descriptions, architecture narration, feature inventories,
   "how it works" prose, design rationale — the code and commits are the source.
 - Prefer one imperative line; record history only when it prevents a regression.
-- **Budget: keep this file under 300 lines.** Adding a section means deleting at
-  least as much stale text. If a change only makes the file longer, the
-  information belongs in a code comment or a commit message instead.
+- **Budget: under 300 lines.** Adding a section means deleting as much stale
+  text; if a change only makes the file longer, it belongs in a code comment.
 
 ---
 
@@ -259,41 +258,42 @@ Rules:
   transcript has **no `.id`** and is rebound; Changes is `.id`-keyed per tab.
 - The inactive page does zero work, gated by `pageActive` — no file IO, no diff
   loading, no highlighting.
-- Changed files + per-file stats come from `GitStatus.classify` (one batched
-  two-pass `git diff --numstat`), off the main thread. Per-file diffs are loaded
-  by `DiffLoader` off-main (bounded concurrency); a `path`-named change event
-  reloads only that file, a nil event reloads all.
-- The store only advances on `GitStatus.didChangeNotification` (a terminal `git
-  commit` emits none); a tab switch re-counts the badge only and the viewer
-  re-applies its cached document — never a full reload/rebuild on a switch.
-- The viewer is ONE `CodePaneContainer` (scroll view + `ReadOnlyCodeTextView` +
-  ruler + edit-map scroller) holding every file's diff in path order. The
-  document is assembled PLAIN off the main actor (`DiffDocumentBuilder`); syntax
-  colors are applied only to the VISIBLE display lines (`DiffHighlighter`, off
-  the main actor, coalesced on a 120ms scroll gate) — per file and within a
-  file, so a large changeset never colors what is off screen. Never build for a
-  hidden page; `sizeThatFits` fills the slot, never the content. Each
-  `CodeSection` carries the file's canonical absolute path, so a copy tags a
-  `CodeReference` to the FILE (real current-file lines, removed lines dropped),
-  clamped to the owning section.
+- Changed files + stats via `GitStatus.classify` (one batched `git diff
+  --numstat`), off-main; `DiffLoader` diffs, a `path` event reloads that file only.
+- The store advances only on `GitStatus.didChangeNotification` (a `git commit`
+  emits none); a tab switch only re-counts the badge and re-applies the cache.
+- The viewer is ONE `CodePaneContainer` (scroll view + code view + ruler +
+  edit-map scroller) over every file's diff in path order, each opened by a
+  header band. A file renders only its changed runs + 3 context lines
+  (`DiffPlan`, Core); each unchanged gap collapses to ONE expand control
+  revealing a compounding block from both edges — never the contiguous
+  first-change→last-change span. Built PLAIN off-main (`DiffDocumentBuilder`);
+  colors go only to the VISIBLE `codeLineRanges` (`DiffHighlighter`, off-main,
+  120ms gate). `sizeThatFits` fills the slot; a copy tags the `CodeReference`
+  to the FILE via the section's canonical path.
+- Header bands paint full-width in `ReadOnlyCodeTextView.drawBackground`, never
+  a `.backgroundColor` attribute. The scroller IS the edit map
+  (`EditMarkerScroller`): green/red ticks at rendered changed-line fractions.
+- Cmd+Up / Cmd+Down jump between changed-line runs (`DiffEditCycler`, Core),
+  anchored at the viewport top like the transcript's user-message cycle.
+- A tab switch commits the selected-tab frame before the incoming session's
+  rebind: `Coordinator.beginSwitch(to:)` blanks a first visit behind an AppKit
+  spinner and defers `rebind` one run-loop turn.
 - Search (`CodeSearchModel`) scans the whole viewer buffer and re-runs on expansion.
-- The vertical scroller doubles as an edit map; ticks mirror the overlay exactly.
 - `pi-file://` links reveal the file only when it is in the changeset (unchanged
   → dead), at the named line; a pre-document reveal defers to the next build.
 - Diff egress uses the interleaved view (removed lines inline in red), not
-  added-lines-only. Spinners are AppKit `SpinnerView`, never a SwiftUI
-  `ProgressView` in a mounted view.
+  added-lines-only; spinners are AppKit `SpinnerView`, never a SwiftUI one.
 - New `NSEvent` window monitors: use a NONISOLATED `@Sendable` closure handing
   off via `MainActor.assumeIsolated`; an inferred `@MainActor` closure crashes in
   `swift_getObjectType`.
 
 Failed fixes (do not re-introduce):
 
+- A first-change→last-change contiguous window (renders the whole file when
+  changes sit far apart); collapse the gaps into hunks.
 - Rendering only added lines, so a deletion-only change looked uncolored.
-- Rebuilding the whole viewer document on every scroll-spy tick or tab switch,
-  or loading all diffs on the main thread.
-- Highlighting all of the diff document, or on the main thread: color only the
-  visible range, off-main.
-- One edit-map tick per edited line per scroller repaint: coalesce per point row
-  and cache the paths.
+- Rebuilding the viewer document on every scroll tick/tab switch, or loading
+  diffs on main.
+- Highlighting the whole diff, or on the main thread: color only the visible range.
 - `sizeToFit` without `allowsNonContiguousLayout`: full-document layout is seconds.

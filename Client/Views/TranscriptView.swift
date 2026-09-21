@@ -55,9 +55,7 @@ struct TranscriptView: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         // The representable's inputs are stable (same viewModel reference);
         // handle a window-value swap defensively.
-        if context.coordinator.viewModel !== viewModel {
-            context.coordinator.rebind(viewModel: viewModel)
-        }
+        context.coordinator.setViewModel(viewModel)
         context.coordinator.setPageActive(isPageActive)
     }
 }
@@ -138,6 +136,17 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// the active tab changed while the task was in flight.
     private var activeSessionKey: ObjectIdentifier?
     weak var viewModel: SessionViewModel?
+    /// The session a deferred tab-switch rebind is heading to, and the token
+    /// that invalidates it when another switch intervenes. The rebind (which
+    /// lays out the incoming session's rows on the main thread) runs on the
+    /// NEXT run-loop turn so the click's frame — the newly selected tab and a
+    /// switching spinner — commits first; a tab switch then never looks like
+    /// the click did not land. See `beginSwitch`.
+    private var pendingSwitch: SessionViewModel?
+    private var switchToken = 0
+    /// The spinner shown over the (blanked) transcript while a deferred rebind
+    /// is pending. AppKit, so no SwiftUI graph invalidates per frame.
+    private var switchingIndicator: NSProgressIndicator?
     private var isApplying = false
     /// Streaming batching: the tail row is refreshed at most every
     /// `batchInterval` seconds (a few words for a typical stream), and the new
@@ -627,7 +636,85 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         pageActive = active
         guard active else { return }
         needsCatchUp = false
+        // A deferred tab-switch rebind is about to swap the view model; the
+        // catch-up pass would run against the OUTGOING session. The rebind
+        // populates the table itself.
+        guard pendingSwitch == nil else { return }
         applyModelChanges()
+    }
+
+    /// Reconciles the representable's incoming session with the coordinator's.
+    /// A switch away starts the deferred `beginSwitch`; a switch back to the
+    /// session we are still showing (A→B→A before the deferred rebind ran)
+    /// cancels the pending switch, so it never rebinds to the abandoned tab.
+    func setViewModel(_ viewModel: SessionViewModel) {
+        if viewModel === self.viewModel {
+            if let pending = pendingSwitch, pending !== viewModel {
+                pendingSwitch = nil
+                switchToken &+= 1
+                tableView?.alphaValue = 1
+                hideSwitchingIndicator()
+            }
+            return
+        }
+        beginSwitch(to: viewModel)
+    }
+
+    /// Defers the rebind one run-loop turn and blanks the outgoing session
+    /// behind a spinner. `updateNSView` runs inside the same transaction as the
+    /// click, so a heavy rebind here would hold the newly selected tab's frame
+    /// until it finished (the "click did not come through" delay). Rebinding
+    /// on the next turn lets that frame commit first. A second switch before
+    /// the turn re-targets the pending one (the token invalidates the stale
+    /// block).
+    func beginSwitch(to viewModel: SessionViewModel) {
+        if pendingSwitch === viewModel { return }
+        pendingSwitch = viewModel
+        switchToken &+= 1
+        let token = switchToken
+        if scrollStateBySession[ObjectIdentifier(viewModel)] == nil {
+            // First visit: the rebind will populate from scratch, so blank the
+            // outgoing session now and cover the gap with the spinner.
+            tableView?.alphaValue = 0
+            showSwitchingIndicator()
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.switchToken == token, let target = self.pendingSwitch else { return }
+            self.pendingSwitch = nil
+            self.rebind(viewModel: target)
+            self.tableView?.alphaValue = 1
+            self.hideSwitchingIndicator()
+        }
+    }
+
+    private func showSwitchingIndicator() {
+        guard let scrollView else { return }
+        let indicator: NSProgressIndicator
+        if let switchingIndicator {
+            indicator = switchingIndicator
+        } else {
+            // Click-transparent (never eats a scroll/click landing on its
+            // small frame).
+            let created = SwitchSpinner()
+            created.style = .spinning
+            created.controlSize = .small
+            created.isDisplayedWhenStopped = false
+            created.translatesAutoresizingMaskIntoConstraints = false
+            scrollView.addSubview(created)
+            NSLayoutConstraint.activate([
+                created.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
+                created.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
+            ])
+            switchingIndicator = created
+            indicator = created
+        }
+        indicator.startAnimation(nil)
+        indicator.isHidden = false
+    }
+
+    private func hideSwitchingIndicator() {
+        switchingIndicator?.stopAnimation(nil)
+        switchingIndicator?.isHidden = true
     }
 
     func rebind(viewModel: SessionViewModel) {
@@ -2291,4 +2378,12 @@ extension NSScrollView {
 private extension NSUserInterfaceItemIdentifier {
     static let textRow = NSUserInterfaceItemIdentifier("textRow")
     static let toolRow = NSUserInterfaceItemIdentifier("toolRow")
+}
+
+/// The deferred-tab-switch spinner: floats over the transcript, so it must
+/// never consume a scroll or click landing on its small frame. An AppKit
+/// `NSProgressIndicator` (never a SwiftUI `ProgressView`, which would keep the
+/// window's content graph invalidating per frame).
+private final class SwitchSpinner: NSProgressIndicator {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

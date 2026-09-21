@@ -19,7 +19,7 @@ protocol CodeSearching: AnyObject {
     func bufferDidChange()
 }
 
-/// Edit positions for the diff viewer's SCROLLBAR edit map: the display lines
+/// Edit positions for the diff viewer's scrollbar edit map: the display lines
 /// that are additions (green ticks) and removals (red ticks) across every file
 /// shown. Resolved to positions by the container, since the builder that
 /// produces them stays color-free.
@@ -45,7 +45,7 @@ nonisolated struct HighlightedChunk: @unchecked Sendable {
 /// characters belong to its diff (for reference-tagged copies). `lineRange`
 /// spans the section's diff and expand lines too, so the scroll spy attributes
 /// a viewport parked anywhere in the section to the right file.
-struct CodeSection: Sendable {
+nonisolated struct CodeSection: Sendable {
     /// Session-relative path (the form the sidebar and the agent use).
     let path: String
     /// Canonical absolute path of the same file. The diff document is a
@@ -55,12 +55,33 @@ struct CodeSection: Sendable {
     let lineRange: ClosedRange<Int>
     /// Display lines holding real diff lines (excludes expand/placeholder rows).
     let diffLineRange: ClosedRange<Int>
+    /// The rendered code-line runs, ascending. A file with far-apart changes is
+    /// several runs separated by expand controls, so the visible highlighter
+    /// and the reference-tagged copy ranges walk these, never the whole
+    /// `diffLineRange` (which would swallow the control rows between hunks).
+    let codeLineRanges: [ClosedRange<Int>]
     let diffCharRange: NSRange
+
+    init(
+        path: String,
+        absolutePath: String,
+        lineRange: ClosedRange<Int>,
+        diffLineRange: ClosedRange<Int>,
+        codeLineRanges: [ClosedRange<Int>]? = nil,
+        diffCharRange: NSRange
+    ) {
+        self.path = path
+        self.absolutePath = absolutePath
+        self.lineRange = lineRange
+        self.diffLineRange = diffLineRange
+        self.codeLineRanges = codeLineRanges ?? [diffLineRange]
+        self.diffCharRange = diffCharRange
+    }
 }
 
 /// The diff viewer's view hierarchy: one scroll view over one buffered
 /// `ReadOnlyCodeTextView` holding every shown file's diff, plus the line-number
-/// ruler and the edit-map scroller. The container only ever swaps the whole
+/// ruler. The container only ever swaps the whole
 /// document (and repaints the chrome); all document building lives in
 /// `DiffBrowserView.Coordinator`.
 final class CodePaneContainer: NSView {
@@ -199,6 +220,8 @@ final class CodePaneContainer: NSView {
         lineNumbers: [Int?]? = nil,
         sections: [CodeSection] = [],
         markers: PaneMarkers = .none,
+        markerFractions: [CGFloat]? = nil,
+        headerLines: [Int] = [],
         contentHeight: CGFloat? = nil,
         restoreCharacterIndex: Int? = nil,
         lineStartOffsets: [Int]? = nil
@@ -213,8 +236,9 @@ final class CodePaneContainer: NSView {
         // The document is every file's diff in one buffer: each file's diff
         // lines map to that file's canonical absolute path, so a copy inside
         // the diff tags a reference to the FILE (never to "the diff").
-        codeView.setSectionPaths(sections.map { ($0.diffCharRange, $0.absolutePath) })
-        applyMarkers(markers, in: text.string)
+        codeView.setSectionPaths(sectionPaths(sections))
+        applyMarkers(markers, fractions: markerFractions, in: text.string)
+        codeView.setHeaderLines(headerLines)
 
         if let restoreCharacterIndex, restoreCharacterIndex < (codeView.string as NSString).length {
             scrollCharacterToTop(restoreCharacterIndex)
@@ -242,6 +266,7 @@ final class CodePaneContainer: NSView {
         codeView.clearReveal()
         (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
         (scrollView.verticalScroller as? CodePaneEditMarkerScroller)?.clearMarkers()
+        codeView.setHeaderLines([])
         codeView.setSectionPaths([])
         sections = []
         codeView.load(path: "", text: NSAttributedString(string: ""))
@@ -288,6 +313,28 @@ final class CodePaneContainer: NSView {
     func scrollToTop() {
         clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: 0))
         scrollView.reflectScrolledClipView(clipView)
+    }
+
+    /// Scrolls to the end of the document (the last edit-cycle fallback).
+    func scrollToBottom() {
+        let maxY = max(0, codeView.frame.height - clipView.bounds.height)
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: maxY))
+        scrollView.reflectScrolledClipView(clipView)
+    }
+
+    /// The 1-based display line at the top of the viewport — the anchor the
+    /// Cmd+Up / Cmd+Down edit cycle moves strictly away from.
+    var topVisibleDisplayLine: Int {
+        let length = (codeView.string as NSString).length
+        guard length > 0 else { return 1 }
+        return codeView.lineNumber(forIndex: min(topVisibleCharacterIndex, length - 1))
+    }
+
+    /// Scrolls a display line's top edge to the top of the viewport (the
+    /// landing of an edit-cycle jump).
+    func scrollDisplayLineToTop(_ line: Int) {
+        guard line >= 1, line - 1 < codeView.lineStartOffsets.count else { return }
+        scrollCharacterToTop(codeView.lineStartOffsets[line - 1])
     }
 
     /// The character index at the top of the viewport.
@@ -368,6 +415,20 @@ final class CodePaneContainer: NSView {
 
     // MARK: - Sections
 
+    /// One range per code-line run, so a reference-tagged copy is clamped to
+    /// the run under the selection and the expand controls between hunks fall
+    /// back to a plain copy.
+    private func sectionPaths(_ sections: [CodeSection]) -> [(range: NSRange, absolutePath: String)] {
+        var result: [(range: NSRange, absolutePath: String)] = []
+        for section in sections {
+            for lines in section.codeLineRanges {
+                guard let range = characterRange(forDisplayLines: lines) else { continue }
+                result.append((range, section.absolutePath))
+            }
+        }
+        return result
+    }
+
     /// The path owning the top of the viewport (the scroll spy).
     var topSectionPath: String? {
         guard !sections.isEmpty else { return nil }
@@ -414,17 +475,19 @@ final class CodePaneContainer: NSView {
 
     // MARK: - Scrollbar edit map
 
-    private func applyMarkers(_ markers: PaneMarkers, in text: String) {
+    /// Maps the document's added/removed display lines to colored ticks on the
+    /// vertical scroller, so the bar shows where the whole changeset's edits
+    /// sit. `fractions` (from the builder) gives each line's real vertical
+    /// center as a document fraction — the document mixes font sizes, so a
+    /// line-count fraction would drift from the glyph it marks. Without it
+    /// (tests), a uniform line-count fraction is the fallback.
+    private func applyMarkers(_ markers: PaneMarkers, fractions: [CGFloat]?, in text: String) {
         guard let scroller = scrollView.verticalScroller as? CodePaneEditMarkerScroller else { return }
         switch markers {
         case .none:
             scroller.clearMarkers()
         case .lines(let added, let removed):
             scroller.wholeTrackColor = nil
-            // The line table was rebuilt by `load` just above: reuse it rather
-            // than re-scanning a multi-megabyte string on the main thread.
-            // A trailing newline leaves a "phantom" final offset, which is not
-            // a real line.
             let offsets = codeView.lineStartOffsets
             let lineCount = text.isEmpty ? 0 : (text.hasSuffix("\n") ? offsets.count - 1 : offsets.count)
             guard lineCount > 0 else {
@@ -433,10 +496,13 @@ final class CodePaneContainer: NSView {
             }
             func marker(_ line: Int, _ color: NSColor) -> CodePaneEditMarkerScroller.Marker? {
                 guard line >= 1, line <= lineCount else { return nil }
-                return CodePaneEditMarkerScroller.Marker(
-                    fraction: (CGFloat(line) - 0.5) / CGFloat(lineCount),
-                    color: color
-                )
+                let fraction: CGFloat
+                if let fractions, line - 1 < fractions.count {
+                    fraction = fractions[line - 1]
+                } else {
+                    fraction = (CGFloat(line) - 0.5) / CGFloat(lineCount)
+                }
+                return CodePaneEditMarkerScroller.Marker(fraction: fraction, color: color)
             }
             // `added`/`removed` are in ascending line order, so this is a merge
             // of two sorted runs (no O(n log n) sort of a huge changeset).

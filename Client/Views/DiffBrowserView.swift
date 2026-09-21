@@ -10,7 +10,7 @@ nonisolated enum DiffLink {
 /// One built diff document: the attributed text for the one big scrollable
 /// area, the per-display-line real-line map (for the gutter), the file
 /// sections (scroll spy + reveal + reference-tagged copies), the full-array
-/// index of each display line (rebuild anchoring), and the scrollbar edit map.
+/// index of each display line (rebuild anchoring), and the edit-cycle stops.
 ///
 /// The text is built PLAIN (font + line background only, no syntax colors):
 /// syntax highlighting is applied lazily to the visible range (see
@@ -26,11 +26,25 @@ nonisolated struct DiffDocument: @unchecked Sendable {
     let lineNumbers: [Int?]
     let sections: [CodeSection]
     let fullIndices: [Int?]
+    /// The edit-map ticks: the rendered added/removed display lines across
+    /// every file. The vertical scroller paints them, so the bar shows where
+    /// the whole changeset's edits sit.
     let markers: PaneMarkers
+    /// Each display line's vertical center as a fraction of the document
+    /// height, for the edit-map ticks (the document mixes font sizes, so line
+    /// count is not a safe fraction).
+    let markerFractions: [CGFloat]
+    /// The start DISPLAY line of each changed-line run, ascending — the
+    /// Cmd+Up / Cmd+Down edit cycle. Computed off-main by the builder.
+    let editStops: [Int]
+    /// DISPLAY lines carrying a file header band. The code view paints a
+    /// full-width band behind each, so a scroll clearly distinguishes one
+    /// file's diff from the next.
+    let headerLines: [Int]
     /// The document's exact laid-out text height (sum of each line's font
     /// height, insets excluded), computed off-main by the builder. The view
     /// pins its frame to this: TextKit's lazily-estimated used rect would
-    /// otherwise move the scroller and the edit map mid-scroll.
+    /// otherwise move the scroller mid-scroll.
     let contentHeight: CGFloat
     /// `[0, offset-after-each-newline]`, computed off-main as the lines are
     /// appended, so applying the document does not rescan the whole buffer for
@@ -39,13 +53,15 @@ nonisolated struct DiffDocument: @unchecked Sendable {
 }
 
 /// Everything the document builder needs, snapshotted on the main actor: each
-/// changed file, its loaded diff (nil while still loading), and its visible
-/// window (nil when there is no diff yet). All `Sendable`, so the snapshot
-/// crosses to the builder untouched.
+/// changed file, its loaded diff (nil while still loading), and its render
+/// plan. All `Sendable`, so the snapshot crosses to the builder untouched.
 nonisolated struct DiffBuildFile: Sendable {
     let path: String
     let diff: LoadedFileDiff?
-    let window: ChangesStore.Window?
+    /// The file's render plan: the changed runs to render and the expand
+    /// controls standing in for the unchanged gaps. Empty while loading or for
+    /// a message-only diff (the builder still emits the header/placeholder).
+    let items: [DiffRenderItem]
 }
 
 nonisolated struct DiffBuildInput: Sendable {
@@ -116,6 +132,7 @@ struct DiffBrowserView: NSViewRepresentable {
         }
         container.linkTextAttributes()
         context.coordinator.installKeyMonitor()
+        context.coordinator.installEditJumpMonitor()
         return container
     }
 
@@ -174,6 +191,15 @@ struct DiffBrowserView: NSViewRepresentable {
         /// The visible-range syntax highlighter (off-main, cache inside).
         private let highlighter = DiffHighlighter()
         private var keyMonitor: Any?
+        /// Cmd+Up / Cmd+Down jumps between changed-line runs. Installed from
+        /// `makeNSView`, removed in `teardown`.
+        private var cmdJumpMonitor: Any?
+        /// The display line the edit cycle last landed on. Used as the cycle
+        /// anchor while it is still visible (so a landing near the document's
+        /// bottom, where scrolling cannot put it at the very top, is never
+        /// re-targeted by the next press). `nil` after a rebuild/scroll-away,
+        /// when the viewport's own top line becomes the anchor.
+        private var cycleAnchorDisplayLine: Int?
 
         private static let highlightScrollSettle: Duration = .milliseconds(120)
         /// Extra lines above/below the viewport to color, so a small scroll
@@ -193,6 +219,11 @@ struct DiffBrowserView: NSViewRepresentable {
                     // it rather than rebuilding the whole changeset.
                     if let cached = store?.builtDocument(for: appliedDocumentVersion) {
                         let version = appliedDocumentVersion
+                        // Re-applying a cached document is deferred a main turn
+                        // (it swaps the whole text storage, which must not run
+                        // inside an update); show the spinner for that gap so
+                        // an active page never flashes blank.
+                        container?.setBusy(true)
                         Task { @MainActor [weak self] in
                             self?.apply(cached, version: version)
                         }
@@ -245,6 +276,9 @@ struct DiffBrowserView: NSViewRepresentable {
                     // one main turn — `displayDocument` swaps the whole text
                     // storage, which must not run inside `updateNSView`.
                     if let cached = store.builtDocument(for: documentVersion) {
+                        // Deferred one main turn (see the setActive path): show
+                        // the spinner for the gap too.
+                        container?.setBusy(true)
                         Task { @MainActor [weak self] in
                             self?.apply(cached, version: documentVersion)
                         }
@@ -295,6 +329,10 @@ struct DiffBrowserView: NSViewRepresentable {
                 NSEvent.removeMonitor(keyMonitor)
                 self.keyMonitor = nil
             }
+            if let cmdJumpMonitor {
+                NSEvent.removeMonitor(cmdJumpMonitor)
+                self.cmdJumpMonitor = nil
+            }
         }
 
         // MARK: Keyboard find
@@ -334,6 +372,81 @@ struct DiffBrowserView: NSViewRepresentable {
             }
         }
 
+        // MARK: Edit navigation (Cmd+Up / Cmd+Down)
+
+        /// Installs the window-level Cmd+Up / Cmd+Down monitor for the edit
+        /// cycle. Deferred to EDITABLE text views (the prompt input, the find
+        /// field), which use Cmd+Up/Down for their own caret movement, and to
+        /// sheets/popups — the same guards the transcript's monitor uses. The
+        /// closure is `@Sendable` and hands off via `MainActor.assumeIsolated`
+        /// (the established AppKit-boundary pattern; an inferred `@MainActor`
+        /// closure here crashes in `swift_getObjectType`).
+        func installEditJumpMonitor() {
+            guard cmdJumpMonitor == nil else { return }
+            let handler: @Sendable (NSEvent) -> NSEvent? = { [weak self] event in
+                guard event.keyCode == 125 || event.keyCode == 126, // Down / Up
+                      event.modifierFlags.contains(.command),
+                      !event.modifierFlags.contains(.option),
+                      !event.modifierFlags.contains(.control),
+                      !event.modifierFlags.contains(.shift) else { return event }
+                guard let self else { return event }
+                let isUp = event.keyCode == 126
+                let consume = MainActor.assumeIsolated {
+                    self.handleEditJump(isUp: isUp)
+                }
+                return consume ? nil : event
+            }
+            cmdJumpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: handler)
+        }
+
+        @MainActor
+        private func handleEditJump(isUp: Bool) -> Bool {
+            guard isActive, let container, let document, !document.editStops.isEmpty else { return false }
+            guard let window = container.window else { return false }
+            guard window.isKeyWindow, window.attachedSheet == nil else { return false }
+            guard !NSApp.windows.contains(where: { $0.level == .popUpMenu && $0.isVisible }) else { return false }
+            if let editor = window.firstResponder as? NSTextView, editor.isEditable { return false }
+            let anchor = currentEditAnchor()
+            if isUp {
+                if let target = DiffEditCycler.previous(before: anchor, stops: document.editStops) {
+                    jumpToEdit(target)
+                } else {
+                    container.scrollToTop()
+                    cycleAnchorDisplayLine = nil
+                }
+            } else {
+                if let target = DiffEditCycler.next(after: anchor, stops: document.editStops) {
+                    jumpToEdit(target)
+                } else {
+                    container.scrollToBottom()
+                    cycleAnchorDisplayLine = nil
+                }
+            }
+            return true
+        }
+
+        /// The anchor for the next edit-cycle step: the last landed edit while
+        /// it is still on screen, else the viewport's top display line. Reading
+        /// the top line right after a landing would re-target the edit when the
+        /// jump was clamped near the document's bottom (the target cannot reach
+        /// the very top), so the landing stays authoritative while visible.
+        private func currentEditAnchor() -> Int {
+            guard let container else { return 1 }
+            if let anchor = cycleAnchorDisplayLine,
+               let visible = container.visibleDisplayLineRange,
+               visible.contains(anchor) {
+                return anchor
+            }
+            return container.topVisibleDisplayLine
+        }
+
+        private func jumpToEdit(_ line: Int) {
+            guard let container else { return }
+            container.scrollDisplayLineToTop(line)
+            cycleAnchorDisplayLine = line
+            onTopSectionChanged?(container.topSectionPath)
+        }
+
         // MARK: Scroll spy + links
 
         func scrollSpy() {
@@ -350,8 +463,9 @@ struct DiffBrowserView: NSViewRepresentable {
             switch url.host {
             case "expand":
                 guard let path,
-                      let dir = comps?.queryItems?.first(where: { $0.name == "dir" })?.value else { return }
-                store.expand(path: path, direction: dir == "up" ? .up : .down)
+                      let gapString = comps?.queryItems?.first(where: { $0.name == "gap" })?.value,
+                      let gap = Int(gapString) else { return }
+                store.expand(path: path, gap: gap)
             default:
                 break
             }
@@ -394,6 +508,9 @@ struct DiffBrowserView: NSViewRepresentable {
             // document): a scroll during the off-main build must not be lost.
             let anchor = captureAnchor()
             document = doc
+            // Expansion/reload can shift every display line after the change;
+            // the old landing line no longer names the same run.
+            cycleAnchorDisplayLine = nil
             store?.cacheBuiltDocument(doc, version: version)
             let restore = anchor.flatMap { restoreCharacterIndex(for: $0, in: doc) }
             container.displayDocument(
@@ -402,6 +519,8 @@ struct DiffBrowserView: NSViewRepresentable {
                 lineNumbers: doc.lineNumbers,
                 sections: doc.sections,
                 markers: doc.markers,
+                markerFractions: doc.markerFractions,
+                headerLines: doc.headerLines,
                 contentHeight: doc.contentHeight,
                 restoreCharacterIndex: restore,
                 lineStartOffsets: doc.lineStartOffsets
@@ -426,7 +545,7 @@ struct DiffBrowserView: NSViewRepresentable {
                 return DiffBuildFile(
                     path: entry.path,
                     diff: diff,
-                    window: diff.map { store.window(for: $0) }
+                    items: diff.map { store.renderItems(for: $0) } ?? []
                 )
             }
         }
@@ -466,17 +585,22 @@ struct DiffBrowserView: NSViewRepresentable {
             for section in document.sections where section.lineRange.overlaps(lower...upper) {
                 // A message-only section is secondary-colored prose, not code.
                 guard store.diffs[section.path]?.message == nil else { continue }
-                let start = max(section.diffLineRange.lowerBound, lower)
-                let end = min(section.diffLineRange.upperBound, upper)
-                guard start <= end,
-                      let charRange = container.characterRange(forDisplayLines: start...end) else { continue }
-                let text = (container.codeView.string as NSString).substring(with: charRange)
-                guard !text.isEmpty else { continue }
-                chunks.append(HighlightChunk(
-                    range: charRange,
-                    text: text,
-                    language: SyntaxHighlighter.language(forPath: section.path)
-                ))
+                // Highlight each rendered code run separately: an expand control
+                // between hunks must keep its secondary color, not be recolored
+                // as code by a range that spans it.
+                for run in section.codeLineRanges {
+                    let start = max(run.lowerBound, lower)
+                    let end = min(run.upperBound, upper)
+                    guard start <= end,
+                          let charRange = container.characterRange(forDisplayLines: start...end) else { continue }
+                    let text = (container.codeView.string as NSString).substring(with: charRange)
+                    guard !text.isEmpty else { continue }
+                    chunks.append(HighlightChunk(
+                        range: charRange,
+                        text: text,
+                        language: SyntaxHighlighter.language(forPath: section.path)
+                    ))
+                }
             }
             guard !chunks.isEmpty else { return }
 
@@ -490,18 +614,25 @@ struct DiffBrowserView: NSViewRepresentable {
         }
 
         /// The (path, full-array line) at the top of the viewport, so a rebuild
-        /// can keep the reader's place (expansion inserts lines above).
+        /// can keep the reader's place (expansion inserts lines above). The top
+        /// line may be a header or an expand control (no full index); walk
+        /// forward to the section's first code line so an expansion never
+        /// bounces the reader back to the document top.
         private func captureAnchor() -> (path: String, fullIndex: Int)? {
             guard let container, let document else { return nil }
             let index = container.topVisibleCharacterIndex
             let length = (container.codeView.string as NSString).length
             guard length > 0 else { return nil }
             let displayLine = container.codeView.lineNumber(forIndex: min(index, length - 1))
-            guard displayLine >= 1, displayLine - 1 < document.fullIndices.count,
-                  let fullIndex = document.fullIndices[displayLine - 1],
-                  let path = document.sections.first(where: { $0.lineRange.contains(displayLine) })?.path
+            guard let section = document.sections.first(where: { $0.lineRange.contains(displayLine) })
             else { return nil }
-            return (path, fullIndex)
+            for line in displayLine...section.lineRange.upperBound {
+                guard line - 1 < document.fullIndices.count else { break }
+                if let fullIndex = document.fullIndices[line - 1] {
+                    return (section.path, fullIndex)
+                }
+            }
+            return nil
         }
 
         private func restoreCharacterIndex(for anchor: (path: String, fullIndex: Int), in doc: DiffDocument) -> Int? {
@@ -534,13 +665,24 @@ nonisolated enum DiffDocumentBuilder {
         let smallLineHeight = ReadOnlyCodeTextView.lineHeight(
             for: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         )
+        let headerFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        let headerLineHeight = ReadOnlyCodeTextView.lineHeight(for: headerFont)
+        let spacerFont = NSFont.monospacedSystemFont(ofSize: 5, weight: .regular)
+        let spacerLineHeight = ReadOnlyCodeTextView.lineHeight(for: spacerFont)
         let text = NSMutableAttributedString()
         var lineNumbers: [Int?] = []
         var fullIndices: [Int?] = []
         var sections: [CodeSection] = []
         var addedLines: [Int] = []
         var removedLines: [Int] = []
+        var headerLines: [Int] = []
         var contentHeight: CGFloat = 0
+        // Each display line's vertical center as a fraction of the final
+        // document height. The document mixes 12pt code, a 12pt header, 11pt
+        // expand rows and a 5pt spacer, so a line-count fraction would drift
+        // from the glyph it marks; the built y is what the knob actually
+        // travels over.
+        var lineCenters: [CGFloat] = []
 
         func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?, lineHeight: CGFloat) -> (line: Int, start: Int) {
             if !lineNumbers.isEmpty { text.append(NSAttributedString(string: "\n")) }
@@ -548,50 +690,76 @@ nonisolated enum DiffDocumentBuilder {
             text.append(attributed)
             lineNumbers.append(lineNumber)
             fullIndices.append(fullIndex)
+            lineCenters.append(contentHeight + lineHeight / 2)
             contentHeight += lineHeight
             return (lineNumbers.count, start)
         }
 
-        for file in input.files {
-            guard let diff = file.diff, let window = file.window else {
+        for (fileIndex, file) in input.files.enumerated() {
+            guard let diff = file.diff else {
                 _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 continue
             }
-            // The file's identity lives in the viewer header above the pane, so
-            // the document opens straight onto the diff — no repeated
-            // path/stats/extras row under it.
+            // Each file opens with a header band naming it — the path, its
+            // change kind, and its line counts. This is what makes scrolling
+            // read as "this file, then the next" rather than one
+            // undifferentiated run of diff lines. The spacer above every
+            // header but the first (both belong to THIS section, so the scroll
+            // spy credits the file that follows) gives the band breathing room.
             let sectionStart = lineNumbers.count + 1
-
-            if diff.message == nil, window.start > 0 {
-                _ = appendLine(expandLine(hidden: window.start, path: file.path, direction: "up", label: "above"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+            if fileIndex > 0 {
+                _ = appendLine(spacerLine(font: spacerFont), lineNumber: nil, fullIndex: nil, lineHeight: spacerLineHeight)
             }
+            let header = appendLine(
+                headerLine(path: file.path, kind: diff.kind, added: diff.added.count, removed: diff.removed.count, font: headerFont),
+                lineNumber: nil, fullIndex: nil, lineHeight: headerLineHeight
+            )
+            headerLines.append(header.line)
 
             var diffStart = -1
             var diffEnd = -1
             var diffFirstLine = -1
             var diffLastLine = -1
+            var codeRuns: [ClosedRange<Int>] = []
             if diff.message == nil, !diff.lines.isEmpty {
-                for index in window.start...window.end {
-                    let line = diff.lines[index]
-                    let attributed = NSMutableAttributedString(string: line.text, attributes: [
-                        .font: font,
-                        .foregroundColor: NSColor.labelColor,
-                    ])
-                    switch line.kind {
-                    case .added:
-                        attributed.addAttribute(.backgroundColor, value: addedColor, range: NSRange(location: 0, length: attributed.length))
-                    case .removed:
-                        attributed.addAttribute(.backgroundColor, value: deletedColor, range: NSRange(location: 0, length: attributed.length))
-                    case .same:
-                        break
+                // Only the changed runs (+ context) are rendered; the unchanged
+                // gaps between them are one expand control each, so the file
+                // never opens as its whole contents.
+                for item in file.items {
+                    switch item {
+                    case .expand(let gap, let hidden):
+                        _ = appendLine(
+                            expandLine(hidden: hidden, path: file.path, gap: gap),
+                            lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight
+                        )
+                    case .lines(let range):
+                        let runStart = lineNumbers.count + 1
+                        for index in range {
+                            let line = diff.lines[index]
+                            let attributed = NSMutableAttributedString(string: line.text, attributes: [
+                                .font: font,
+                                .foregroundColor: NSColor.labelColor,
+                            ])
+                            switch line.kind {
+                            case .added:
+                                attributed.addAttribute(.backgroundColor, value: addedColor, range: NSRange(location: 0, length: attributed.length))
+                            case .removed:
+                                attributed.addAttribute(.backgroundColor, value: deletedColor, range: NSRange(location: 0, length: attributed.length))
+                            case .same:
+                                break
+                            }
+                            let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index, lineHeight: codeLineHeight)
+                            if diffStart < 0 { diffStart = appended.start }
+                            diffEnd = appended.start + attributed.length
+                            if diffFirstLine < 0 { diffFirstLine = appended.line }
+                            diffLastLine = appended.line
+                            if line.kind == .added { addedLines.append(appended.line) }
+                            if line.kind == .removed { removedLines.append(appended.line) }
+                        }
+                        if lineNumbers.count >= runStart {
+                            codeRuns.append(runStart...lineNumbers.count)
+                        }
                     }
-                    let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index, lineHeight: codeLineHeight)
-                    if diffStart < 0 { diffStart = appended.start }
-                    diffEnd = appended.start + attributed.length
-                    if diffFirstLine < 0 { diffFirstLine = appended.line }
-                    diffLastLine = appended.line
-                    if line.kind == .added { addedLines.append(appended.line) }
-                    if line.kind == .removed { removedLines.append(appended.line) }
                 }
             } else if let message = diff.message {
                 let placeholder = placeholderLine(message)
@@ -600,16 +768,21 @@ nonisolated enum DiffDocumentBuilder {
                 diffEnd = appended.start + placeholder.length
                 diffFirstLine = appended.line
                 diffLastLine = appended.line
-            }
-
-            if diff.message == nil, window.end < diff.lines.count - 1 {
-                let hidden = diff.lines.count - 1 - window.end
-                _ = appendLine(expandLine(hidden: hidden, path: file.path, direction: "down", label: "below"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+            } else if diff.lines.isEmpty {
+                // An empty added/deleted file still gets a header; give it a
+                // body line so the section has a position to anchor on.
+                let placeholder = placeholderLine("(empty file)")
+                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+                diffStart = appended.start
+                diffEnd = appended.start + placeholder.length
+                diffFirstLine = appended.line
+                diffLastLine = appended.line
             }
 
             let sectionEnd = lineNumbers.count
-            // A section with no lines (an empty new file) has no position to
-            // anchor the scroll spy or a reveal on; skip it.
+            // The header (and the empty-file placeholder above) guarantee a
+            // position to anchor the scroll spy and a reveal on, so every
+            // loaded file contributes a section.
             guard sectionEnd >= sectionStart, diffStart >= 0, diffFirstLine > 0 else { continue }
             let diffRange = NSRange(location: diffStart, length: max(diffEnd - diffStart, 0))
             // The section's file, canonical (filesystem stat, off-main): a copy
@@ -622,6 +795,7 @@ nonisolated enum DiffDocumentBuilder {
                 absolutePath: absolutePath,
                 lineRange: sectionStart...sectionEnd,
                 diffLineRange: diffFirstLine...diffLastLine,
+                codeLineRanges: codeRuns.isEmpty ? nil : codeRuns,
                 diffCharRange: diffRange
             ))
         }
@@ -632,6 +806,9 @@ nonisolated enum DiffDocumentBuilder {
             sections: sections,
             fullIndices: fullIndices,
             markers: .lines(added: addedLines, removed: removedLines),
+            markerFractions: contentHeight > 0 ? lineCenters.map { $0 / contentHeight } : [],
+            editStops: DiffEditCycler.editStops(added: addedLines, removed: removedLines),
+            headerLines: headerLines,
             contentHeight: contentHeight,
             // Same algorithm as the text view's own scan, run here off-main
             // (the view is the single source of truth for the invariant).
@@ -639,25 +816,25 @@ nonisolated enum DiffDocumentBuilder {
         )
     }
 
-    private static func selfURL(host: String, path: String, direction: String? = nil) -> URL? {
+    private static func selfURL(host: String, path: String, gap: Int? = nil) -> URL? {
         var comps = URLComponents()
         comps.scheme = DiffLink.scheme
         comps.host = host
         var items = [URLQueryItem(name: "path", value: path)]
-        if let direction {
-            items.append(URLQueryItem(name: "dir", value: direction))
+        if let gap {
+            items.append(URLQueryItem(name: "gap", value: String(gap)))
         }
         comps.queryItems = items
         return comps.url
     }
 
-    private static func expandLine(hidden: Int, path: String, direction: String, label: String) -> NSAttributedString {
-        let text = "  ⌃  \(hidden) more line\(hidden == 1 ? "" : "s") \(label) — click to expand"
+    private static func expandLine(hidden: Int, path: String, gap: Int) -> NSAttributedString {
+        let text = "  ⌄  \(hidden) hidden line\(hidden == 1 ? "" : "s") — click to expand"
         let result = NSMutableAttributedString(string: text, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor,
         ])
-        if let url = selfURL(host: "expand", path: path, direction: direction) {
+        if let url = selfURL(host: "expand", path: path, gap: gap) {
             result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
         }
         return result
@@ -668,6 +845,45 @@ nonisolated enum DiffDocumentBuilder {
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor,
         ])
+    }
+
+    /// A near-empty line that only exists to give the next file's header band
+    /// breathing room. It must still be a real paragraph (a space, not "") so
+    /// the layout manager gives it a fragment of the small font's height.
+    private static func spacerLine(font: NSFont) -> NSAttributedString {
+        NSAttributedString(string: " ", attributes: [
+            .font: font,
+            .foregroundColor: NSColor.clear,
+        ])
+    }
+
+    /// One file's header line: kind letter + path, then its added/removed
+    /// counts. The code view paints the full-width band behind it.
+    private static func headerLine(path: String, kind: GitStatus.Kind, added: Int, removed: Int, font: NSFont) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: "  \(kindLetter(kind))  \(path)", attributes: [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ])
+        var suffix = ""
+        if added > 0 { suffix += "  +\(added)" }
+        if removed > 0 { suffix += "  −\(removed)" }
+        if !suffix.isEmpty {
+            result.append(NSAttributedString(string: suffix, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ]))
+        }
+        return result
+    }
+
+    private static func kindLetter(_ kind: GitStatus.Kind) -> String {
+        switch kind {
+        case .added: return "A"
+        case .modified: return "M"
+        case .deleted: return "D"
+        case .untracked: return "U"
+        case .normal: return " "
+        }
     }
 }
 

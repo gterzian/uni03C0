@@ -209,6 +209,24 @@ final class CodeLineRulerTests: XCTestCase {
     }
 
     @MainActor
+    func testHeaderLinesReachTheViewAndClearWithTheBuffer() {
+        let container = makeLoadedPane(lineCount: 40)
+        XCTAssertTrue(container.codeView.headerLines.isEmpty,
+                      "a document with no header lines carries none")
+        let text = (1...40).map { "line \($0)" }.joined(separator: "\n") + "\n"
+        container.displayDocument(
+            path: "/tmp/headers.swift",
+            text: NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)]),
+            headerLines: [1, 20]
+        )
+        XCTAssertEqual(container.codeView.headerLines, [1, 20],
+                       "displayDocument must hand the header lines to the text view (they drive the full-width bands)")
+        container.showPlaceholder("none")
+        XCTAssertTrue(container.codeView.headerLines.isEmpty,
+                      "a placeholder clears the bands so stale file headers never paint")
+    }
+
+    @MainActor
     func testNoLabelsBleedBelowTheLastLineOfAShortFile() {
         // A short file in a tall viewport: the gutter must not paint numbers
         // into the empty space below the last text line (doc-arithmetic

@@ -14,8 +14,8 @@ nonisolated struct LoadedFileDiff: Equatable, Sendable {
     /// Real current-file line of each display line (`nil` for a removed line,
     /// which belongs to the old side).
     let lineNumbers: [Int?]
-    /// Display indices of added / removed lines (drives the green/red overlay
-    /// and the scrollbar edit map).
+    /// Display indices of added / removed lines (drives the green/red line
+    /// overlay and the Cmd+Up / Cmd+Down edit stops).
     let added: [Int]
     let removed: [Int]
     /// A reason the diff is not renderable (unreadable / no baseline). `lines`

@@ -46,8 +46,8 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// knows it (the off-main diff builder sums each line's font height as it
     /// assembles the document). Under `allowsNonContiguousLayout`, `sizeToFit`
     /// and `usedRect` report an ESTIMATE that grows as more of a large document
-    /// is laid out, so a view that sized itself would move the scroller and the
-    /// edit map under the reader mid-scroll. While this is set the view refuses
+    /// is laid out, so a view that sized itself would move the scroller under
+    /// the reader mid-scroll. While this is set the view refuses
     /// every height change (see `setFrameSize`). nil = the view sizes itself.
     private(set) var fixedContentHeight: CGFloat?
     /// For an interleaved diff buffer, the REAL current-file line number of
@@ -165,6 +165,7 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the fading fill (see `startReveal`).
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
+        drawHeaderBands(in: rect)
         if let anchorRect = revealAnchorRect {
             Self.revealColor.withAlphaComponent(0.6).setFill()
             NSRect(x: 0, y: anchorRect.minY, width: 3, height: max(anchorRect.height, 1)).fill()
@@ -337,6 +338,55 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// an expand row falls back to a plain copy rather than a bogus reference.
     func setSectionPaths(_ paths: [(range: NSRange, absolutePath: String)]) {
         sectionPaths = paths
+    }
+
+    /// The 1-based display lines carrying a file header band. Drawn here as a
+    /// full-width fill UNDER the glyphs (a background color attribute would
+    /// only span the text's own width), so a scroll reads as clearly separated
+    /// per-file sections. Set with the document; empty clears the bands.
+    private(set) var headerLines: [Int] = []
+
+    func setHeaderLines(_ lines: [Int]) {
+        headerLines = lines
+        needsDisplay = true
+    }
+
+    /// Paints a subtle band and a hairline rule behind each visible header
+    /// line. Only lines intersecting the dirty rect are touched, and each band
+    /// spans the viewport (never just the header text's width), so the
+    /// separator reads even for a short path in a wide window.
+    private func drawHeaderBands(in rect: NSRect) {
+        guard !headerLines.isEmpty, let layoutManager, let textContainer else { return }
+        let length = (string as NSString).length
+        guard length > 0 else { return }
+        let inset = textContainerInset
+        // The characters intersecting the dirty rect. Restricting the layout
+        // queries to them keeps a changeset with hundreds of files from
+        // locating every header band on every repaint — only the headers the
+        // pass could actually paint are looked up.
+        let containerRect = NSRect(
+            x: rect.minX - inset.width,
+            y: rect.minY - inset.height,
+            width: max(rect.width, 1),
+            height: max(rect.height, 1)
+        )
+        let visibleGlyphs = layoutManager.glyphRange(forBoundingRect: containerRect, in: textContainer)
+        guard visibleGlyphs.length > 0 else { return }
+        let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        let bandWidth = max(bounds.width, enclosingScrollView?.contentSize.width ?? bounds.width)
+        for line in headerLines {
+            guard line >= 1, line - 1 < lineStartOffsets.count else { continue }
+            let charIndex = lineStartOffsets[line - 1]
+            guard charIndex < length, NSLocationInRange(charIndex, visibleChars) else { continue }
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let y = fragment.minY + inset.height
+            guard y < rect.maxY, y + fragment.height > rect.minY else { continue }
+            NSColor.labelColor.withAlphaComponent(0.10).setFill()
+            NSRect(x: 0, y: y, width: bandWidth, height: fragment.height).fill()
+            NSColor.separatorColor.setFill()
+            NSRect(x: 0, y: y, width: bandWidth, height: 1).fill()
+        }
     }
 
     /// The file section owning a character index, with its diff-character
@@ -854,7 +904,7 @@ class EditMarkerScroller: NSScroller {
     /// Paints the edit map into the slot, UNDER the knob (the knob is drawn
     /// afterwards by the default `drawKnob`, so it covers any tick it overlaps
     /// — a tick whose edit is currently on screen disappears under the knob,
-    /// exactly the \"you are here\" read). The scroller is flipped (top-down):
+    /// exactly the "you are here" read). The scroller is flipped (top-down):
     /// slot y grows downward, matching the document.
     private func drawEditMarkers(in slotRect: NSRect) {
         if let wholeTrackColor {

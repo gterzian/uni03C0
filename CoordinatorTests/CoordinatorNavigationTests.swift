@@ -869,6 +869,38 @@ extension CoordinatorNavigationTests {
         XCTAssertTrue(aText.contains("answer A0"), "A's rows must render on return, got: \(aText.prefix(160))")
     }
 
+    /// The tab-switch responsiveness contract: `setViewModel` defers the heavy
+    /// rebind one run-loop turn (so the selected-tab frame commits first), and
+    /// switching back to the session still on screen before that turn cancels
+    /// the pending rebind — it must never land on the abandoned tab.
+    func testSwitchAwayAndBackBeforeTheDeferredRebindCancelsIt() {
+        let vmA = SessionViewModel()
+        let vmB = SessionViewModel()
+        foldTurn(vmA.store, user: "question A0", reply: "answer A0")
+        foldTurn(vmB.store, user: "question B0", reply: "answer B0")
+
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vmA)
+        sv.frame = NSRect(x: 0, y: 0, width: 640, height: 600)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+        XCTAssertTrue(visibleText(coordinator).contains("answer A0"))
+
+        // Away to B and immediately back to A — before the deferred rebind runs.
+        coordinator.setViewModel(vmB)
+        XCTAssertTrue(coordinator.viewModel === vmA,
+                      "the rebind is deferred, so the outgoing session is still bound this turn")
+        coordinator.setViewModel(vmA)
+        spinRunLoop()
+
+        XCTAssertTrue(coordinator.viewModel === vmA,
+                      "the A→B→A switch must cancel the pending rebind to B")
+        sv.layoutSubtreeIfNeeded()
+        let text = visibleText(coordinator)
+        XCTAssertTrue(text.contains("answer A0"), "A's content must remain, got: \(text.prefix(160))")
+        XCTAssertFalse(text.contains("answer B0"), "B must never render after the switch was cancelled")
+    }
+
     /// Switching back to a session whose window heights are already cached
     /// must schedule NOTHING for the background measurer — otherwise every
     /// tab switch re-typesets the whole window off-main (the reported

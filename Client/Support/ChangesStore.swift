@@ -50,9 +50,10 @@ final class ChangesStore {
     // MARK: The loaded diffs (off-main data, read by the document builder)
 
     @ObservationIgnored private(set) var diffs: [String: LoadedFileDiff] = [:]
-    /// Extra full-array lines revealed above/below the base window, per path.
-    @ObservationIgnored private var extraUp: [String: Int] = [:]
-    @ObservationIgnored private var extraDown: [String: Int] = [:]
+    /// Per-gap reveal counters, path → (gap 0-based lower bound → lines
+    /// revealed). A gap collapses to one expand control; each activation grows
+    /// the counter in compounding blocks (see `DiffPlan`).
+    @ObservationIgnored private var gapExpansion: [String: DiffPlan.Expansion] = [:]
 
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var refreshInFlight = false
@@ -132,8 +133,7 @@ final class ChangesStore {
             isLoading = false
             // Drop diffs for files that are no longer changed.
             diffs = diffs.filter { paths.contains($0.key) }
-            extraUp = extraUp.filter { paths.contains($0.key) }
-            extraDown = extraDown.filter { paths.contains($0.key) }
+            gapExpansion = gapExpansion.filter { paths.contains($0.key) }
 
             let toLoad: [GitStatus.FileEntry]
             if let changedPath {
@@ -192,58 +192,31 @@ final class ChangesStore {
 
     // MARK: Expansion
 
-    enum ExpandDirection { case up, down }
-
-    /// The visible window of a file's interleaved diff, in full-array indices
-    /// (inclusive). The base window is the change span plus a few context lines;
-    /// expansion grows it above/below in compounding blocks until the whole file
-    /// is shown.
-    struct Window: Equatable, Sendable {
-        let start: Int
-        let end: Int
+    /// A file's rendered layout: the changed runs plus context, with the
+    /// unchanged gaps between them collapsed to expand controls. Pure math in
+    /// `DiffPlan`, so the builder stays color-free and the layout is testable.
+    func renderItems(for diff: LoadedFileDiff) -> [DiffRenderItem] {
+        DiffPlan.renderItems(
+            added: diff.added,
+            removed: diff.removed,
+            count: diff.lines.count,
+            expansion: gapExpansion[diff.path] ?? [:]
+        )
     }
 
-    private static let baseContext = 3
-    private static let expandBlockStart = 40
-    private static let expandBlockMax = 4000
-
-    func window(for diff: LoadedFileDiff) -> Window {
-        let count = diff.lines.count
-        guard count > 0 else { return Window(start: 0, end: 0) }
-        let change = diff.changeRange ?? (0...(count - 1))
-        let baseStart = max(0, change.lowerBound - Self.baseContext)
-        let baseEnd = min(count - 1, change.upperBound + Self.baseContext)
-        let start = max(0, baseStart - (extraUp[diff.path] ?? 0))
-        let end = min(count - 1, baseEnd + (extraDown[diff.path] ?? 0))
-        return Window(start: start, end: end)
-    }
-
-    /// Whether there is more of the file to reveal on a side.
-    func canExpand(_ diff: LoadedFileDiff, _ direction: ExpandDirection) -> Bool {
-        let window = window(for: diff)
-        switch direction {
-        case .up: return window.start > 0
-        case .down: return window.end < diff.lines.count - 1
-        }
-    }
-
-    func expand(path: String, direction: ExpandDirection) {
+    /// Reveals the next compounding block of the gap starting at 0-based
+    /// display index `gap`. No-ops when the gap is already fully shown, so a
+    /// double click on a stale control never bumps the document version.
+    func expand(path: String, gap: Int) {
         guard let diff = diffs[path] else { return }
-        switch direction {
-        case .up:
-            guard canExpand(diff, .up) else { return }
-            extraUp[path] = Self.nextBlock(extraUp[path] ?? 0)
-        case .down:
-            guard canExpand(diff, .down) else { return }
-            extraDown[path] = Self.nextBlock(extraDown[path] ?? 0)
-        }
+        let current = renderItems(for: diff)
+        guard current.contains(where: {
+            if case .expand(let g, _) = $0 { return g == gap } else { return false }
+        }) else { return }
+        var map = gapExpansion[path] ?? [:]
+        map[gap] = DiffPlan.nextBlock(map[gap] ?? 0)
+        gapExpansion[path] = map
         documentVersion &+= 1
-    }
-
-    /// The next compounding reveal block: 40, 80, 160, … capped.
-    private static func nextBlock(_ current: Int) -> Int {
-        guard current > 0 else { return expandBlockStart }
-        return min(current * 2, expandBlockMax)
     }
 
     // MARK: Viewer commands
