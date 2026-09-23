@@ -16,23 +16,38 @@ final class DiffPlanTests: XCTestCase {
     }
 
     func testFarApartChangesCollapseToHunksAndControls() {
-        // 100 lines, changes at display lines 10 and 90 (1-based).
+        // 100 lines, changes at display lines 10 and 90 (1-based). The head and
+        // tail gaps are under `minCollapsedGap`, so they render inline; only the
+        // large middle gap collapses.
         let items = DiffPlan.renderItems(added: [10, 90], removed: [], count: 100, expansion: [:])
-        XCTAssertEqual(lines(items), [6...12, 86...92])
-        XCTAssertEqual(expands(items).map(\.gap), [0, 13, 93])
-        XCTAssertEqual(expands(items).map(\.hidden), [6, 73, 7])
-        // The controls bracket the hunks in document order.
-        XCTAssertEqual(items.count, 5)
-        if case .expand(let gap, _) = items[0] { XCTAssertEqual(gap, 0) } else { XCTFail() }
-        if case .lines = items[1] {} else { XCTFail() }
-        if case .expand(let gap, _) = items[2] { XCTAssertEqual(gap, 13) } else { XCTFail() }
-        if case .lines = items[3] {} else { XCTFail() }
-        if case .expand(let gap, _) = items[4] { XCTAssertEqual(gap, 93) } else { XCTFail() }
+        XCTAssertEqual(lines(items), [0...12, 86...99])
+        XCTAssertEqual(expands(items).map(\.gap), [13])
+        XCTAssertEqual(expands(items).map(\.hidden), [73])
+        XCTAssertEqual(items.count, 3)
+        if case .lines = items[0] {} else { XCTFail() }
+        if case .expand(let gap, _) = items[1] { XCTAssertEqual(gap, 13) } else { XCTFail() }
+        if case .lines = items[2] {} else { XCTFail() }
+    }
+
+    func testGapsUnderMinCollapsedGapShowInline() {
+        // A 16-line head gap still collapses, but a 7-line tail gap does not.
+        let accepted = DiffPlan.renderItems(added: [20], removed: [], count: 30, expansion: [:])
+        XCTAssertEqual(lines(accepted), [16...29])
+        XCTAssertEqual(expands(accepted).map(\.gap), [0])
+        XCTAssertEqual(expands(accepted).map(\.hidden), [16])
+
+        // Change near the top: the 1-line head gap shows inline, the tail collapses.
+        let head = DiffPlan.renderItems(added: [5], removed: [], count: 30, expansion: [:])
+        XCTAssertEqual(lines(head), [0...7])
+        XCTAssertEqual(expands(head).map(\.gap), [8])
+        XCTAssertEqual(expands(head).map(\.hidden), [22])
     }
 
     func testAdjacentChangedLinesFormOneRun() {
         let items = DiffPlan.renderItems(added: [10, 11], removed: [12], count: 100, expansion: [:])
-        XCTAssertEqual(lines(items).first, 6...14)
+        // 6...14 is the run plus context; the 6-line head gap is under the
+        // collapse threshold, so the whole head renders too.
+        XCTAssertEqual(lines(items).first, 0...14)
     }
 
     func testHugeRunIsInitiallyCapped() {
@@ -48,11 +63,11 @@ final class DiffPlanTests: XCTestCase {
         let base = DiffPlan.renderItems(added: [10, 90], removed: [], count: 100, expansion: [:])
         let middleGap = expands(base).first { $0.gap == 13 }!.gap
         let revealed = DiffPlan.renderItems(added: [10, 90], removed: [], count: 100, expansion: [middleGap: 40])
-        XCTAssertEqual(lines(revealed), [6...32, 66...92],
+        XCTAssertEqual(lines(revealed), [0...32, 66...99],
                        "40 revealed lines split 20 from the gap's top and 20 from its bottom")
-        XCTAssertEqual(expands(revealed).map(\.gap), [0, middleGap, 93],
+        XCTAssertEqual(expands(revealed).map(\.gap), [middleGap],
                        "the control keeps the ORIGINAL gap id while its lines move")
-        XCTAssertEqual(expands(revealed).map(\.hidden), [6, 33, 7])
+        XCTAssertEqual(expands(revealed).map(\.hidden), [33])
     }
 
     func testExpansionEventuallyShowsTheWholeGap() {

@@ -235,27 +235,49 @@ final class MarkdownTextTests: XCTestCase {
         let b = body("| Name | Age |\n|:-----|----:|\n| Alice | 30 |\n| Bob | 5 |")
         let text = b.string.string
         XCTAssertFalse(text.contains("|"), "the pipe delimiters are consumed")
+        XCTAssertFalse(text.contains("\t"), "cells are table blocks, not tab-separated text")
         XCTAssertTrue(text.contains("Name"))
         XCTAssertTrue(text.contains("Alice"))
-        XCTAssertTrue(text.contains("\t"), "columns are positioned by tab stops")
         // The header row is bold and carries a background tint so it reads as
-        // a header; the body row is not bold.
+        // a header; the body row is not bold and is untinted. The tint lives
+        // on the cell's text block (TextKit draws it), not as a run attribute.
         let header = RenderTestHelper.range(of: "Name", in: b.string).location
         XCTAssertTrue(RenderTestHelper.font(b.string, at: header, hasTrait: .bold))
-        XCTAssertNotNil(b.string.attribute(.backgroundColor, at: header, effectiveRange: nil))
+        let headerBlock = RenderTestHelper.paragraph(b.string, at: header)?.textBlocks.first as? NSTextTableBlock
+        XCTAssertNotNil(headerBlock)
+        XCTAssertNotNil(headerBlock?.backgroundColor)
         let bodyCell = RenderTestHelper.range(of: "Alice", in: b.string).location
         XCTAssertFalse(RenderTestHelper.font(b.string, at: bodyCell, hasTrait: .bold))
-        XCTAssertNil(b.string.attribute(.backgroundColor, at: bodyCell, effectiveRange: nil))
+        let bodyBlock = RenderTestHelper.paragraph(b.string, at: bodyCell)?.textBlocks.first as? NSTextTableBlock
+        XCTAssertNotNil(bodyBlock)
+        XCTAssertNil(bodyBlock?.backgroundColor)
+        // Columns sit side by side on the header line, not one per line.
+        let (_, view) = RenderTestHelper.layout(b.string, width: 400)
+        let name = lineRect(of: "Name", in: b.string, in: view)
+        let age = lineRect(of: "Age", in: b.string, in: view)
+        XCTAssertEqual(name.minY, age.minY, accuracy: 0.5)
+        XCTAssertGreaterThan(age.minX, name.maxX)
+    }
+
+    /// The bounding rect of `needle` in a laid-out attributed string.
+    private func lineRect(of needle: String, in string: NSAttributedString, in view: NSTextView) -> NSRect {
+        let loc = RenderTestHelper.range(of: needle, in: string).location
+        let glyphs = view.layoutManager!.glyphRange(
+            forCharacterRange: NSRange(location: loc, length: (needle as NSString).length),
+            actualCharacterRange: nil
+        )
+        return view.layoutManager!.boundingRect(forGlyphRange: glyphs, in: view.textContainer!)
     }
 
     func testTableHonorsColumnAlignment() {
         let b = body("| left | right | center |\n|:-----|------:|:------:|\n| a | b | c |")
-        let ps = RenderTestHelper.paragraph(b.string, at: 0)
-        let stops = ps?.tabStops ?? []
-        // One tab stop per column after the (left-aligned, tab-less) first.
-        XCTAssertEqual(stops.count, 2)
-        XCTAssertEqual(stops[0].alignment, .right)
-        XCTAssertEqual(stops[1].alignment, .center)
+        func alignment(_ needle: String) -> NSTextAlignment? {
+            let loc = RenderTestHelper.range(of: needle, in: b.string).location
+            return RenderTestHelper.paragraph(b.string, at: loc)?.alignment
+        }
+        XCTAssertEqual(alignment("left"), .left)
+        XCTAssertEqual(alignment("right"), .right)
+        XCTAssertEqual(alignment("center"), .center)
     }
 
     func testTableRightEdgeIsFlushAcrossRows() {
@@ -283,11 +305,12 @@ final class MarkdownTextTests: XCTestCase {
         XCTAssertNil(RenderTestHelper.range(of: "**", in: b.string).location != NSNotFound ? "found" : nil)
     }
 
-    func testTableLinesAreSeparatedByTabsAndNotDoubleSpaced() {
+    func testTableLinesAreNotDoubleSpaced() {
         let b = body("| a | b |\n|---|---|\n| c | d |")
-        // Three lines: header, separator, body. No paragraphSpacing
-        // inflation (which would inflate every line fragment).
-        XCTAssertEqual(RenderTestHelper.ranges(of: "\n", in: b.string).count, 2)
+        // Four cell paragraphs (2 header + 2 body), the last newline dropped:
+        // three separators. No paragraphSpacing inflation (which would inflate
+        // every line fragment).
+        XCTAssertEqual(RenderTestHelper.ranges(of: "\n", in: b.string).count, 3)
         var location = 0
         while location < b.string.length {
             var effective = NSRange(location: 0, length: 0)
@@ -310,6 +333,23 @@ final class MarkdownTextTests: XCTestCase {
         XCTAssertTrue(b.string.string.contains("pipe | operator"))
     }
 
+    func testHeaderOnlyTableRendersAndMeasures() {
+        // A delimiter row with no body rows (also the state mid-stream): the
+        // table is still detected and must lay out and measure consistently.
+        let b = body("| Name | Age |\n|:-----|----:|")
+        XCTAssertTrue(b.string.string.contains("Name"))
+        XCTAssertFalse(b.string.string.contains("|"))
+        for width: CGFloat in [600, 200] {
+            let (used, _) = RenderTestHelper.layout(b.string, width: width)
+            XCTAssertEqual(
+                RenderTestHelper.boundingHeight(b.string, width: width),
+                used.height,
+                accuracy: 0.5,
+                "measured height must match at width \(width)"
+            )
+        }
+    }
+
     func testTableMeasurementMatchesRenderedHeight() {
         let b = body("| Name | Age |\n|:-----|----:|\n| Alice | 30 |\n| Bob | 5 |")
         for width: CGFloat in [400, 200, 120] {
@@ -319,6 +359,36 @@ final class MarkdownTextTests: XCTestCase {
                 used.height,
                 accuracy: 0.5,
                 "measured height must match the layout manager at width \(width)"
+            )
+        }
+    }
+
+    func testWideTableFitsTheRowAndKeepsColumnsOnOneLine() {
+        // Regression: a long first-column cell used to size a tab stop far
+        // beyond the viewport, so every column wrapped onto its own line and
+        // the "table" read as a vertical list. Columns must stay on one line
+        // and the table must fit the available width.
+        let b = body("""
+        | Piece | Who/what | Status |
+        |---|---|---|
+        | 1. Host extension-point declaration in Robrix (`@Definition`, `Name("org.robrix.agent-host")`, `Scope`, `UserInterface(false)`) | Swift compiled into Robrix | easy to compile, hard to **bundle/register** from Makepad's non-Xcode build |
+        | 2. Host XPC bridge: `Monitor` → `AppExtensionProcess` → `makeXPCConnection()`, installed via `install_extension_bridge` | Swift in Robrix | ~200 lines; straightforward |
+        """)
+        for width: CGFloat in [600, 900] {
+            let (used, view) = RenderTestHelper.layout(b.string, width: width)
+            XCTAssertLessThanOrEqual(used.maxX, width, "the table must not overflow at width \(width)")
+            let piece = lineRect(of: "Piece", in: b.string, in: view)
+            let who = lineRect(of: "Who/what", in: b.string, in: view)
+            let status = lineRect(of: "Status", in: b.string, in: view)
+            XCTAssertEqual(piece.minY, who.minY, accuracy: 0.5, "header columns share a line")
+            XCTAssertEqual(who.minY, status.minY, accuracy: 0.5, "header columns share a line")
+            XCTAssertGreaterThan(who.minX, piece.maxX)
+            XCTAssertGreaterThan(status.minX, who.maxX)
+            XCTAssertEqual(
+                RenderTestHelper.boundingHeight(b.string, width: width),
+                used.height,
+                accuracy: 0.5,
+                "measured height must match at width \(width)"
             )
         }
     }

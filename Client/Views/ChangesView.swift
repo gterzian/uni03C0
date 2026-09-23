@@ -111,11 +111,34 @@ struct ChangesView: View {
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(Color.secondary.opacity(0.15), in: Capsule())
+                totalStatsView
             }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 9)
+    }
+
+    /// The changeset's total added/deleted lines, beside the file count. Reads
+    /// as one summary ("3 files, +120 −34"); hidden when nothing is countable
+    /// (untracked-only or binary changes already show their own badge).
+    @ViewBuilder
+    private var totalStatsView: some View {
+        if let total = store.totalStats, total.total > 0 {
+            HStack(spacing: 4) {
+                if total.added > 0 {
+                    Text("+\(total.added)")
+                        .foregroundStyle(.green)
+                }
+                if total.deleted > 0 {
+                    Text("−\(total.deleted)")
+                        .foregroundStyle(.red)
+                }
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Total \(total.added) lines added, \(total.deleted) lines deleted")
+        }
     }
 
     private func fileRow(_ entry: GitStatus.FileEntry) -> some View {

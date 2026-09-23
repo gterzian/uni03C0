@@ -185,11 +185,13 @@ real `pi` or hit a live model.
   an intra-paragraph newline as a `.softBreak` run whose text is a space; re-emit
   a real `\n` for soft and hard (`.lineBreak`) breaks or multi-line prose collapses.
 - **`AttributedString(markdown:)` has no table extension.** `MarkdownText` detects
-  GFM header + delimiter rows (never inside a fence) and renders tab-stop lines in
-  the row's one attributed string, so the measurement invariant holds. Use
-  `NSTextTab`s at column edges; space padding drifts, and a leading stop at 0 is
-  skipped, so add a leading tab only when column 1 is not left-aligned. Keep the
-  no-`|` fast path on the streaming hot path.
+  GFM header + delimiter rows (never inside a fence) and renders an `NSTextTable`
+  grid — one block per cell, content-proportional `contentWidth` percentages, and
+  the header hairline/tint from the block. NSTextTable sizes columns to the row
+  width at layout time, so the string stays width-independent and the measurement
+  invariant holds. Tab stops were the old approach and overflowed: a long cell
+  sized a stop past the viewport and shoved later columns onto their own lines.
+  Keep the no-`|` fast path on the streaming hot path.
 - **Row-height under-measure clips the TOP.** The text view is flipped but the
   row is not, so a too-tall text view overflows **upward**; and measuring at
   `tableView.bounds.width` (which includes the ~32pt scroller gutter) over-reports,
@@ -269,9 +271,10 @@ Rules:
 - The viewer is ONE `CodePaneContainer` (scroll view + code view + ruler +
   edit-map scroller) over every file's diff in path order, each opened by a
   header band. A file renders only its changed runs + 3 context lines
-  (`DiffPlan`, Core); each unchanged gap collapses to ONE expand control
-  revealing a compounding block from both edges — never the contiguous
-  first-change→last-change span. Built PLAIN off-main (`DiffDocumentBuilder`);
+  (`DiffPlan`, Core); each gap under 10 lines renders inline, larger gaps
+  collapse to ONE expand control revealing a compounding block from both edges
+  — never the contiguous first-change→last-change span. Built PLAIN off-main
+  (`DiffDocumentBuilder`);
   `DiffHighlightPlan` prefetches `DiffHighlighter` colors past the viewport in
   compounding blocks; `sizeThatFits` fills the slot and a copy tags the file.
 - Header bands paint full-width in `ReadOnlyCodeTextView.drawBackground`, never

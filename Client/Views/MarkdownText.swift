@@ -21,8 +21,8 @@ import AppKit
 /// button from the reported `codeBlocks`), bullet and ordered lists (nested,
 /// with hanging indents), blockquotes, links (clickable — `TextRowView`
 /// opens them), and GitHub-style tables (detected before parsing —
-/// Foundation's parser has no table extension — and rendered as an aligned
-/// grid of columns).
+/// Foundation's parser has no table extension — and rendered as an
+/// `NSTextTable` grid that wraps its cells to fit the row width).
 @MainActor
 enum MarkdownText {
     /// A plain immutable data holder; `nonisolated` so `build` and the
@@ -390,24 +390,23 @@ enum MarkdownText {
         return cells + Array(repeating: "", count: count - cells.count)
     }
 
-    /// Renders a table as an aligned grid of text lines: a bold header with a
-    /// tinted background, a dashed separator, then one line per row. Columns
-    /// are positioned with tab stops at the widest cell's edge, so alignment
-    /// is exact (a right-aligned tab stop lands the following text flush at
-    /// the column's right edge, a center stop at its middle) regardless of
-    /// inline styling; tabs keep the whole table inside the row's single
-    /// attributed string (the load-bearing measurement invariant). Cells are
-    /// inline markdown, so `**bold**`, `` `code` `` and links work inside a
-    /// cell.
+    /// Renders a table with `NSTextTable` — a bold, tinted header row with a
+    /// hairline under it, then one row per body row. Cells are real text
+    /// blocks, so TextKit sizes the columns to their content and scales them to
+    /// the row's width: a long cell wraps inside its column instead of pushing
+    /// the next column onto its own line, and the table always fits. The
+    /// width-dependence lives in the layout, not the attributed string, so the
+    /// load-bearing measurement invariant holds (the string is built once per
+    /// `(text, bodySize)` and measured/laid out at any width). Cells are inline
+    /// markdown, so `**bold**`, `` `code` `` and links work inside a cell.
     nonisolated private static func renderTable(_ table: MarkdownTable, bodySize: CGFloat) -> NSAttributedString {
         let bodyFont = NSFont.systemFont(ofSize: bodySize)
         let columnCount = table.headers.count
-        // The gap between columns, as a fixed point width (it must not depend
-        // on the font's space glyph, since the columns are laid out by tab).
+        // The gap between columns, added as padding on each block's inner edge.
         let columnGap: CGFloat = 12
 
-        let headerCells = (0..<columnCount).map {
-            renderInlineCell($0 < table.headers.count ? table.headers[$0] : "", bodySize: bodySize, isHeader: true)
+        let headerCells = table.headers.map {
+            renderInlineCell($0, bodySize: bodySize, isHeader: true)
         }
         let bodyRows: [[NSAttributedString]] = table.rows.map { row in
             (0..<columnCount).map {
@@ -415,86 +414,69 @@ enum MarkdownText {
             }
         }
 
-        var widths = [CGFloat](repeating: 0, count: columnCount)
+        // Natural content widths steer the column proportions; TextKit scales
+        // the percentages to the container, so a wide table wraps inside its
+        // columns rather than overflowing.
+        var natural = [CGFloat](repeating: 0, count: columnCount)
         for (column, cell) in headerCells.enumerated() {
-            widths[column] = max(widths[column], cell.size().width)
+            natural[column] = max(natural[column], cell.size().width)
         }
         for row in bodyRows {
             for (column, cell) in row.enumerated() {
-                widths[column] = max(widths[column], cell.size().width)
+                natural[column] = max(natural[column], cell.size().width)
             }
         }
+        let totalNatural = max(natural.reduce(0, +), 1)
 
-        var starts = [CGFloat](repeating: 0, count: columnCount)
-        var cursor: CGFloat = 0
-        for column in 0..<columnCount {
-            starts[column] = cursor
-            cursor += widths[column] + columnGap
-        }
-
-        func tabStop(for column: Int) -> NSTextTab {
-            let alignment: NSTextAlignment = switch table.alignments[column] {
-            case .left: .left
-            case .right: .right
-            case .center: .center
-            }
-            let location: CGFloat = switch table.alignments[column] {
-            case .left: starts[column]
-            case .right: starts[column] + widths[column]
-            case .center: starts[column] + widths[column] / 2
-            }
-            return NSTextTab(textAlignment: alignment, location: location, options: [:])
-        }
-
-        // A left-aligned first column needs no leading tab (a left tab stop at
-        // 0 is skipped by the layout engine, which would jump the cell to the
-        // NEXT stop). A right/center first column gets a leading tab whose stop
-        // is its own.
-        let leadingTab = table.alignments[0] != .left
-        var stops: [NSTextTab] = []
-        if leadingTab { stops.append(tabStop(for: 0)) }
-        for column in 1..<columnCount { stops.append(tabStop(for: column)) }
-
-        let tab = NSAttributedString(string: "\t", attributes: [.font: bodyFont])
-        func assemble(_ cells: [NSAttributedString]) -> NSMutableAttributedString {
-            let line = NSMutableAttributedString()
-            if leadingTab { line.append(tab) }
-            line.append(cells[0])
-            for column in 1..<columnCount {
-                line.append(tab)
-                line.append(cells[column])
-            }
-            return line
-        }
-
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
-        paragraph.lineBreakMode = .byWordWrapping
-        paragraph.tabStops = stops
-
-        let dashWidth = ("\u{2500}" as NSString).size(withAttributes: [.font: bodyFont]).width
-        let separatorCells = (0..<columnCount).map { column -> NSAttributedString in
-            let count = dashWidth > 0 ? max(1, Int(widths[column] / dashWidth)) : 1
-            return NSAttributedString(string: String(repeating: "\u{2500}", count: count), attributes: [
-                .font: bodyFont,
-                .foregroundColor: NSColor.tertiaryLabelColor,
-            ])
-        }
+        let nsTable = NSTextTable()
+        nsTable.numberOfColumns = columnCount
+        nsTable.layoutAlgorithm = .automatic
+        nsTable.collapsesBorders = false
+        nsTable.hidesEmptyCells = false
 
         let out = NSMutableAttributedString()
-        out.append(assemble(headerCells))
-        out.addAttribute(.backgroundColor, value: tableHeaderBackground, range: NSRange(location: 0, length: out.length))
-        out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
-        out.append(assemble(separatorCells))
-        out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
-        for row in bodyRows {
-            out.append(assemble(row))
-            out.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
+        func appendRow(_ cells: [NSAttributedString], isHeader: Bool, row: Int) {
+            for column in 0..<columnCount {
+                let block = NSTextTableBlock(
+                    table: nsTable, startingRow: row, rowSpan: 1,
+                    startingColumn: column, columnSpan: 1
+                )
+                block.setWidth(columnGap / 2, type: .absolute, for: .padding, edge: .minX)
+                block.setWidth(columnGap / 2, type: .absolute, for: .padding, edge: .maxX)
+                block.setContentWidth(natural[column] / totalNatural * 100, type: .percentage)
+                if isHeader {
+                    block.backgroundColor = tableHeaderBackground
+                    // A hairline under the header stands in for the markdown
+                    // delimiter row; the block draws it, so it spans the cell
+                    // even when the cell's text wraps.
+                    block.setWidth(1, type: .absolute, for: .border, edge: .maxY)
+                    block.setBorderColor(NSColor.separatorColor, for: .maxY)
+                }
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.textBlocks = [block]
+                paragraph.lineSpacing = 2
+                paragraph.lineBreakMode = .byWordWrapping
+                paragraph.alignment = switch table.alignments[column] {
+                case .left: .left
+                case .right: .right
+                case .center: .center
+                }
+                let cell = NSMutableAttributedString(attributedString: cells[column])
+                if cell.length == 0 {
+                    cell.append(NSAttributedString(string: " ", attributes: [.font: bodyFont]))
+                }
+                cell.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont]))
+                cell.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: cell.length))
+                out.append(cell)
+            }
         }
-        // One line per row, so no trailing blank line; the block gap is added
-        // by the segment assembler.
+        appendRow(headerCells, isHeader: true, row: 0)
+        for (index, row) in bodyRows.enumerated() {
+            appendRow(row, isHeader: false, row: index + 1)
+        }
+        // The last newline only closes the final cell; drop it so the table
+        // owns no trailing blank line (the segment assembler adds the gap).
         if out.string.hasSuffix("\n") { out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1)) }
-        out.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: out.length))
         return out
     }
 

@@ -101,6 +101,43 @@ final class GitStatusParsingTests: XCTestCase {
         XCTAssertNil(GitStatus.parseNumstatRecord("1\t2"))
     }
 
+    // MARK: - totalStats (the changeset's aggregate +/−)
+
+    func testTotalStatsSumsCountableEntries() {
+        let entries = [
+            GitStatus.FileEntry(path: "a.swift", kind: .modified, stats: GitStatus.DiffStats(added: 10, deleted: 2)),
+            GitStatus.FileEntry(path: "b.swift", kind: .added, stats: GitStatus.DiffStats(added: 5, deleted: 0)),
+            GitStatus.FileEntry(path: "c.swift", kind: .modified, stats: GitStatus.DiffStats(added: 0, deleted: 7))
+        ]
+        XCTAssertEqual(GitStatus.totalStats(of: entries), GitStatus.DiffStats(added: 15, deleted: 9))
+    }
+
+    func testTotalStatsSkipsUncountableEntries() {
+        // Untracked, binary, and normal entries carry no stats and add nothing.
+        let entries = [
+            GitStatus.FileEntry(path: "new.txt", kind: .untracked),
+            GitStatus.FileEntry(path: "blob.bin", kind: .modified),
+            GitStatus.FileEntry(path: "unchanged.swift", kind: .normal),
+            GitStatus.FileEntry(path: "real.swift", kind: .modified, stats: GitStatus.DiffStats(added: 3, deleted: 4))
+        ]
+        XCTAssertEqual(GitStatus.totalStats(of: entries), GitStatus.DiffStats(added: 3, deleted: 4))
+    }
+
+    func testTotalStatsNilWhenNothingCountable() {
+        XCTAssertNil(GitStatus.totalStats(of: []))
+        XCTAssertNil(GitStatus.totalStats(of: [
+            GitStatus.FileEntry(path: "new.txt", kind: .untracked)
+        ]))
+    }
+
+    func testTotalStatsKeepsZeroTotalDistinctFromNil() {
+        // A countable but unchanged record still yields a value (0/0), which
+        // the view hides (it shows the summary only when the total is > 0).
+        let entries = [GitStatus.FileEntry(path: "mode.sh", kind: .modified, stats: GitStatus.DiffStats(added: 0, deleted: 0))]
+        XCTAssertEqual(GitStatus.totalStats(of: entries), GitStatus.DiffStats(added: 0, deleted: 0))
+        XCTAssertEqual(GitStatus.totalStats(of: entries)?.total, 0)
+    }
+
     // MARK: - parseNameStatusZ (the `git diff -z --name-status` wire format)
 
     func testNameStatusRecordsParseStatusAndRawPath() {

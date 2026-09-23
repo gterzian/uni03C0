@@ -20,6 +20,9 @@ final class ChangesStore {
 
     private(set) var entries: [GitStatus.FileEntry] = []
     private(set) var isLoading = true
+    /// The changeset's total added/deleted line counts (the sidebar summary).
+    /// Derived from `entries`, so it tracks the list without its own refresh.
+    var totalStats: GitStatus.DiffStats? { GitStatus.totalStats(of: entries) }
     /// Bumped when `entries` changes.
     private(set) var listVersion = 0
     /// Bumped whenever the rendered diff document's inputs change: diffs

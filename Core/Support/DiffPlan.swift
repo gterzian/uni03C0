@@ -15,10 +15,12 @@ public enum DiffRenderItem: Equatable, Sendable {
 ///
 /// The file's display lines are the interleaved diff (every real current-file
 /// line with removed lines re-inserted). Only the changed regions plus a few
-/// context lines are shown; the unchanged gaps between them collapse to one
+/// context lines are shown; larger unchanged gaps between them collapse to one
 /// expand control each, so a file whose changes sit far apart is a handful of
-/// hunks rather than the whole file. Expansion reveals a gap in compounding
-/// blocks, half from each edge, so a click never dumps thousands of lines.
+/// hunks rather than the whole file. Gaps shorter than `minCollapsedGap` render
+/// inline instead, since a control over a handful of lines hides almost nothing.
+/// Expansion reveals a gap in compounding blocks, half from each edge, so a
+/// click never dumps thousands of lines.
 public enum DiffPlan {
     /// Per-gap reveal counters: gap 0-based lower bound → lines revealed so far.
     public typealias Expansion = [Int: Int]
@@ -31,6 +33,10 @@ public enum DiffPlan {
     /// The first expansion block, then doubled up to `expandBlockMax`.
     public static let expandBlockStart = 40
     public static let expandBlockMax = 4000
+    /// Unchanged gaps shorter than this are shown outright, never collapsed
+    /// behind an expand control: a control over a handful of lines costs a
+    /// click and hides almost nothing.
+    public static let minCollapsedGap = 10
 
     /// The next compounding reveal block: 40, 80, 160, … capped.
     public static func nextBlock(_ current: Int) -> Int {
@@ -47,7 +53,8 @@ public enum DiffPlan {
         count: Int,
         expansion: Expansion,
         context: Int = baseContext,
-        initialCap: Int = initialRunCap
+        initialCap: Int = initialRunCap,
+        minCollapsedGap: Int = DiffPlan.minCollapsedGap
     ) -> [DiffRenderItem] {
         guard count > 0 else { return [] }
         // Work in 0-based indices internally; the input is 1-based display lines.
@@ -81,7 +88,13 @@ public enum DiffPlan {
             let residualStart = gap.lowerBound + top
             let residualEnd = gap.upperBound - bottom
             if residualStart <= residualEnd {
-                residuals.append((gap.lowerBound, residualStart...residualEnd))
+                let residual = residualStart...residualEnd
+                if gapLength(residual) < minCollapsedGap {
+                    // Too short to be worth a control: show it inline.
+                    appendMerged(&expanded, residual)
+                } else {
+                    residuals.append((gap.lowerBound, residual))
+                }
             }
         }
         let merged = merge(expanded)

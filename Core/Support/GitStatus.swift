@@ -32,6 +32,15 @@ public enum GitStatus {
             self.added = added
             self.deleted = deleted
         }
+
+        /// Component-wise sum, for aggregating a changeset's totals.
+        public static func + (lhs: DiffStats, rhs: DiffStats) -> DiffStats {
+            DiffStats(added: lhs.added + rhs.added, deleted: lhs.deleted + rhs.deleted)
+        }
+
+        /// Added + deleted lines — zero means an empty/countable-but-unchanged
+        /// file, not "no stats".
+        public var total: Int { added + deleted }
     }
 
     /// One classified project file (the tree's leaf model).
@@ -142,6 +151,21 @@ public enum GitStatus {
         var lines = text.components(separatedBy: "\n")
         if lines.last == "" { lines.removeLast() }
         return lines
+    }
+
+    // MARK: - Changeset totals
+
+    /// The whole changeset's line totals: the sum of every entry's
+    /// added/deleted counts. Entries with no countable baseline (untracked,
+    /// binary, `.normal`) contribute nothing; nil when nothing countable
+    /// changed, so the caller can tell "no diff" from "+0 −0".
+    public static func totalStats(of entries: [FileEntry]) -> DiffStats? {
+        var total: DiffStats?
+        for entry in entries {
+            guard let stats = entry.stats else { continue }
+            total = (total ?? DiffStats(added: 0, deleted: 0)) + stats
+        }
+        return total
     }
 
     // MARK: - Listing + classification
