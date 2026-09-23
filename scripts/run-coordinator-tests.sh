@@ -6,7 +6,7 @@
 # manifest sandbox (`sandbox-exec`), which the Seatbelt policy denies.
 #
 # Prerequisite: `swift test --disable-sandbox` has built the harness Core
-# module at least once (`.build/arm64-apple-macosx/debug`), so the REAL Core
+# module at least once (its SwiftPM bin path), so the REAL Core
 # (TranscriptStore, HeightCache, StreamingRefreshGate, …) is available to
 # link against. The renderer's FontSettings is stubbed because the
 # @Observable macro's plugin server is blocked in the sandbox.
@@ -16,7 +16,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BUILD=.build/arm64-apple-macosx/debug
+# Resolve the harness build directory from SwiftPM itself. The on-disk layout
+# moved (Swift 6.4 puts products under .build/out/Products/Debug, with the
+# module bundles beside the product objects), so a hardcoded path can silently
+# link a stale Core. `--show-bin-path` is the toolchain's own answer.
+BUILD="$(swift build --disable-sandbox --show-bin-path)"
 OUT=/tmp/coordtests
 mkdir -p "$OUT/mod"
 
@@ -32,9 +36,9 @@ swiftc -emit-library -module-name XCTest -swift-version 6 \
 #    binary, linking the real Core module built by the SwiftPM harness (its
 #    dependencies — Subprocess, SystemPackage, the C shims — come from the
 #    same build).
-CORE_MODS="$BUILD/Modules"
-SUB_MODS="$(dirname "$(find "$BUILD" -name Subprocess.swiftmodule | head -1)")"
-SYS_MODS="$(dirname "$(find "$BUILD" -name SystemPackage.swiftmodule | head -1)")"
+# Module bundles sit beside the product objects in the current layout, so the
+# single bin path serves as the import search root for Core/Subprocess/System.
+MODS="$BUILD"
 SHIM_INC="$(find .build -name _SubprocessCShims -type d | head -1)/include"
 CORE_OBJECTS="$(find "$BUILD" -name '*.o' ! -path '*ClientTests*')"
 
@@ -53,7 +57,7 @@ swiftc -swift-version 6 -default-isolation MainActor \
   Client/Views/ToolCallCardView.swift \
   Client/Views/TranscriptEntry+Measurement.swift \
   Client/Views/TranscriptView.swift \
-  -I "$CORE_MODS" -I "$SUB_MODS" -I "$SYS_MODS" -I "$SHIM_INC" \
+  -I "$MODS" -I "$SHIM_INC" \
   -I "$OUT/mod" -L "$OUT" -lXCTest \
   $CORE_OBJECTS
 

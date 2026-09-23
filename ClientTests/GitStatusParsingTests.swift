@@ -100,4 +100,29 @@ final class GitStatusParsingTests: XCTestCase {
         XCTAssertNil(GitStatus.parseNumstatRecord("not a numstat record"))
         XCTAssertNil(GitStatus.parseNumstatRecord("1\t2"))
     }
+
+    // MARK: - parseNameStatusZ (the `git diff -z --name-status` wire format)
+
+    func testNameStatusRecordsParseStatusAndRawPath() {
+        let records = GitStatus.parseNameStatusZ("M\0a.swift\0A\0b\tc.swift\0D\0gone.swift\0")
+        XCTAssertEqual(records.count, 3)
+        XCTAssertEqual(records[0].code, "M")
+        XCTAssertEqual(records[0].path, "a.swift")
+        XCTAssertEqual(records[1].code, "A")
+        // -z never quotes, so a tab in the path is raw.
+        XCTAssertEqual(records[1].path, "b\tc.swift")
+        XCTAssertEqual(records[2].code, "D")
+        XCTAssertEqual(records[2].path, "gone.swift")
+    }
+
+    func testNameStatusEmptyIsEmpty() {
+        XCTAssertTrue(GitStatus.parseNameStatusZ("").isEmpty)
+    }
+
+    func testNameStatusMissingTrailingNulStillParses() {
+        let records = GitStatus.parseNameStatusZ("M\0a.swift")
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records[0].code, "M")
+        XCTAssertEqual(records[0].path, "a.swift")
+    }
 }

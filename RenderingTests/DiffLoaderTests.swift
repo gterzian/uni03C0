@@ -30,24 +30,45 @@ final class DiffLoaderTests: XCTestCase {
             try! text.write(to: file, atomically: true, encoding: .utf8)
         }
 
-        func git(_ args: [String]) {
+        @discardableResult
+        func git(_ args: [String]) -> String? {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
             process.arguments = args
             process.currentDirectoryURL = root
-            process.standardOutput = Pipe()
+            let out = Pipe()
+            process.standardOutput = out
             process.standardError = Pipe()
             try! process.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
+            return String(data: data, encoding: .utf8)
+        }
+
+        /// The current `HEAD` commit, for pinning a turn baseline.
+        func head() -> String {
+            (git(["rev-parse", "HEAD"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
 
     /// Runs an async load to completion by pumping the run loop (the stub test
     /// runner invokes test methods synchronously).
     @MainActor
-    private func load(_ repo: Repo, _ entry: GitStatus.FileEntry) -> LoadedFileDiff? {
+    private func load(_ repo: Repo, _ entry: GitStatus.FileEntry, base: String = "HEAD") -> LoadedFileDiff? {
         var result: LoadedFileDiff?
-        Task { result = await DiffLoader.load(cwd: repo.root, entry: entry) }
+        Task { result = await DiffLoader.load(cwd: repo.root, entry: entry, base: base) }
+        let deadline = Date().addingTimeInterval(3)
+        while result == nil, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        return result
+    }
+
+    /// Runs `GitStatus.classify` to completion by pumping the run loop.
+    @MainActor
+    private func classify(_ repo: Repo, base: String) -> [GitStatus.FileEntry]? {
+        var result: [GitStatus.FileEntry]?
+        Task { result = await GitStatus.classify(at: repo.root, base: base) }
         let deadline = Date().addingTimeInterval(3)
         while result == nil, Date() < deadline {
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
@@ -111,6 +132,43 @@ final class DiffLoaderTests: XCTestCase {
         XCTAssertEqual(diff.added, [1, 2])
         XCTAssertTrue(diff.removed.isEmpty)
         XCTAssertEqual(diff.lineNumbers, [1, 2])
+    }
+
+    // MARK: - Turn baseline across a mid-turn commit
+
+    @MainActor
+    func testPinnedBaseKeepsDiffAndListingAfterMidTurnCommit() {
+        let repo = Repo()
+        repo.write("a\nb\nc\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "init"])
+        let base = repo.head()
+        XCTAssertFalse(base.isEmpty)
+
+        // The agent edits and commits mid-turn: HEAD moves, the pinned base
+        // does not — the turn's change stays reviewable.
+        repo.write("a\nB\nc\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "mid-turn"])
+
+        guard let entries = classify(repo, base: base) else { return XCTFail("no classify") }
+        let fileEntry = entries.first { $0.path == "a.txt" }
+        XCTAssertEqual(fileEntry?.kind, .modified)
+        XCTAssertEqual(fileEntry?.stats, GitStatus.DiffStats(added: 1, deleted: 1))
+
+        guard let diff = load(repo, entry("a.txt", .modified), base: base) else { return XCTFail("no diff") }
+        XCTAssertNil(diff.message)
+        // The net turn change relative to the pinned base, not the now-clean
+        // working tree.
+        XCTAssertEqual(diff.lines.map(\.text), ["a", "b", "B", "c"])
+        XCTAssertEqual(diff.added, [3])
+        XCTAssertEqual(diff.removed, [2])
+
+        // Sanity: the live HEAD now matches the working tree, so a live base
+        // would have shown nothing — which is exactly what the pinned base
+        // avoids.
+        guard let headEntries = classify(repo, base: "HEAD") else { return XCTFail("no classify") }
+        XCTAssertNil(headEntries.first { $0.path == "a.txt" && $0.kind != .normal })
     }
 
     @MainActor

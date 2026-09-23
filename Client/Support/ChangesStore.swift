@@ -39,6 +39,13 @@ final class ChangesStore {
     /// `#L…` of an agent's `pi-file` link), nil for a whole-file reveal.
     var revealLine: Int?
 
+    /// The commit this turn diffs against, pinned when the user's prompt is
+    /// sent (`beginTurn`). `nil` until the first turn — then every refresh uses
+    /// the live `HEAD`. Pinning it is what keeps a commit the agent makes
+    /// mid-turn from clearing the viewer: the changed set and diffs are net
+    /// changes since the turn began, and only the next turn re-baselines.
+    @ObservationIgnored private(set) var baseline: String?
+
     /// The assembled document for `documentVersion`, from the viewer's off-main
     /// builder. The Changes page is `.id`-keyed per tab, so a tab switch
     /// remounts the viewer; re-applying this instead of rebuilding avoids the
@@ -105,6 +112,16 @@ final class ChangesStore {
         }
     }
 
+    /// Re-baselines the viewer for a new user turn: pins the current `HEAD` as
+    /// the commit this turn diffs against (a mid-turn commit by the agent then
+    /// no longer moves the baseline) and drops the previous turn's expansion
+    /// state. Called when a prompt is sent, never on a git commit.
+    func beginTurn() async {
+        baseline = await GitStatus.resolveHead(at: cwd)
+        gapExpansion = [:]
+        await refresh()
+    }
+
     /// Re-lists the changed files, then (re)loads their diffs off the main
     /// thread. When `changedPath` names a file, only that file's diff is
     /// re-read; a nil path (a turn settled, a `git commit`) reloads them all.
@@ -119,8 +136,17 @@ final class ChangesStore {
             refreshQueued = false
             guard !Task.isCancelled else { return }
             let cwd = self.cwd
+            // Read the baseline each iteration: `beginTurn` may pin a new one
+            // while a refresh is already in flight (the queued repeat picks it
+            // up instead of the old base).
+            let base: String
+            if let baseline {
+                base = baseline
+            } else {
+                base = await GitStatus.resolveHead(at: cwd)
+            }
             let all = await Task.detached(priority: .userInitiated) {
-                await GitStatus.classify(at: cwd)
+                await GitStatus.classify(at: cwd, base: base)
             }.value
             guard !Task.isCancelled else { return }
             let changed = all.filter { $0.kind != .normal }.sorted { $0.path < $1.path }
@@ -151,7 +177,7 @@ final class ChangesStore {
             // highlighting, no rebuild, and no scroll jump.
             var needsRebuild = previousPaths != paths
             if !toLoad.isEmpty {
-                let loaded = await self.load(changed: toLoad, cwd: cwd)
+                let loaded = await self.load(changed: toLoad, cwd: cwd, base: base)
                 for diff in loaded where diffs[diff.path] != diff {
                     diffs[diff.path] = diff
                     needsRebuild = true
@@ -169,7 +195,7 @@ final class ChangesStore {
 
     /// Loads a batch of files' diffs concurrently, bounded so a large changeset
     /// does not spawn one git process per file at once.
-    private nonisolated func load(changed: [GitStatus.FileEntry], cwd: URL) async -> [LoadedFileDiff] {
+    private nonisolated func load(changed: [GitStatus.FileEntry], cwd: URL, base: String) async -> [LoadedFileDiff] {
         var result: [LoadedFileDiff] = []
         result.reserveCapacity(changed.count)
         let batchSize = 6
@@ -178,7 +204,7 @@ final class ChangesStore {
             let batch = Array(changed[index..<min(index + batchSize, changed.count)])
             let loaded = await withTaskGroup(of: LoadedFileDiff.self) { group in
                 for entry in batch {
-                    group.addTask { await DiffLoader.load(cwd: cwd, entry: entry) }
+                    group.addTask { await DiffLoader.load(cwd: cwd, entry: entry, base: base) }
                 }
                 var out: [LoadedFileDiff] = []
                 for await diff in group { out.append(diff) }

@@ -262,10 +262,10 @@ Rules:
   transcript has **no `.id`** and is rebound; Changes is `.id`-keyed per tab.
 - The inactive page does zero work, gated by `pageActive` — no file IO, no diff
   loading, no highlighting.
-- Changed files + stats via `GitStatus.classify` (one batched `git diff HEAD
-  --numstat`, matching the diff); `DiffLoader` reloads a `path` event's file.
-- The store advances only on `GitStatus.didChangeNotification` (a `git commit`
-  emits none); a tab switch only re-counts the badge and re-applies the cache.
+- Changed files + stats via `GitStatus.classify`/`DiffLoader` against the turn
+  baseline (`beginTurn` pins `HEAD` when a prompt is sent), so a mid-turn
+  `git commit` never clears the viewer; only a new turn re-baselines. The store
+  advances only on `GitStatus.didChangeNotification` — a commit emits none.
 - The viewer is ONE `CodePaneContainer` (scroll view + code view + ruler +
   edit-map scroller) over every file's diff in path order, each opened by a
   header band. A file renders only its changed runs + 3 context lines

@@ -114,6 +114,14 @@ final class SessionTab: Identifiable {
             guard let self else { return }
             self.fileStateMayHaveChanged(path: path)
         }
+        // A user turn begins: pin the Changes viewer's baseline to the commit
+        // `HEAD` names right now, so a commit the agent makes mid-turn does not
+        // clear the diff. Fired before the prompt is sent, and the git work is
+        // deferred off the send path (a main-actor Task), so it never delays
+        // the prompt reaching pi.
+        viewModel.onTurnStarted = { [weak self] in
+            Task { [weak self] in await self?.changes.beginTurn() }
+        }
         // A click on an agent-emitted file reference in the transcript (posted
         // by the transcript coordinator, which has no SessionTab): switch to the
         // Changes page and scroll the viewer to the referenced file when it has
@@ -230,7 +238,10 @@ final class SessionTab: Identifiable {
                 try? await Task.sleep(for: .milliseconds(350))
             }
             guard !Task.isCancelled else { return }
-            let count = await GitStatus.changedFileCount(at: cwd)
+            // Same turn baseline as the viewer, so the badge and the changed
+            // list can never disagree (a mid-turn commit keeps counting).
+            let base = self?.changes.baseline
+            let count = await GitStatus.changedFileCount(at: cwd, base: base)
             self?.gitChangeCount = count
         }
         gitCountTask = task

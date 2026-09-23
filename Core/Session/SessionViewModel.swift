@@ -396,6 +396,13 @@ public final class SessionViewModel {
     /// window (same shape as `onRestoreSteeringToInput` / `onAgentSettled`).
     public var onFilesChanged: ((String?) -> Void)?
 
+    /// Turn-start hook: called with the prompt about to be sent, before the
+    /// agent starts working. The Client layer uses it to pin the Changes
+    /// viewer's baseline to the commit `HEAD` points at right now, so the
+    /// turn's accumulated diff — including anything the agent commits mid-turn
+    /// — survives until the next prompt re-baselines it.
+    public var onTurnStarted: (() -> Void)?
+
     private var eventTask: Task<Void, Never>?
     /// Periodic `get_session_stats` poller while the agent is streaming. pi has
     /// no event that pushes context usage, so the client polls: `get_session_stats`
@@ -574,6 +581,7 @@ public final class SessionViewModel {
         abortReturnsQueuedSteering = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        onTurnStarted?()
         do {
             let response = try await controller.send(.prompt(message: trimmed))
             if response.success == false {

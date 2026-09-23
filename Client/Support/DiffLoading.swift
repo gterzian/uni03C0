@@ -43,11 +43,15 @@ nonisolated struct LoadedFileDiff: Equatable, Sendable {
 /// for the old side, and `TextDiff` all run on the caller's executor so the
 /// only main-thread work is handing the finished value to the store.
 nonisolated enum DiffLoader {
-    static func load(cwd: URL, entry: GitStatus.FileEntry) async -> LoadedFileDiff {
+    /// Loads one file's diff against `base` — the turn baseline captured when
+    /// the user's prompt was sent. Keeping the base fixed (rather than reading
+    /// the live `HEAD`) is what lets a file the agent commits mid-turn keep
+    /// showing the accumulated diff instead of blanking out.
+    static func load(cwd: URL, entry: GitStatus.FileEntry, base: String = "HEAD") async -> LoadedFileDiff {
         let name = (entry.path as NSString).lastPathComponent
         switch entry.kind {
         case .deleted:
-            guard let head = await GitStatus.headContent(of: entry.path, cwd: cwd) else {
+            guard let head = await GitStatus.content(of: entry.path, at: base, cwd: cwd) else {
                 return unreadable(entry, "No committed content for \(name).")
             }
             let lines = splitLines(head)
@@ -83,7 +87,7 @@ nonisolated enum DiffLoader {
             guard let text = GitStatus.currentContent(of: entry.path, cwd: cwd) else {
                 return unreadable(entry, "Couldn't read \(name).")
             }
-            guard let old = await GitStatus.headContent(of: entry.path, cwd: cwd) else {
+            guard let old = await GitStatus.content(of: entry.path, at: base, cwd: cwd) else {
                 // No HEAD baseline (edge): show the current file uncolored.
                 let lines = splitLines(text)
                 return LoadedFileDiff(
