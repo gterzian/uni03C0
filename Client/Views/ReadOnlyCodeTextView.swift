@@ -57,6 +57,13 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// "line N" keeps meaning line N of the real file even though the buffer
     /// carries the removed lines.
     private(set) var lineNumberMap: [Int?]?
+    /// The display-only line number shown in the gutter for each 1-based
+    /// display line: the real current-file line for same/added lines, the
+    /// old-file line for a removed (red) line. `nil` → fall back to
+    /// `lineNumberMap` (no separate map was supplied). Kept apart from
+    /// `lineNumberMap`, whose nil-on-removed contract the copy/reference
+    /// machinery depends on.
+    private(set) var gutterLineNumberMap: [Int?]?
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         if let container {
@@ -262,9 +269,10 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// Loads a file's content (syntax + edit attributes already applied by the
     /// pane) and rebuilds the line-offset table. `lineNumbers` is the real-line
     /// map for an interleaved diff (nil for a plain, non-diff buffer).
-    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil, contentHeight: CGFloat? = nil) {
+    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, gutterLineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil, contentHeight: CGFloat? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
+        gutterLineNumberMap = gutterLineNumbers
         sectionPaths = []
         // The whole buffer is being replaced: the previous search paint's
         // ledger points into the OLD storage and must not be replayed onto the
@@ -429,6 +437,18 @@ final class ReadOnlyCodeTextView: NSTextView {
         guard let lineNumberMap else { return displayLine >= 1 ? displayLine : nil }
         guard displayLine >= 1, displayLine <= lineNumberMap.count else { return nil }
         return lineNumberMap[displayLine - 1]
+    }
+
+    /// The number the GUTTER shows for a display line. Unlike
+    /// `realLineNumber(forDisplayLine:)` this is never nil for a removed line
+    /// when the document carries an old-side map: a red line shows its
+    /// old-file number, so a deletion-only change is numbered rather than blank.
+    func gutterLineNumber(forDisplayLine displayLine: Int) -> Int? {
+        if let gutterLineNumberMap {
+            guard displayLine >= 1, displayLine <= gutterLineNumberMap.count else { return nil }
+            return gutterLineNumberMap[displayLine - 1]
+        }
+        return realLineNumber(forDisplayLine: displayLine)
     }
 
     /// The 1-based DISPLAY line showing real current-file line `real`, or the
@@ -796,12 +816,13 @@ final class CodeLineRulerView: NSRulerView {
             // only the fragment that begins the logical line carries the
             // number (the pane disables wrapping, so this is defensive).
             guard displayLine >= 1, displayLine - 1 < offsets.count, offsets[displayLine - 1] == charIndex else { return }
-            // The number is the REAL current-file line, and an interleaved
-            // diff's removed lines have no current-file number — their gutter
-            // stays blank (the red line background is their marker).
-            guard let realLine = codeView.realLineNumber(forDisplayLine: displayLine) else { return }
+            // The number shown is the display-only gutter number: the real
+            // current-file line for a same/added line, the OLD-file line for a
+            // removed line (a red line with no current-file number must still
+            // read as a numbered line, not a blank row).
+            guard let gutterLine = codeView.gutterLineNumber(forDisplayLine: displayLine) else { return }
 
-            let label = "\(realLine)" as NSString
+            let label = "\(gutterLine)" as NSString
             let size = label.size(withAttributes: attributes)
             // The fragment's vertical center in the text view's coordinates,
             // converted into the ruler's (flipped) coordinates.

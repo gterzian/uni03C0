@@ -215,34 +215,29 @@ public enum GitStatus {
     }
 
     /// The batched line-count pass behind `classify`: per-path added/deleted
-    /// counts from TWO `git diff --numstat` runs — the worktree delta
-    /// (`git diff`, index→worktree) and the staged delta (`git diff --cached`,
-    /// HEAD→index), the worktree delta winning when both would count a path
-    /// (an `MM` file's two passes overlap). Two git calls total, no content
-    /// reads, no subprocess per file — this is what paints each file name's
-    /// deletion-vs-addition fill without the slow per-file listing. The
-    /// worktree-first rule keeps the fill on the AGENT'S live edits: a staged
-    /// file the agent then changed scores its worktree delta (deletions
-    /// included), while a staged-only file scores against HEAD — and in a
-    /// repo with no commits yet the staged pass still counts new files
-    /// against the empty tree, so a freshly `git add`ed file reads as all
-    /// additions rather than vanishing. Untracked paths never appear in
-    /// either pass (they have no baseline).
+    /// counts against the SAME baseline the diff viewer renders — HEAD→working
+    /// tree (`git diff HEAD`), so a file's `+N −M` in the sidebar always matches
+    /// the red/green in its diff. The old two-pass preferred the unstaged delta
+    /// (`git diff`, index→worktree), which disagreed with the viewer whenever a
+    /// file also had staged changes (sidebar showed `+127`, diff showed a red
+    /// block). One git call, no content reads, no subprocess per file. A repo
+    /// with no commits yet falls back to `--cached` (index vs the empty tree),
+    /// so a freshly `git add`ed file still reads as all additions.
     private static func diffStatsByPath(at cwd: URL) async -> [String: DiffStats] {
-        var stats: [String: DiffStats] = [:]
-        for staged in [false, true] {
-            let args = staged
-                ? ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--cached", "--numstat"]
-                : ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--numstat"]
+        let attempts = [
+            ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--numstat", "HEAD"],
+            ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--cached", "--numstat"],
+        ]
+        for args in attempts {
             guard let out = await gitOutput(args, cwd: cwd) else { continue }
+            var stats: [String: DiffStats] = [:]
             for record in out.split(separator: "\0") where !record.isEmpty {
                 guard let parsed = parseNumstatRecord(String(record)) else { continue }
-                if stats[parsed.path] == nil {
-                    stats[parsed.path] = parsed.stats
-                }
+                stats[parsed.path] = parsed.stats
             }
+            return stats
         }
-        return stats
+        return [:]
     }
 
     /// Count of changed paths for the gating badge — nil when the folder is

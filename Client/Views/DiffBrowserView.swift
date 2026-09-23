@@ -24,6 +24,11 @@ nonisolated enum DiffLink {
 nonisolated struct DiffDocument: @unchecked Sendable {
     let text: NSAttributedString
     let lineNumbers: [Int?]
+    /// The number the gutter shows for each display line: the real
+    /// current-file line for same/added lines, the old-file line for a removed
+    /// (red) line. `lineNumbers` stays the real-line map the copy/reference
+    /// machinery needs (nil on a removed line); this one is display-only.
+    let gutterLineNumbers: [Int?]
     let sections: [CodeSection]
     let fullIndices: [Int?]
     /// The edit-map ticks: the rendered added/removed display lines across
@@ -188,6 +193,18 @@ struct DiffBrowserView: NSViewRepresentable {
         private var buildTask: Task<Void, Never>?
         private var highlightTask: Task<Void, Never>?
         private var document: DiffDocument?
+        /// The display lines whose syntax colors have been applied (Core
+        /// `DiffHighlightPlan.State`). Highlighting is PREFETCH-ONLY, exactly
+        /// like the transcript's materialized row window: the viewport always
+        /// sits inside this window with a buffer to spare, so a scroll never
+        /// reveals plain text — the visible content is already rendered when
+        /// it arrives.
+        private var highlight = DiffHighlightPlan.State()
+        /// A highlight pass is off-main. A scroll that needs another pass while
+        /// one is in flight QUEUES it instead of cancelling (cancelling would
+        /// mean a fast scroll never sends a pass at all).
+        private var highlightInFlight = false
+        private var highlightQueued = false
         /// The visible-range syntax highlighter (off-main, cache inside).
         private let highlighter = DiffHighlighter()
         private var keyMonitor: Any?
@@ -200,11 +217,6 @@ struct DiffBrowserView: NSViewRepresentable {
         /// re-targeted by the next press). `nil` after a rebuild/scroll-away,
         /// when the viewport's own top line becomes the anchor.
         private var cycleAnchorDisplayLine: Int?
-
-        private static let highlightScrollSettle: Duration = .milliseconds(120)
-        /// Extra lines above/below the viewport to color, so a small scroll
-        /// does not immediately need a new pass.
-        private static let highlightMargin = 60
 
         // MARK: Lifecycle
 
@@ -231,7 +243,7 @@ struct DiffBrowserView: NSViewRepresentable {
                         rebuild()
                     }
                 } else {
-                    scheduleHighlight(immediate: true)
+                    scheduleHighlight()
                 }
             } else {
                 // Abandon in-flight work: a hidden page highlights nothing and
@@ -452,8 +464,11 @@ struct DiffBrowserView: NSViewRepresentable {
         func scrollSpy() {
             guard isActive, let container else { return }
             onTopSectionChanged?(container.topSectionPath)
-            // Color the newly visible lines once scrolling settles.
-            scheduleHighlight(immediate: false)
+            // Prefetch the next block the moment the viewport nears the edge of
+            // the colored window — NOT after a settle delay, or a fast scroll
+            // would reach plain text first. When the viewport is comfortably
+            // inside the window this is a no-op.
+            if needsHighlightPrefetch() { scheduleHighlight() }
         }
 
         func handleLink(_ url: URL) {
@@ -508,21 +523,26 @@ struct DiffBrowserView: NSViewRepresentable {
             // document): a scroll during the off-main build must not be lost.
             let anchor = captureAnchor()
             document = doc
+            // A new buffer has no colored lines: the next pass establishes a
+            // fresh prefetch window around the viewport.
+            highlight = DiffHighlightPlan.State()
             // Expansion/reload can shift every display line after the change;
             // the old landing line no longer names the same run.
             cycleAnchorDisplayLine = nil
             store?.cacheBuiltDocument(doc, version: version)
-            let restore = anchor.flatMap { restoreCharacterIndex(for: $0, in: doc) }
+            let restore = anchor.flatMap { restoreAnchor($0, in: doc) }
             container.displayDocument(
                 path: "",
                 text: doc.text,
                 lineNumbers: doc.lineNumbers,
+                gutterLineNumbers: doc.gutterLineNumbers,
                 sections: doc.sections,
                 markers: doc.markers,
                 markerFractions: doc.markerFractions,
                 headerLines: doc.headerLines,
                 contentHeight: doc.contentHeight,
-                restoreCharacterIndex: restore,
+                restoreCharacterIndex: restore?.index,
+                restoreCharacterOffset: restore?.offset ?? 0,
                 lineStartOffsets: doc.lineStartOffsets
             )
             container.setBusy(false)
@@ -532,9 +552,9 @@ struct DiffBrowserView: NSViewRepresentable {
                 reveal(pending.path, line: pending.line)
             }
             // The buffer was replaced: re-run an active find against it, then
-            // color whatever is on screen.
+            // prefetch the colors around the viewport.
             search?.bufferDidChange()
-            scheduleHighlight(immediate: true)
+            scheduleHighlight()
         }
 
         /// The main-actor snapshot of the store's changed files and their loaded
@@ -554,43 +574,108 @@ struct DiffBrowserView: NSViewRepresentable {
             NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
 
-        // MARK: Visible-range highlighting
+        // MARK: Prefetch highlighting
 
-        /// Coalesces highlight passes: a burst of scroll events runs at most one
-        /// pass, after the viewport settles.
-        private func scheduleHighlight(immediate: Bool) {
-            guard isActive else { return }
+        /// Coalesces highlight passes: a pass already off-main queues the next
+        /// one instead of being cancelled (a cancelled pass would never apply).
+        private func scheduleHighlight() {
+            guard isActive, document != nil else { return }
+            if highlightInFlight {
+                highlightQueued = true
+                return
+            }
             highlightTask?.cancel()
             let version = appliedDocumentVersion
             highlightTask = Task { [weak self] in
-                if !immediate {
-                    try? await Task.sleep(for: Self.highlightScrollSettle)
-                }
-                guard !Task.isCancelled else { return }
                 await self?.highlightVisible(documentVersion: version)
             }
         }
 
-        /// Highlights ONLY the display lines currently on screen (plus a small
-        /// margin), for the sections that intersect them. Highlighting runs off
-        /// the main actor; the finished colors are applied in one hop.
+        /// Whether the viewport is close enough to an edge of the colored
+        /// window that the next block should be prefetched now.
+        private func needsHighlightPrefetch() -> Bool {
+            guard let container,
+                  let visible = container.visibleDisplayLineRange,
+                  let total = document?.lineNumbers.count, total > 0 else { return true }
+            return DiffHighlightPlan.needsPrefetch(state: highlight, visible: visible, total: total)
+        }
+
+        /// Extends the colored window so the viewport is always inside it with
+        /// a buffer to spare, and colors only the newly added block. The visible
+        /// lines are never colored on demand: they were already colored when the
+        /// viewport was still a buffer away.
         private func highlightVisible(documentVersion: Int) async {
+            highlightInFlight = true
+            defer {
+                highlightInFlight = false
+                if highlightQueued {
+                    highlightQueued = false
+                    scheduleHighlight()
+                }
+            }
             guard isActive, documentVersion == appliedDocumentVersion,
                   let container, let document, let store,
                   let visible = container.visibleDisplayLineRange else { return }
+            let total = document.lineNumbers.count
+            guard total > 0 else { return }
 
-            let lower = max(1, visible.lowerBound - Self.highlightMargin)
-            let upper = visible.upperBound + Self.highlightMargin
+            let firstPass = highlight.end == 0
+            let (ranges, newState) = DiffHighlightPlan.step(state: highlight, visible: visible, total: total)
+            guard !ranges.isEmpty else { return }
+
+            // The first screen must not land plain: on the initial pass, paint
+            // the visible lines before the larger surrounding prefetch. The
+            // second pass re-covers them from the highlighter cache.
+            if firstPass {
+                let visibleChunks = highlightChunks(in: visible, document: document, store: store, container: container)
+                guard await paint(visibleChunks, documentVersion: documentVersion, container: container) else { return }
+            }
+
             var chunks: [HighlightChunk] = []
-            for section in document.sections where section.lineRange.overlaps(lower...upper) {
+            for range in ranges {
+                chunks.append(contentsOf: highlightChunks(in: range, document: document, store: store, container: container))
+            }
+            if chunks.isEmpty {
+                // The new block holds nothing to color (expand controls only):
+                // advance the window anyway so the fetch is not retried forever.
+                highlight = newState
+                return
+            }
+            guard await paint(chunks, documentVersion: documentVersion, container: container) else { return }
+            // Commit the window only after the colors land, so a cancelled pass
+            // never marks lines colored that were never painted.
+            highlight = newState
+        }
+
+        /// Runs `chunks` through the off-main highlighter and applies the
+        /// result. Returns false when the pass was superseded (a newer document
+        /// or a cancelled pass), so the caller does not commit its window.
+        private func paint(_ chunks: [HighlightChunk], documentVersion: Int, container: CodePaneContainer) async -> Bool {
+            guard !chunks.isEmpty else { return true }
+            let dark = currentDark()
+            let highlighter = self.highlighter
+            let highlighted = await Task.detached(priority: .userInitiated) {
+                highlighter.highlight(chunks, dark: dark)
+            }.value
+            guard !Task.isCancelled, isActive, documentVersion == appliedDocumentVersion else { return false }
+            container.applyHighlights(highlighted)
+            return true
+        }
+
+        /// The chunks to color for a display-line range, intersected with each
+        /// section's rendered code runs (expand controls and message-only prose
+        /// are never recolored as code).
+        private func highlightChunks(in range: ClosedRange<Int>, document: DiffDocument, store: ChangesStore, container: CodePaneContainer) -> [HighlightChunk] {
+            var chunks: [HighlightChunk] = []
+            for section in document.sections where section.lineRange.overlaps(range) {
                 // A message-only section is secondary-colored prose, not code.
                 guard store.diffs[section.path]?.message == nil else { continue }
                 // Highlight each rendered code run separately: an expand control
                 // between hunks must keep its secondary color, not be recolored
                 // as code by a range that spans it.
                 for run in section.codeLineRanges {
-                    let start = max(run.lowerBound, lower)
-                    let end = min(run.upperBound, upper)
+                    let start = max(run.lowerBound, range.lowerBound)
+                    let end = min(run.upperBound, range.upperBound)
                     guard start <= end,
                           let charRange = container.characterRange(forDisplayLines: start...end) else { continue }
                     let text = (container.codeView.string as NSString).substring(with: charRange)
@@ -602,23 +687,20 @@ struct DiffBrowserView: NSViewRepresentable {
                     ))
                 }
             }
-            guard !chunks.isEmpty else { return }
-
-            let dark = currentDark()
-            let highlighter = self.highlighter
-            let highlighted = await Task.detached(priority: .userInitiated) {
-                highlighter.highlight(chunks, dark: dark)
-            }.value
-            guard !Task.isCancelled, isActive, documentVersion == appliedDocumentVersion else { return }
-            container.applyHighlights(highlighted)
+            return chunks
         }
 
-        /// The (path, full-array line) at the top of the viewport, so a rebuild
-        /// can keep the reader's place (expansion inserts lines above). The top
-        /// line may be a header or an expand control (no full index); walk
-        /// forward to the section's first code line so an expansion never
-        /// bounces the reader back to the document top.
-        private func captureAnchor() -> (path: String, fullIndex: Int)? {
+        /// The (path, full-array line, pixel offset) at the top of the
+        /// viewport, so a rebuild keeps the reader's place EXACTLY — not just
+        /// the same line, but the same number of pixels of it showing above the
+        /// fold. The top line may be a header or an expand control (no full
+        /// index); walk forward to the section's first code line so an
+        /// expansion never bounces the reader back to the document top, falling
+        /// back to the section start for a message-only diff (no code line, so
+        /// nothing to key on but the file itself). The offset is that line's top
+        /// relative to the viewport top (negative when it is scrolled partly off
+        /// screen).
+        private func captureAnchor() -> (path: String, fullIndex: Int?, offset: CGFloat)? {
             guard let container, let document else { return nil }
             let index = container.topVisibleCharacterIndex
             let length = (container.codeView.string as NSString).length
@@ -626,23 +708,48 @@ struct DiffBrowserView: NSViewRepresentable {
             let displayLine = container.codeView.lineNumber(forIndex: min(index, length - 1))
             guard let section = document.sections.first(where: { $0.lineRange.contains(displayLine) })
             else { return nil }
+            let clip = container.scrollView.contentView
+            let clipTop = clip.convert(NSPoint(x: 0, y: clip.bounds.minY), to: container.codeView).y
             for line in displayLine...section.lineRange.upperBound {
                 guard line - 1 < document.fullIndices.count else { break }
-                if let fullIndex = document.fullIndices[line - 1] {
-                    return (section.path, fullIndex)
-                }
+                guard let fullIndex = document.fullIndices[line - 1] else { continue }
+                return (section.path, fullIndex, lineTop(of: line, in: container) - clipTop)
             }
-            return nil
+            // No code line in the section (a message-only or unreadable diff):
+            // pin the section start so the rebuild still keeps the file in view.
+            return (section.path, nil, lineTop(of: section.lineRange.lowerBound, in: container) - clipTop)
         }
 
-        private func restoreCharacterIndex(for anchor: (path: String, fullIndex: Int), in doc: DiffDocument) -> Int? {
-            guard let container else { return nil }
+        /// The line's top edge in the code view's coordinates, or 0 when the
+        /// line is unmeasurable.
+        private func lineTop(of displayLine: Int, in container: CodePaneContainer) -> CGFloat {
+            guard displayLine >= 1,
+                  displayLine - 1 < container.codeView.lineStartOffsets.count,
+                  let layoutManager = container.codeView.layoutManager else { return 0 }
+            let charIndex = container.codeView.lineStartOffsets[displayLine - 1]
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            return fragment.minY + container.codeView.textContainerInset.height
+        }
+
+        private func restoreAnchor(_ anchor: (path: String, fullIndex: Int?, offset: CGFloat), in doc: DiffDocument) -> (index: Int, offset: CGFloat)? {
+            // Map the anchor's full-array line to a display line in the NEW
+            // document, then use the NEW document's own offset table. Reading
+            // the container's `lineStartOffsets` here would still be the OLD
+            // document's (the container has not loaded `doc` yet), so a rebuild
+            // that changes any earlier line length would scroll to the wrong
+            // character — the viewport jump this restore exists to prevent.
             for section in doc.sections where section.path == anchor.path {
-                for line in section.lineRange {
-                    guard line - 1 < doc.fullIndices.count, doc.fullIndices[line - 1] == anchor.fullIndex else { continue }
-                    guard line - 1 < container.codeView.lineStartOffsets.count else { return nil }
-                    return container.codeView.lineStartOffsets[line - 1]
+                var line = section.lineRange.lowerBound
+                if let fullIndex = anchor.fullIndex {
+                    for candidate in section.lineRange {
+                        guard candidate - 1 < doc.fullIndices.count, doc.fullIndices[candidate - 1] == fullIndex else { continue }
+                        line = candidate
+                        break
+                    }
                 }
+                guard line >= 1, line - 1 < doc.lineStartOffsets.count else { return nil }
+                return (doc.lineStartOffsets[line - 1], anchor.offset)
             }
             return nil
         }
@@ -671,6 +778,7 @@ nonisolated enum DiffDocumentBuilder {
         let spacerLineHeight = ReadOnlyCodeTextView.lineHeight(for: spacerFont)
         let text = NSMutableAttributedString()
         var lineNumbers: [Int?] = []
+        var gutterLineNumbers: [Int?] = []
         var fullIndices: [Int?] = []
         var sections: [CodeSection] = []
         var addedLines: [Int] = []
@@ -684,11 +792,12 @@ nonisolated enum DiffDocumentBuilder {
         // travels over.
         var lineCenters: [CGFloat] = []
 
-        func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, fullIndex: Int?, lineHeight: CGFloat) -> (line: Int, start: Int) {
+        func appendLine(_ attributed: NSAttributedString, lineNumber: Int?, gutterNumber: Int?, fullIndex: Int?, lineHeight: CGFloat) -> (line: Int, start: Int) {
             if !lineNumbers.isEmpty { text.append(NSAttributedString(string: "\n")) }
             let start = text.length
             text.append(attributed)
             lineNumbers.append(lineNumber)
+            gutterLineNumbers.append(gutterNumber)
             fullIndices.append(fullIndex)
             lineCenters.append(contentHeight + lineHeight / 2)
             contentHeight += lineHeight
@@ -697,7 +806,7 @@ nonisolated enum DiffDocumentBuilder {
 
         for (fileIndex, file) in input.files.enumerated() {
             guard let diff = file.diff else {
-                _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+                _ = appendLine(placeholderLine("Loading \(file.path)…"), lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 continue
             }
             // Each file opens with a header band naming it — the path, its
@@ -708,11 +817,11 @@ nonisolated enum DiffDocumentBuilder {
             // spy credits the file that follows) gives the band breathing room.
             let sectionStart = lineNumbers.count + 1
             if fileIndex > 0 {
-                _ = appendLine(spacerLine(font: spacerFont), lineNumber: nil, fullIndex: nil, lineHeight: spacerLineHeight)
+                _ = appendLine(spacerLine(font: spacerFont), lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: spacerLineHeight)
             }
             let header = appendLine(
                 headerLine(path: file.path, kind: diff.kind, added: diff.added.count, removed: diff.removed.count, font: headerFont),
-                lineNumber: nil, fullIndex: nil, lineHeight: headerLineHeight
+                lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: headerLineHeight
             )
             headerLines.append(header.line)
 
@@ -730,7 +839,7 @@ nonisolated enum DiffDocumentBuilder {
                     case .expand(let gap, let hidden):
                         _ = appendLine(
                             expandLine(hidden: hidden, path: file.path, gap: gap),
-                            lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight
+                            lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: smallLineHeight
                         )
                     case .lines(let range):
                         let runStart = lineNumbers.count + 1
@@ -748,7 +857,13 @@ nonisolated enum DiffDocumentBuilder {
                             case .same:
                                 break
                             }
-                            let appended = appendLine(attributed, lineNumber: diff.lineNumbers[index], fullIndex: index, lineHeight: codeLineHeight)
+                            let appended = appendLine(
+                                attributed,
+                                lineNumber: diff.lineNumbers[index],
+                                gutterNumber: diff.lineNumbers[index] ?? diff.oldLineNumbers[index],
+                                fullIndex: index,
+                                lineHeight: codeLineHeight
+                            )
                             if diffStart < 0 { diffStart = appended.start }
                             diffEnd = appended.start + attributed.length
                             if diffFirstLine < 0 { diffFirstLine = appended.line }
@@ -763,7 +878,7 @@ nonisolated enum DiffDocumentBuilder {
                 }
             } else if let message = diff.message {
                 let placeholder = placeholderLine(message)
-                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+                let appended = appendLine(placeholder, lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 diffStart = appended.start
                 diffEnd = appended.start + placeholder.length
                 diffFirstLine = appended.line
@@ -772,7 +887,7 @@ nonisolated enum DiffDocumentBuilder {
                 // An empty added/deleted file still gets a header; give it a
                 // body line so the section has a position to anchor on.
                 let placeholder = placeholderLine("(empty file)")
-                let appended = appendLine(placeholder, lineNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
+                let appended = appendLine(placeholder, lineNumber: nil, gutterNumber: nil, fullIndex: nil, lineHeight: smallLineHeight)
                 diffStart = appended.start
                 diffEnd = appended.start + placeholder.length
                 diffFirstLine = appended.line
@@ -803,6 +918,7 @@ nonisolated enum DiffDocumentBuilder {
         return DiffDocument(
             text: text,
             lineNumbers: lineNumbers,
+            gutterLineNumbers: gutterLineNumbers,
             sections: sections,
             fullIndices: fullIndices,
             markers: .lines(added: addedLines, removed: removedLines),

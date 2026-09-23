@@ -121,6 +121,28 @@ final class DiffViewerReferenceTests: XCTestCase {
         XCTAssertEqual(reference.snippet, "beta1")
     }
 
+    func testGutterShowsOldLineNumbersForRemovedLines() {
+        // A red (removed) line has no current-file number, so the copy/reference
+        // map keeps nil there — but the GUTTER must still show the old-file
+        // number, or a pure deletion renders as blank rows.
+        let view = ReadOnlyCodeTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), textContainer: nil)
+        view.load(
+            path: "",
+            text: NSAttributedString(string: document),
+            lineNumbers: [nil, 1, 2, nil, 1, 2],
+            gutterLineNumbers: [7, 1, 2, 9, 1, 2]
+        )
+        XCTAssertEqual(view.gutterLineNumber(forDisplayLine: 1), 7, "removed line shows its old-file number")
+        XCTAssertEqual(view.gutterLineNumber(forDisplayLine: 2), 1, "context line shows its current-file number")
+        XCTAssertNil(view.realLineNumber(forDisplayLine: 1), "the reference map still treats a removed line as nil")
+
+        // No gutter map supplied: fall back to the real-line map (nil removed).
+        let plain = ReadOnlyCodeTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 480), textContainer: nil)
+        plain.load(path: "", text: NSAttributedString(string: document), lineNumbers: [nil, 1, 2])
+        XCTAssertNil(plain.gutterLineNumber(forDisplayLine: 1))
+        XCTAssertEqual(plain.gutterLineNumber(forDisplayLine: 2), 1)
+    }
+
     func testPrecomputedLineOffsetsMatchTheScan() {
         let text = "line1\nline2\nline3"
         let offsets = ReadOnlyCodeTextView.lineStartOffsets(in: text)

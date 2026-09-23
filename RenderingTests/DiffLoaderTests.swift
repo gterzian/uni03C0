@@ -65,8 +65,10 @@ final class DiffLoaderTests: XCTestCase {
         let result = DiffLoader.interleaved(old: "one\ntwo\nthree\n", new: "one\nTWO\nthree\n")
         XCTAssertEqual(result.lines.map(\.text), ["one", "two", "TWO", "three"])
         XCTAssertEqual(result.lines.map(\.kind), [.same, .removed, .added, .same])
-        // Removed line has no real line number; the others number 1,2,3.
+        // Removed line has no real line number; the others number 1,2,3. The
+        // removed line keeps its OLD-file number for the gutter instead.
         XCTAssertEqual(result.lineNumbers, [1, nil, 2, 3])
+        XCTAssertEqual(result.oldLineNumbers, [nil, 2, nil, nil])
         XCTAssertEqual(result.added, [3])
         XCTAssertEqual(result.removed, [2])
     }

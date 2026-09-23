@@ -218,12 +218,14 @@ final class CodePaneContainer: NSView {
         path: String,
         text: NSAttributedString,
         lineNumbers: [Int?]? = nil,
+        gutterLineNumbers: [Int?]? = nil,
         sections: [CodeSection] = [],
         markers: PaneMarkers = .none,
         markerFractions: [CGFloat]? = nil,
         headerLines: [Int] = [],
         contentHeight: CGFloat? = nil,
         restoreCharacterIndex: Int? = nil,
+        restoreCharacterOffset: CGFloat = 0,
         lineStartOffsets: [Int]? = nil
     ) {
         statusLabel.isHidden = true
@@ -232,7 +234,7 @@ final class CodePaneContainer: NSView {
         (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
         self.sections = sections
 
-        codeView.load(path: path, text: text, lineNumbers: lineNumbers, lineStartOffsets: lineStartOffsets, contentHeight: contentHeight)
+        codeView.load(path: path, text: text, lineNumbers: lineNumbers, gutterLineNumbers: gutterLineNumbers, lineStartOffsets: lineStartOffsets, contentHeight: contentHeight)
         // The document is every file's diff in one buffer: each file's diff
         // lines map to that file's canonical absolute path, so a copy inside
         // the diff tags a reference to the FILE (never to "the diff").
@@ -241,7 +243,7 @@ final class CodePaneContainer: NSView {
         codeView.setHeaderLines(headerLines)
 
         if let restoreCharacterIndex, restoreCharacterIndex < (codeView.string as NSString).length {
-            scrollCharacterToTop(restoreCharacterIndex)
+            scrollCharacterToTop(restoreCharacterIndex, offset: restoreCharacterOffset)
         } else {
             scrollToTop()
         }
@@ -278,14 +280,17 @@ final class CodePaneContainer: NSView {
 
     private var clipView: NSClipView { scrollView.contentView }
 
-    /// Scrolls a character index's line to the top of the viewport.
-    func scrollCharacterToTop(_ index: Int) {
+    /// Scrolls a character index's line to the top of the viewport, minus
+    /// `offset` pixels, so a rebuild can keep the exact fraction of the anchor
+    /// line that was showing (0 = its top flush with the viewport top, negative
+    /// = the line was partly scrolled off).
+    func scrollCharacterToTop(_ index: Int, offset: CGFloat = 0) {
         guard let layoutManager = codeView.layoutManager,
               layoutManager.numberOfGlyphs > 0 else { return }
         let clamped = min(max(index, 0), max((codeView.string as NSString).length - 1, 0))
         let glyphIndex = layoutManager.glyphIndexForCharacter(at: clamped)
         let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-        let topInCodeView = fragment.minY + codeView.textContainerInset.height
+        let topInCodeView = fragment.minY + codeView.textContainerInset.height - offset
         let clipY = clipView.convert(NSPoint(x: 0, y: topInCodeView), from: codeView).y
         clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: max(0, clipY)))
         scrollView.reflectScrolledClipView(clipView)

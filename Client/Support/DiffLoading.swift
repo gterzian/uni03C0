@@ -14,6 +14,11 @@ nonisolated struct LoadedFileDiff: Equatable, Sendable {
     /// Real current-file line of each display line (`nil` for a removed line,
     /// which belongs to the old side).
     let lineNumbers: [Int?]
+    /// Old-file line of each display line (`nil` for same/added lines, which
+    /// belong to the current side). The gutter shows this for a removed (red)
+    /// line, which has no current-file number, so a red diff still reads as a
+    /// numbered line rather than a blank row.
+    let oldLineNumbers: [Int?]
     /// Display indices of added / removed lines (drives the green/red line
     /// overlay and the Cmd+Up / Cmd+Down edit stops).
     let added: [Int]
@@ -46,11 +51,15 @@ nonisolated enum DiffLoader {
                 return unreadable(entry, "No committed content for \(name).")
             }
             let lines = splitLines(head)
+            // A deleted file is all old-side: its lines number 1…n on the old
+            // side, and the gutter shows that number.
+            let numbers = realLineNumbers(count: lines.count)
             return LoadedFileDiff(
                 path: entry.path,
                 kind: entry.kind,
                 lines: lines.map { DiffLine(kind: .removed, text: $0) },
-                lineNumbers: realLineNumbers(count: lines.count),
+                lineNumbers: numbers,
+                oldLineNumbers: numbers,
                 added: [],
                 removed: lineIndexRange(count: lines.count),
                 message: nil
@@ -65,6 +74,7 @@ nonisolated enum DiffLoader {
                 kind: entry.kind,
                 lines: lines.map { DiffLine(kind: .added, text: $0) },
                 lineNumbers: realLineNumbers(count: lines.count),
+                oldLineNumbers: [],
                 added: lineIndexRange(count: lines.count),
                 removed: [],
                 message: nil
@@ -80,6 +90,7 @@ nonisolated enum DiffLoader {
                     path: entry.path, kind: entry.kind,
                     lines: lines.map { DiffLine(kind: .same, text: $0) },
                     lineNumbers: realLineNumbers(count: lines.count),
+                    oldLineNumbers: [],
                     added: [], removed: [], message: nil
                 )
             }
@@ -88,6 +99,7 @@ nonisolated enum DiffLoader {
                 path: entry.path, kind: entry.kind,
                 lines: diff.lines,
                 lineNumbers: diff.lineNumbers,
+                oldLineNumbers: diff.oldLineNumbers,
                 added: diff.added,
                 removed: diff.removed,
                 message: nil
@@ -100,7 +112,7 @@ nonisolated enum DiffLoader {
     private static func unreadable(_ entry: GitStatus.FileEntry, _ message: String) -> LoadedFileDiff {
         LoadedFileDiff(
             path: entry.path, kind: entry.kind,
-            lines: [], lineNumbers: [], added: [], removed: [], message: message
+            lines: [], lineNumbers: [], oldLineNumbers: [], added: [], removed: [], message: message
         )
     }
 
@@ -128,26 +140,37 @@ nonisolated enum DiffLoader {
     /// Builds the GitHub-style interleaved view of a modification: every real
     /// current-file line in order, with each run of removed lines re-inserted
     /// where it was. Returns the display lines, the REAL line number of each
-    /// (`nil` for a removed line), and the 1-based display indices that are
-    /// added / removed.
-    nonisolated static func interleaved(old: String, new: String) -> (lines: [DiffLine], lineNumbers: [Int?], added: [Int], removed: [Int]) {
+    /// (`nil` for a removed line), the OLD-file line of each removed line
+    /// (`nil` otherwise), and the 1-based display indices that are added /
+    /// removed.
+    nonisolated static func interleaved(old: String, new: String) -> (lines: [DiffLine], lineNumbers: [Int?], oldLineNumbers: [Int?], added: [Int], removed: [Int]) {
         let diff = TextDiff.diff(old: old, new: new)
         var lineNumbers: [Int?] = []
+        var oldLineNumbers: [Int?] = []
         var added: [Int] = []
         var removed: [Int] = []
-        var currentLine = 0
+        var newLine = 0
+        var oldLine = 0
         for (index, line) in diff.enumerated() {
             switch line.kind {
-            case .same, .added:
-                currentLine += 1
-                lineNumbers.append(currentLine)
-                if line.kind == .added { added.append(index + 1) }
+            case .same:
+                newLine += 1
+                oldLine += 1
+                lineNumbers.append(newLine)
+                oldLineNumbers.append(nil)
+            case .added:
+                newLine += 1
+                lineNumbers.append(newLine)
+                oldLineNumbers.append(nil)
+                added.append(index + 1)
             case .removed:
+                oldLine += 1
                 lineNumbers.append(nil)
+                oldLineNumbers.append(oldLine)
                 removed.append(index + 1)
             }
         }
-        return (diff, lineNumbers, added, removed)
+        return (diff, lineNumbers, oldLineNumbers, added, removed)
     }
 }
 

@@ -191,6 +191,62 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
                        "the last line is reachable at the exact document height")
     }
 
+    /// A rebuild (a background diff load, an expansion) swaps in a whole new
+    /// document. The restore must keep not only the same anchor LINE but the
+    /// same fraction of it on screen: an anchor line partly scrolled off stays
+    /// partly scrolled off, so the reader sees no jump at all.
+    @MainActor
+    func testRestoreKeepsTheExactViewportOffset() {
+        let container = makeContainer()
+        let view = container.codeView
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let lineHeight = ReadOnlyCodeTextView.lineHeight(for: font)
+
+        func topOffset(ofLine line: Int) -> CGFloat? {
+            guard let layoutManager = view.layoutManager,
+                  line >= 1, line - 1 < view.lineStartOffsets.count else { return nil }
+            let clip = container.scrollView.contentView
+            let clipTop = clip.convert(NSPoint(x: 0, y: clip.bounds.minY), to: view).y
+            let glyph = layoutManager.glyphIndexForCharacter(at: view.lineStartOffsets[line - 1])
+            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+            return (fragment.minY + view.textContainerInset.height) - clipTop
+        }
+
+        // First document: short lines. Scroll line 201 so its top sits 5pt
+        // ABOVE the viewport top (a negative offset), as a mid-line scroll is.
+        let short = (1...400).map { "L\($0)" }.joined(separator: "\n")
+        container.displayDocument(
+            path: "/tmp/old.swift",
+            text: NSAttributedString(string: short, attributes: [.font: font]),
+            contentHeight: CGFloat(400) * lineHeight
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        container.scrollCharacterToTop(view.lineStartOffsets[200], offset: -5)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let anchorOffset = topOffset(ofLine: 201) ?? 999
+        XCTAssertEqual(anchorOffset, -5, accuracy: 0.5, "the anchor line starts 5pt above the fold")
+
+        // Second document: every line before the anchor is longer, so the OLD
+        // document's character offsets no longer name the same place. Restoring
+        // with the NEW offset table (what the builder hands the view) must land
+        // on the same line at the same screen position.
+        let long = (1...400).map { index in
+            index < 201 ? "line \(index) with a much longer prefix than before" : "L\(index)"
+        }.joined(separator: "\n")
+        let offsets = ReadOnlyCodeTextView.lineStartOffsets(in: long)
+        container.displayDocument(
+            path: "/tmp/new.swift",
+            text: NSAttributedString(string: long, attributes: [.font: font]),
+            contentHeight: CGFloat(400) * lineHeight,
+            restoreCharacterIndex: offsets[200],
+            restoreCharacterOffset: -5,
+            lineStartOffsets: offsets
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(topOffset(ofLine: 201) ?? 999, -5, accuracy: 0.5,
+                       "the rebuilt document keeps the anchor line at the same pixel offset")
+    }
+
     /// The diff document mixes the 12pt code font with the 11pt expand row
     /// font, so the builder sums each line's own height. The total must equal
     /// TextKit's laid-out height exactly, or the pinning is off by the
