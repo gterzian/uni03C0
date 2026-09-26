@@ -137,7 +137,7 @@ struct SessionTabsView: View {
     // MARK: - Tab panel
 
     /// The whole tab chrome: the outer session tabs (one per folder) plus, for
-    /// the ACTIVE session only, its nested page tabs — Session / Files. The
+    /// the ACTIVE session only, its nested page tabs — Session / Changes. The
     /// nested strip lives in the PANEL (not the session content) so it reads as
     /// navigation within the active top-level tab: it hangs directly under the
     /// active pill, shares the panel's background, and disappears when another
@@ -173,10 +173,10 @@ struct SessionTabsView: View {
         .padding(.vertical, 6)
     }
 
-    /// Session / Files — the page tabs of the ACTIVE session, nested under its
-    /// outer pill (see `tabPanel`). The Files tab carries the edited-file count
-    /// (the old "N edited" review-gate signal) so a session with uncommitted
-    /// changes advertises them at the tab level.
+    /// Session / Changes — the page tabs of the ACTIVE session, nested under
+    /// its outer pill (see `tabPanel`). The Changes tab carries the
+    /// edited-file count so a session with uncommitted changes advertises them
+    /// at the tab level.
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
         HStack(spacing: 3) {
             pageTabButton(
@@ -188,13 +188,13 @@ struct SessionTabsView: View {
                 tab.page = .conversation
             }
             pageTabButton(
-                title: "Files",
-                icon: "folder",
-                isSelected: tab.page == .files,
+                title: "Changes",
+                icon: "plus.forwardslash.minus",
+                isSelected: tab.page == .changes,
                 badge: tab.gitChangeCount,
-                help: "Browse the session's files — review what changed"
+                help: "Review the uncommitted diff of this session's folder"
             ) {
-                tab.page = .files
+                tab.page = .changes
             }
             Spacer(minLength: 0)
         }
@@ -204,7 +204,7 @@ struct SessionTabsView: View {
 
     /// One nested page tab: a compact pill in the outer pills' visual language
     /// (accent-tinted when selected), with the edited-file count badge on the
-    /// Files tab.
+    /// Changes tab.
     private func pageTabButton(
         title: String,
         icon: String,
@@ -215,7 +215,7 @@ struct SessionTabsView: View {
     ) -> some View {
         // The badge is visual-only; the selected state and the badge count go
         // into the accessibility label + traits so VoiceOver announces
-        // "Files, 3 edited files, selected" instead of a plain unselected
+        // "Changes, 3 edited files, selected" instead of a plain unselected
         // button (the custom pills carry none of the segmented control's
         // free semantics — selected state, group traits).
         let accessibilityLabel: String

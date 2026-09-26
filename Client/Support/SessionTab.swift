@@ -12,14 +12,14 @@ struct RestoreRequest: Equatable {
     let text: String
 }
 
-/// The nested page a session tab shows — the conversation, or the read-only
-/// file browser for the session's folder. A "tab within the tab": switching
-/// pages swaps the transcript area for the file viewer, while the prompt bar
-/// and the chrome below stay put — so tagging a reference and pasting it into
-/// the prompt happens in the same window.
+/// The nested page a session tab shows — the conversation or the Changes
+/// review surface (the uncommitted diff of the session folder). A "tab within
+/// the tab": switching swaps the transcript area for the diff, while the
+/// prompt bar and the chrome below stay put — so tagging a reference and
+/// pasting it into the prompt happens in the same window.
 enum SessionPage: Hashable {
     case conversation
-    case files
+    case changes
 }
 
 /// One live session — one tab in the tabbed main window (also used by the
@@ -38,12 +38,11 @@ final class SessionTab: Identifiable {
     let id = UUID()
     let cwd: URL
     let viewModel: SessionViewModel
-    /// The file browser's data store — the file-side mirror of `viewModel.store`
-    /// (the transcript store): it owns this folder's classified file data,
-    /// processes it off the main thread, and stays warm for the whole life of
-    /// the tab. The Files view is ephemeral and reads from it; it never builds
-    /// or copies the tree on the main thread.
-    let fileBrowser: FileBrowserStore
+    /// The Changes page's data store and diff model — it owns this folder's
+    /// changed-file list, loads each file's diff off the main thread, and stays
+    /// warm for the whole life of the tab. The view is ephemeral and only ever
+    /// reads the finished document.
+    let changes: ChangesStore
 
     var recentSessions: [SessionListing.Summary] = []
     var showingHistory = false
@@ -69,32 +68,29 @@ final class SessionTab: Identifiable {
     @ObservationIgnored private var hasStopped = false
 
     /// Observer for `Notification.Name.openFileReference` — a click on an
-    /// agent-emitted `pi-file://` link in this tab's transcript. NEW lifecycle
-    /// surface (unlike `onFilesChanged`, which is a plain closure property,
-    /// `SessionTab` registers no NotificationCenter observer of its own
-    /// today), so it must be removed in `stop()` symmetrically with
-    /// `FileBrowserStore.stop()` removing its own observer.
+    /// agent-emitted `pi-file://` link in this tab's transcript. It scrolls the
+    /// Changes viewer to that file when the file is part of the changeset.
     @ObservationIgnored private var openReferenceObserver: NSObjectProtocol?
 
     /// Number of files with uncommitted changes in this session's folder
     /// (`git status --porcelain` line count), nil when the folder isn't a git
     /// repo or the first check hasn't completed. Drives the count badge on
-    /// the nested Files page tab (the old "N edited" review gate). Refreshed
+    /// the nested Changes page tab (the old "N edited" review gate). Refreshed
     /// once at init (a project that already had uncommitted changes before
     /// the app opened shows the badge immediately) and debounced after every
     /// agent file change (§2.2).
     var gitChangeCount: Int?
     private var gitCountTask: Task<Void, Never>?
 
-    /// Which nested page this tab currently shows (the Session / Files tabs in
-    /// the tab panel). Persists across outer tab switches — the view
+    /// Which nested page this tab currently shows (the Session / Changes tabs
+    /// in the tab panel). Persists across outer tab switches — the view
     /// re-materializes on return, the page choice does not.
     var page: SessionPage = .conversation
 
     init(cwd: URL, projectsRoot: URL?) {
         self.cwd = cwd
         self.viewModel = SessionViewModel(cwd: cwd, projectsRoot: projectsRoot)
-        self.fileBrowser = FileBrowserStore(cwd: cwd)
+        self.changes = ChangesStore(cwd: cwd)
         // When an abort ends the turn, queued steering is appended back into
         // the prompt input (a push-back that coexists with any in-flight
         // streamed paste, which keeps pushing to the front).
@@ -108,7 +104,7 @@ final class SessionTab: Identifiable {
             AccessibilityNotification.Announcement(Announcements.agentFinished).post()
         }
         // File-change sync: one signal drives everything that reacts to a file
-        // changing on disk — the count badge on the Files page tab (updated
+        // changing on disk — the count badge on the Changes page tab (updated
         // here, the closure already runs with the tab in scope) and the file
         // browser (reached via a NotificationCenter post keyed by `cwd`, since
         // the browser is a nested page that never holds a reference back to
@@ -116,18 +112,22 @@ final class SessionTab: Identifiable {
         // fires with nil.
         viewModel.onFilesChanged = { [weak self] path in
             guard let self else { return }
-            self.scheduleGitCountRefresh()
-            NotificationCenter.default.post(
-                name: GitStatus.didChangeNotification,
-                object: nil,
-                userInfo: ["cwd": self.cwd, "path": path as Any]
-            )
+            self.fileStateMayHaveChanged(path: path)
+        }
+        // A user turn begins: pin the Changes viewer's baseline to the commit
+        // `HEAD` names right now, so a commit the agent makes mid-turn does not
+        // clear the diff. Fired before the prompt is sent, and the git work is
+        // deferred off the send path (a main-actor Task), so it never delays
+        // the prompt reaching pi.
+        viewModel.onTurnStarted = { [weak self] in
+            Task { [weak self] in await self?.changes.beginTurn() }
         }
         // A click on an agent-emitted file reference in the transcript (posted
-        // by the transcript coordinator, which has no SessionTab): switch to
-        // the Files page and open the referenced file there. cwd-scoped and
-        // delivered on the main queue, exactly like FileBrowserStore's own
-        // observer — this tab only reacts to links naming ITS folder.
+        // by the transcript coordinator, which has no SessionTab): switch to the
+        // Changes page and scroll the viewer to the referenced file when it has
+        // uncommitted changes. cwd-scoped and delivered on the main queue,
+        // exactly like ChangesStore's own observer — this tab only reacts to
+        // links naming ITS folder.
         openReferenceObserver = NotificationCenter.default.addObserver(
             forName: .openFileReference,
             object: nil,
@@ -143,24 +143,27 @@ final class SessionTab: Identifiable {
         scheduleGitCountRefresh(immediate: true)
     }
 
-    /// Opens a clicked agent file reference: flip to the Files page (a pure
-    /// visibility flip — both pages stay mounted) and hand the link to the
-    /// file browser store, which selects the file, asks the tree to reveal it,
-    /// and arms the content pane to land on the reference's line.
+    /// Opens a clicked agent file reference: flip to the Changes page (a pure
+    /// visibility flip) and scroll its viewer to the referenced file — landing
+    /// on the referenced line when the link named one and that line is part of
+    /// the shown diff window. A reference to a file with no uncommitted change
+    /// has no diff section to land on (the viewer is the only file surface) and
+    /// is left alone: the agent is taught to reference only changed files.
     private func openFileReference(_ link: FileReferenceLink) {
-        page = .files
-        fileBrowser.openReference(link)
+        guard changes.entries.contains(where: { $0.path == link.path }) else { return }
+        page = .changes
+        changes.reveal(link.path, line: link.startLine)
     }
 
     func start() async {
         LiveSessions.register(viewModel.controller)
         await viewModel.start()
         reloadSessions()
-        // Warm the file listing the moment the session opens — the git work
+        // Warm the changes listing the moment the session opens — the git work
         // runs off the main thread inside the store, so a large project never
-        // stalls the session open, and the Files page (and its count) is ready
+        // stalls the session open, and the Changes page (and its count) is ready
         // when first shown.
-        fileBrowser.scheduleRefresh(immediate: true)
+        changes.scheduleRefresh(immediate: true)
     }
 
     func stop() async {
@@ -172,8 +175,50 @@ final class SessionTab: Identifiable {
             NotificationCenter.default.removeObserver(openReferenceObserver)
             self.openReferenceObserver = nil
         }
-        fileBrowser.stop()
+        changes.stop()
         await viewModel.stop()
+    }
+
+    /// Re-checks this folder's git state after something pi did not observe:
+    /// the app returned to the foreground, the session became the active tab,
+    /// or the user opened the Changes review surface. Drives the same signal an
+    /// agent file event does, so the store's snapshot (changed list + count
+    /// badge) and the diff viewer can never disagree with the working tree.
+    func refreshWorkingTree() {
+        // Deferred one main-queue turn: the callers are SwiftUI update handlers
+        // (onReceive/onChange), and the fan-out mutates other views' state
+        // (pane reload tokens, the store's snapshot). Mutating that synchronously
+        // from inside an update is undefined behavior.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.fileStateMayHaveChanged(path: nil)
+        }
+    }
+
+    /// Badge-only refresh for a tab switch: re-count the changed files without
+    /// reloading every diff. A tab switch remounts the incoming session's
+    /// Changes page, so re-reading and re-diffing the whole changeset on every
+    /// switch is pure recompute — the diff store re-syncs on a pi file event,
+    /// on app activation, and when a review surface opens. Deferred like
+    /// `refreshWorkingTree` (called from a SwiftUI update handler).
+    func refreshGitCount() {
+        Task { @MainActor [weak self] in
+            self?.scheduleGitCountRefresh()
+        }
+    }
+
+    /// Fan-out for "this folder may have changed on disk": re-count the
+    /// changed files (the tab badge) and post the cwd-keyed notification that
+    /// refreshes the Changes store (changed list + diffs). `path` is the touched
+    /// file, or nil when the change is unknown / any file may have changed (a
+    /// turn settle, a return to the app).
+    private func fileStateMayHaveChanged(path: String?) {
+        scheduleGitCountRefresh()
+        NotificationCenter.default.post(
+            name: GitStatus.didChangeNotification,
+            object: nil,
+            userInfo: ["cwd": cwd, "path": path as Any]
+        )
     }
 
     func reloadSessions() {
@@ -193,7 +238,10 @@ final class SessionTab: Identifiable {
                 try? await Task.sleep(for: .milliseconds(350))
             }
             guard !Task.isCancelled else { return }
-            let count = await GitStatus.changedFileCount(at: cwd)
+            // Same turn baseline as the viewer, so the badge and the changed
+            // list can never disagree (a mid-turn commit keeps counting).
+            let base = self?.changes.baseline
+            let count = await GitStatus.changedFileCount(at: cwd, base: base)
             self?.gitChangeCount = count
         }
         gitCountTask = task

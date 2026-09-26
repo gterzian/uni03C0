@@ -370,7 +370,7 @@ final class PromptTextView: NSTextView {
 
     /// Paste that understands the app's code-reference pasteboard type: when
     /// the pasteboard carries a `.codeReference` (a selection tagged in the
-    /// read-only file browser with its absolute path + lines), insert the
+    /// read-only code view with its absolute path + lines), insert the
     /// RENDERED reference — `[Ref: path:line-line]` + the fenced snippet —
     /// instead of the raw snippet. Everything else pastes normally (§1.4).
     ///

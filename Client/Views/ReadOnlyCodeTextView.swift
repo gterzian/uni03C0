@@ -11,11 +11,11 @@ extension NSPasteboard.PasteboardType {
     static let codeReference = NSPasteboard.PasteboardType("com.gterzian.uni03c0.code-reference")
 }
 
-/// A read-only, selectable code text view — the file browser content pane's
-/// real-buffer view (§1.3/§2.6). The buffer is always the actual text of the
-/// file on disk (or, for a deletion, its last-committed content), so line
-/// numbers and selections mean exactly what they say, and the syntax + edit
-/// overlays are attributes layered on top by the pane.
+/// A read-only, selectable code text view — the diff viewer's real-buffer view
+/// (§1.3/§2.6). The buffer is always actual file text (one file's lines, or an
+/// interleaved multi-file diff), so line numbers and selections mean exactly
+/// what they say, and the syntax + edit overlays are attributes layered on top
+/// by the owner.
 ///
 /// Copy is the mechanism behind the frozen reference: `copy(_:)` maps the
 /// selection to 1-based lines via a per-load offset table, and writes the
@@ -24,8 +24,17 @@ extension NSPasteboard.PasteboardType {
 /// and can be compiled directly into the renderer test bundles.
 final class ReadOnlyCodeTextView: NSTextView {
     /// The absolute path of the file whose content the buffer holds (the
-    /// reference's `absolutePath`). Empty until a file is loaded.
+    /// reference's `absolutePath`). Empty until a file is loaded. For a
+    /// multi-file buffer (the diff viewer) this is the fallback when a
+    /// selection falls outside every `sectionPaths` entry.
     private(set) var absolutePath = ""
+    /// For a multi-file buffer (the diff viewer): the character range each
+    /// file's diff lines occupy, so a copy tags the reference with the file the
+    /// selection is actually in. Headers/expand rows are deliberately absent —
+    /// copying them writes a plain string, not a reference.
+    private var sectionPaths: [(range: NSRange, absolutePath: String)] = []
+    /// Clicks on links in the buffer (the diff viewer's expand controls).
+    var onLinkClick: ((URL) -> Void)?
     /// Start offset (UTF-16) of every line, ascending, built once per load.
     /// `lineStartOffsets[k]` is where line k+1 begins; the line's end is the
     /// next entry (or the text length for the last line). The final entry is
@@ -33,6 +42,14 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the trailing "phantom" line non-empty in the table but unreachable via
     /// `lineNumber(forIndex:)` (guarded by `index < length`).
     private(set) var lineStartOffsets: [Int] = [0]
+    /// The document's EXACT laid-out height, insets included, when the caller
+    /// knows it (the off-main diff builder sums each line's font height as it
+    /// assembles the document). Under `allowsNonContiguousLayout`, `sizeToFit`
+    /// and `usedRect` report an ESTIMATE that grows as more of a large document
+    /// is laid out, so a view that sized itself would move the scroller under
+    /// the reader mid-scroll. While this is set the view refuses
+    /// every height change (see `setFrameSize`). nil = the view sizes itself.
+    private(set) var fixedContentHeight: CGFloat?
     /// For an interleaved diff buffer, the REAL current-file line number of
     /// each 1-based DISPLAY line (`nil` for a removed line, which is old-side
     /// content). nil → the buffer is the real file and display line == real
@@ -40,6 +57,13 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// "line N" keeps meaning line N of the real file even though the buffer
     /// carries the removed lines.
     private(set) var lineNumberMap: [Int?]?
+    /// The display-only line number shown in the gutter for each 1-based
+    /// display line: the real current-file line for same/added lines, the
+    /// old-file line for a removed (red) line. `nil` → fall back to
+    /// `lineNumberMap` (no separate map was supplied). Kept apart from
+    /// `lineNumberMap`, whose nil-on-removed contract the copy/reference
+    /// machinery depends on.
+    private(set) var gutterLineNumberMap: [Int?]?
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         if let container {
@@ -148,6 +172,7 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the fading fill (see `startReveal`).
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
+        drawHeaderBands(in: rect)
         if let anchorRect = revealAnchorRect {
             Self.revealColor.withAlphaComponent(0.6).setFill()
             NSRect(x: 0, y: anchorRect.minY, width: 3, height: max(anchorRect.height, 1)).fill()
@@ -158,6 +183,84 @@ final class ReadOnlyCodeTextView: NSTextView {
         }
     }
 
+    // MARK: - Find-in-buffer highlight
+
+    /// The ranges currently carrying a search-match backdrop, in document
+    /// order (a test hook and the overlay ledger).
+    private(set) var searchHighlightRanges: [NSRange] = []
+    /// Index into `searchHighlightRanges` painted with the stronger "current"
+    /// shade, -1 when none.
+    private(set) var currentSearchHighlightIndex = -1
+    /// The backgrounds that sat under each painted match, captured before the
+    /// search shade replaced them so `clearSearchHighlight` can restore them.
+    /// Without this ledger, clearing would strip the edit overlay's red/green
+    /// line fills wherever a match overlapped one.
+    private var searchOverlay: [(range: NSRange, background: NSColor?)] = []
+
+    /// Paints find-in-buffer highlights over `ranges`: every match in the pale
+    /// shade, `currentIndex` in the stronger one. Any previous search paint is
+    /// restored first, so this is idempotent. Ranges are display-offset ranges
+    /// into the current buffer (an interleaved diff's removed lines included).
+    func applySearchHighlight(ranges: [NSRange], currentIndex: Int) {
+        clearSearchHighlight()
+        guard let storage = textStorage else { return }
+        let length = storage.length
+        for (index, range) in ranges.enumerated() {
+            let clamped = NSIntersectionRange(range, NSRange(location: 0, length: length))
+            guard clamped.length > 0 else { continue }
+            captureSearchOverlay(in: storage, range: clamped)
+            let color = index == currentIndex ? SearchMatchHighlight.current : SearchMatchHighlight.match
+            storage.addAttribute(.backgroundColor, value: color, range: clamped)
+        }
+        searchHighlightRanges = ranges
+        currentSearchHighlightIndex = currentIndex
+    }
+
+    /// Removes the search highlight and restores whatever background the edit
+    /// overlay had underneath it.
+    func clearSearchHighlight() {
+        guard let storage = textStorage else { return }
+        let length = storage.length
+        for entry in searchOverlay where NSMaxRange(entry.range) <= length {
+            if let background = entry.background {
+                storage.addAttribute(.backgroundColor, value: background, range: entry.range)
+            } else {
+                storage.removeAttribute(.backgroundColor, range: entry.range)
+            }
+        }
+        searchOverlay = []
+        searchHighlightRanges = []
+        currentSearchHighlightIndex = -1
+    }
+
+    /// Records the background value under `range` (disjoint per match, so the
+    /// entries never overlap).
+    private func captureSearchOverlay(in storage: NSTextStorage, range: NSRange) {
+        storage.enumerateAttribute(.backgroundColor, in: range) { value, subrange, _ in
+            searchOverlay.append((subrange, value as? NSColor))
+        }
+    }
+
+    /// All non-overlapping occurrences of `query` in `text`, case-insensitive
+    /// by default. The pure half of find-in-buffer — the pane paints and
+    /// scrolls the ranges this returns.
+    nonisolated static func searchRanges(of query: String, in text: String, caseSensitive: Bool) -> [NSRange] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty, !text.isEmpty else { return [] }
+        let options: String.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        let ns = text as NSString
+        var ranges: [NSRange] = []
+        var location = 0
+        while location < ns.length {
+            let search = NSRange(location: location, length: ns.length - location)
+            let found = ns.range(of: needle, options: options, range: search)
+            guard found.location != NSNotFound else { break }
+            ranges.append(found)
+            location = found.location + max(found.length, 1)
+        }
+        return ranges
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -166,18 +269,66 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// Loads a file's content (syntax + edit attributes already applied by the
     /// pane) and rebuilds the line-offset table. `lineNumbers` is the real-line
     /// map for an interleaved diff (nil for a plain, non-diff buffer).
-    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil) {
+    func load(path: String, text: NSAttributedString, lineNumbers: [Int?]? = nil, gutterLineNumbers: [Int?]? = nil, lineStartOffsets: [Int]? = nil, contentHeight: CGFloat? = nil) {
         absolutePath = path
         lineNumberMap = lineNumbers
+        gutterLineNumberMap = gutterLineNumbers
+        sectionPaths = []
+        // The whole buffer is being replaced: the previous search paint's
+        // ledger points into the OLD storage and must not be replayed onto the
+        // new one (the caller re-applies the search after a load).
+        searchOverlay = []
+        searchHighlightRanges = []
+        currentSearchHighlightIndex = -1
         textStorage?.setAttributedString(text)
-        rebuildLineOffsets()
+        // The caller (the diff builder) can pass the offsets it already knows,
+        // so applying a large document does not rescan it for line starts on
+        // the main thread. Empty/invalid input falls back to the scan.
+        if let lineStartOffsets, !lineStartOffsets.isEmpty {
+            self.lineStartOffsets = lineStartOffsets
+        } else {
+            rebuildLineOffsets()
+        }
+        // Pin the height BEFORE sizing, so `sizeToFit` may still fit the width
+        // but can never install TextKit's lazy estimate as the document height.
+        let pinnedHeight = contentHeight.map { $0 + textContainerInset.height * 2 }
+        fixedContentHeight = pinnedHeight
         sizeToFit()
+        if let pinnedHeight { setFrameSize(NSSize(width: frame.width, height: pinnedHeight)) }
         // New file: show the top.
         scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
+    /// Keeps a caller-supplied exact height (`load(contentHeight:)`) even as
+    /// TextKit lays out more of the document and re-offers its estimated used
+    /// rect: the width may still track the text, the height never moves.
+    override func setFrameSize(_ newSize: NSSize) {
+        if let fixedContentHeight {
+            super.setFrameSize(NSSize(width: newSize.width, height: fixedContentHeight))
+        } else {
+            super.setFrameSize(newSize)
+        }
+    }
+
+    /// TextKit's line-fragment height for a line set in `font` — exactly
+    /// `NSLayoutManager.defaultLineHeight(for:)`, computed from the font
+    /// metrics so the off-main diff builder can total a document's height
+    /// without a layout manager. The pane mixes a 12pt code font with an 11pt
+    /// expand/placeholder font, so a fixed "lines × pitch" would not do.
+    nonisolated static func lineHeight(for font: NSFont) -> CGFloat {
+        ceil(font.ascender - font.descender + font.leading)
+    }
+
     private func rebuildLineOffsets() {
-        let ns = string as NSString
+        lineStartOffsets = Self.lineStartOffsets(in: string)
+    }
+
+    /// The start offset (UTF-16) of every line, ascending, as
+    /// `[0, offset-after-each-newline]`. Pure and reusable: the diff builder
+    /// computes it off-main so applying a large document does not rescan the
+    /// whole buffer for line starts on the main thread.
+    nonisolated static func lineStartOffsets(in text: String) -> [Int] {
+        let ns = text as NSString
         let length = ns.length
         var offsets: [Int] = [0]
         var search = 0
@@ -187,14 +338,82 @@ final class ReadOnlyCodeTextView: NSTextView {
             offsets.append(found.location + 1)
             search = found.location + 1
         }
-        lineStartOffsets = offsets
+        return offsets
+    }
+
+    /// Registers the file each character range belongs to (a multi-file diff
+    /// buffer). Ranges are the files' DIFF LINES only, so copying a header or
+    /// an expand row falls back to a plain copy rather than a bogus reference.
+    func setSectionPaths(_ paths: [(range: NSRange, absolutePath: String)]) {
+        sectionPaths = paths
+    }
+
+    /// The 1-based display lines carrying a file header band. Drawn here as a
+    /// full-width fill UNDER the glyphs (a background color attribute would
+    /// only span the text's own width), so a scroll reads as clearly separated
+    /// per-file sections. Set with the document; empty clears the bands.
+    private(set) var headerLines: [Int] = []
+
+    func setHeaderLines(_ lines: [Int]) {
+        headerLines = lines
+        needsDisplay = true
+    }
+
+    /// Paints a subtle band and a hairline rule behind each visible header
+    /// line. Only lines intersecting the dirty rect are touched, and each band
+    /// spans the viewport (never just the header text's width), so the
+    /// separator reads even for a short path in a wide window.
+    private func drawHeaderBands(in rect: NSRect) {
+        guard !headerLines.isEmpty, let layoutManager, let textContainer else { return }
+        let length = (string as NSString).length
+        guard length > 0 else { return }
+        let inset = textContainerInset
+        // The characters intersecting the dirty rect. Restricting the layout
+        // queries to them keeps a changeset with hundreds of files from
+        // locating every header band on every repaint — only the headers the
+        // pass could actually paint are looked up.
+        let containerRect = NSRect(
+            x: rect.minX - inset.width,
+            y: rect.minY - inset.height,
+            width: max(rect.width, 1),
+            height: max(rect.height, 1)
+        )
+        let visibleGlyphs = layoutManager.glyphRange(forBoundingRect: containerRect, in: textContainer)
+        guard visibleGlyphs.length > 0 else { return }
+        let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        let bandWidth = max(bounds.width, enclosingScrollView?.contentSize.width ?? bounds.width)
+        for line in headerLines {
+            guard line >= 1, line - 1 < lineStartOffsets.count else { continue }
+            let charIndex = lineStartOffsets[line - 1]
+            guard charIndex < length, NSLocationInRange(charIndex, visibleChars) else { continue }
+            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
+            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let y = fragment.minY + inset.height
+            guard y < rect.maxY, y + fragment.height > rect.minY else { continue }
+            NSColor.labelColor.withAlphaComponent(0.10).setFill()
+            NSRect(x: 0, y: y, width: bandWidth, height: fragment.height).fill()
+            NSColor.separatorColor.setFill()
+            NSRect(x: 0, y: y, width: bandWidth, height: 1).fill()
+        }
+    }
+
+    /// The file section owning a character index, with its diff-character
+    /// range, falling back to the whole buffer for a single-file view. nil
+    /// when the index is not in any file's diff lines (an expand/placeholder
+    /// row), which `copy` treats as "do a plain copy".
+    private func section(at index: Int) -> (path: String, range: NSRange)? {
+        for entry in sectionPaths where NSLocationInRange(index, entry.range) {
+            return (entry.absolutePath, entry.range)
+        }
+        guard !absolutePath.isEmpty else { return nil }
+        return (absolutePath, NSRange(location: 0, length: (string as NSString).length))
     }
 
     /// The 1-based line containing character `index` (0 ≤ index < length).
-    /// `fileprivate` so the line-number ruler (same file) resolves each visible
-    /// fragment to the SAME per-load offset table the copy machinery uses — one
-    /// source of truth for "which line is this" across the pane.
-    fileprivate func lineNumber(forIndex index: Int) -> Int {
+    /// Internal so the diff viewer's container can resolve the scroll spy's
+    /// top-of-viewport line to the section that owns it — one source of truth
+    /// for "which line is this" across the code views.
+    func lineNumber(forIndex index: Int) -> Int {
         let offsets = lineStartOffsets
         var low = 0
         var high = offsets.count - 1
@@ -220,6 +439,18 @@ final class ReadOnlyCodeTextView: NSTextView {
         return lineNumberMap[displayLine - 1]
     }
 
+    /// The number the GUTTER shows for a display line. Unlike
+    /// `realLineNumber(forDisplayLine:)` this is never nil for a removed line
+    /// when the document carries an old-side map: a red line shows its
+    /// old-file number, so a deletion-only change is numbered rather than blank.
+    func gutterLineNumber(forDisplayLine displayLine: Int) -> Int? {
+        if let gutterLineNumberMap {
+            guard displayLine >= 1, displayLine <= gutterLineNumberMap.count else { return nil }
+            return gutterLineNumberMap[displayLine - 1]
+        }
+        return realLineNumber(forDisplayLine: displayLine)
+    }
+
     /// The 1-based DISPLAY line showing real current-file line `real`, or the
     /// nearest preceding real line when `real` itself was removed (a reference
     /// to a removed line anchors at the context around it).
@@ -238,16 +469,38 @@ final class ReadOnlyCodeTextView: NSTextView {
 
     /// The REAL current-file line number of a character index (the copy
     /// reference's line). A character on a removed line maps to the nearest
-    /// real line before it, so a selection spanning a removal still produces a
-    /// valid in-file reference.
+    /// real line in the SAME file section — preferring one before it, then one
+    /// after — so a selection spanning a removal still produces a valid
+    /// in-file reference and never borrows the previous file's line numbers
+    /// (in the multi-file diff every file's real numbers restart).
     func realLineNumber(forIndex index: Int) -> Int {
         let display = lineNumber(forIndex: index)
+        let (lower, upper) = sectionDisplayBounds(containing: index)
         var candidate = display
-        while candidate >= 1 {
+        while candidate >= lower {
             if let real = realLineNumber(forDisplayLine: candidate) { return real }
             candidate -= 1
         }
-        return 1
+        // A leading removal run: take the first real line below it.
+        candidate = display + 1
+        while candidate <= upper {
+            if let real = realLineNumber(forDisplayLine: candidate) { return real }
+            candidate += 1
+        }
+        return lower
+    }
+
+    /// The inclusive display-line bounds of the file section owning `index`,
+    /// or the whole buffer for a single-file view.
+    private func sectionDisplayBounds(containing index: Int) -> (lower: Int, upper: Int) {
+        let length = (string as NSString).length
+        for entry in sectionPaths where NSLocationInRange(index, entry.range) {
+            let lower = lineNumber(forIndex: entry.range.location)
+            let endIndex = max(entry.range.location, entry.range.location + entry.range.length - 1)
+            let upper = lineNumber(forIndex: min(endIndex, max(length - 1, 0)))
+            return (lower, upper)
+        }
+        return (1, max(lineStartOffsets.count, 1))
     }
 
     /// The selected text with any interleaved removed lines dropped, so a
@@ -277,12 +530,28 @@ final class ReadOnlyCodeTextView: NSTextView {
 
     override func copy(_ sender: Any?) {
         let selection = selectedRange()
-        // Nothing selected (just a caret), or no file loaded: fall back to
-        // normal copy behavior instead of writing a zero-width nonsense
-        // reference.
+        // Nothing selected (just a caret), or the selection is not inside a
+        // loaded file's diff lines (an expand/placeholder row): fall back to
+        // normal copy behavior instead of writing a zero-width or bogus
+        // reference. In the Changes viewer the buffer holds every changed
+        // file's diff, so the owning file comes from the per-section ranges;
+        // for a single-file buffer it is `absolutePath`.
         guard selection.length > 0,
               Range(selection, in: string) != nil,
-              !absolutePath.isEmpty else {
+              let section = section(at: selection.location) else {
+            super.copy(sender)
+            return
+        }
+        // Clamp the selection to the owning file's diff lines: a drag that
+        // runs past the section into the next file (or a trailing expand row)
+        // must never pull another file's text into this file's snippet. A
+        // trailing newline is naturally dropped (the section's range ends at
+        // the last diff character), so a selection through the newline still
+        // ends on its own line.
+        let sectionEnd = section.range.location + section.range.length
+        let clampedEnd = min(selection.location + selection.length, sectionEnd)
+        let clamped = NSRange(location: selection.location, length: max(0, clampedEnd - selection.location))
+        guard clamped.length > 0 else {
             super.copy(sender)
             return
         }
@@ -292,11 +561,18 @@ final class ReadOnlyCodeTextView: NSTextView {
         // when the buffer is an interleaved diff (removed lines map to the
         // nearest real line around them), and the snippet drops the removed
         // lines so the frozen reference always quotes text that is in the file.
-        let startLine = realLineNumber(forIndex: selection.location)
-        let endLine = realLineNumber(forIndex: selection.location + selection.length - 1)
-        let snippet = realSnippet(for: selection)
+        let startLine = realLineNumber(forIndex: clamped.location)
+        let endLine = realLineNumber(forIndex: clamped.location + clamped.length - 1)
+        let snippet = realSnippet(for: clamped)
+        // A selection made up entirely of removed (old-side) lines has no
+        // current-file content to freeze: a reference to it would quote an
+        // empty fenced block. Paste the removed text plainly instead.
+        guard !snippet.isEmpty else {
+            super.copy(sender)
+            return
+        }
         let reference = CodeReference(
-            absolutePath: absolutePath,
+            absolutePath: section.path,
             startLine: startLine,
             endLine: endLine,
             snippet: snippet
@@ -329,6 +605,21 @@ final class ReadOnlyCodeTextView: NSTextView {
 extension ReadOnlyCodeTextView: NSTextViewDelegate {
     func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
         false
+    }
+
+    /// Forwards a link click (the diff viewer's expand controls) to
+    /// `onLinkClick`. Other schemes fall through to AppKit.
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let onLinkClick else { return false }
+        if let url = link as? URL {
+            onLinkClick(url)
+            return true
+        }
+        if let string = link as? String, let url = URL(string: string) {
+            onLinkClick(url)
+            return true
+        }
+        return false
     }
 }
 
@@ -525,12 +816,13 @@ final class CodeLineRulerView: NSRulerView {
             // only the fragment that begins the logical line carries the
             // number (the pane disables wrapping, so this is defensive).
             guard displayLine >= 1, displayLine - 1 < offsets.count, offsets[displayLine - 1] == charIndex else { return }
-            // The number is the REAL current-file line, and an interleaved
-            // diff's removed lines have no current-file number — their gutter
-            // stays blank (the red line background is their marker).
-            guard let realLine = codeView.realLineNumber(forDisplayLine: displayLine) else { return }
+            // The number shown is the display-only gutter number: the real
+            // current-file line for a same/added line, the OLD-file line for a
+            // removed line (a red line with no current-file number must still
+            // read as a numbered line, not a blank row).
+            guard let gutterLine = codeView.gutterLineNumber(forDisplayLine: displayLine) else { return }
 
-            let label = "\(realLine)" as NSString
+            let label = "\(gutterLine)" as NSString
             let size = label.size(withAttributes: attributes)
             // The fragment's vertical center in the text view's coordinates,
             // converted into the ruler's (flipped) coordinates.
@@ -587,8 +879,22 @@ class EditMarkerScroller: NSScroller {
 
     /// The edit ticks, in ascending document order.
     var markers: [Marker] = [] {
-        didSet { needsDisplay = true }
+        didSet {
+            markersRevision &+= 1
+            needsDisplay = true
+        }
     }
+
+    /// Bumped on every `markers` change, so the built tick paths can be cached
+    /// across scroller repaints (the knob moves on every scroll, but the ticks
+    /// do not).
+    private var markersRevision = 0
+    private struct FillsKey: Equatable {
+        let revision: Int
+        let minY, midX, height, knobHeight: CGFloat
+    }
+    private var fillsKey: FillsKey?
+    private var cachedFills: [(color: NSColor, path: NSBezierPath)] = []
 
     /// Clears both the ticks and the whole-track tint.
     func clearMarkers() {
@@ -601,16 +907,27 @@ class EditMarkerScroller: NSScroller {
         drawEditMarkers(in: slotRect)
     }
 
+    /// Device-RGB key for batching same-colored ticks. `NSColor` hash/equality
+    /// across dynamically-constructed colors (the hue-blended row tints) is not
+    /// a contract to rely on for dictionary keys, but equal components are
+    /// exactly "paint these together".
+    private struct ColorKey: Hashable {
+        let r, g, b, a: CGFloat
+        init(_ color: NSColor) {
+            let rgb = color.usingColorSpace(.deviceRGB) ?? color
+            r = rgb.redComponent
+            g = rgb.greenComponent
+            b = rgb.blueComponent
+            a = rgb.alphaComponent
+        }
+    }
+
     /// Paints the edit map into the slot, UNDER the knob (the knob is drawn
     /// afterwards by the default `drawKnob`, so it covers any tick it overlaps
     /// — a tick whose edit is currently on screen disappears under the knob,
-    /// exactly the \"you are here\" read). The scroller is flipped (top-down):
+    /// exactly the "you are here" read). The scroller is flipped (top-down):
     /// slot y grows downward, matching the document.
     private func drawEditMarkers(in slotRect: NSRect) {
-        let tickWidth: CGFloat = 4
-        let tickHeight: CGFloat = 5
-        let x = slotRect.midX - tickWidth / 2
-
         if let wholeTrackColor {
             wholeTrackColor.withAlphaComponent(0.28).setFill()
             NSBezierPath(roundedRect: slotRect, xRadius: slotRect.width / 2, yRadius: slotRect.width / 2).fill()
@@ -619,53 +936,61 @@ class EditMarkerScroller: NSScroller {
         guard !markers.isEmpty else { return }
         // Map a document fraction to the slot position whose knob-top would
         // land there: the knob travels over (slotHeight - knobHeight) as the
-        // viewport travels over the scrollable document.
-        // The knob's height at the current scroll (its travel range over the
-        // track is slotHeight - knobHeight). rect(for:) is the authoritative
-        // source when available; knobProportion is the fallback.
+        // viewport travels over the scrollable document. `rect(for:)` is the
+        // authoritative source when available; `knobProportion` is the fallback.
         let knobHeight = rect(for: .knob).height > 0 ? rect(for: .knob).height : knobProportion * slotRect.height
-        let travel = max(slotRect.height - knobHeight, 1)
 
-        // Batch the ticks by color: every same-color tick appends its rounded
-        // rect as a SUBPATH of one path, then each color gets exactly ONE
-        // fill. The old loop issued a path allocation + setFill + fill per
-        // marker, so a file with many edited lines (or a tree with many
-        // edited rows) meant that many tiny state changes and rasterized
-        // fills on every scroller repaint.
-        //
-        // Keyed by device-RGB components rather than the `NSColor` object:
-        // `NSColor` hash/equality across dynamically-constructed colors (the
-        // hue-blended row tints) is not a contract to rely on for dictionary
-        // keys, but equal components are exactly "paint these together".
-        struct ColorKey: Hashable {
-            let r, g, b, a: CGFloat
-            init(_ color: NSColor) {
-                let rgb = color.usingColorSpace(.deviceRGB) ?? color
-                r = rgb.redComponent
-                g = rgb.greenComponent
-                b = rgb.blueComponent
-                a = rgb.alphaComponent
-            }
+        // Only the TICKS depend on `markers`; the knob moves on every scroll,
+        // so the built paths are cached and re-filled until the tick set or the
+        // slot geometry changes. See `buildFills` for the one-rect-per-pixel
+        // coalescing that keeps a huge changeset from drawing tens of thousands
+        // of subpaths on every repaint.
+        let key = FillsKey(revision: markersRevision, minY: slotRect.minY, midX: slotRect.midX, height: slotRect.height, knobHeight: knobHeight)
+        if fillsKey != key {
+            cachedFills = buildFills(in: slotRect, knobHeight: knobHeight)
+            fillsKey = key
         }
-        var fills: [ColorKey: (color: NSColor, path: NSBezierPath)] = [:]
-        fills.reserveCapacity(min(markers.count, 8))
-        for marker in markers {
-            // Fraction along the scrollable document, clamped to the track.
-            let f = min(max(marker.fraction, 0), 1)
-            let y = slotRect.minY + f * travel - tickHeight / 2
-            let key = ColorKey(marker.color)
-            let entry = fills[key] ?? (marker.color, NSBezierPath())
-            entry.path.appendRoundedRect(
-                NSRect(x: x, y: y, width: tickWidth, height: tickHeight),
-                xRadius: tickWidth / 2,
-                yRadius: tickWidth / 2
-            )
-            fills[key] = entry
-        }
-        for entry in fills.values {
+        for entry in cachedFills {
             entry.color.setFill()
             entry.path.fill()
         }
+    }
+
+    /// Builds one batched path per tick color, coalescing ticks that land on
+    /// the same point row. A changed file alone can contribute one tick per
+    /// edited line — tens of thousands for a large changeset — and they land
+    /// on at most one per point of track, so the coalesced map is visually
+    /// identical while being ~100× cheaper to rasterize.
+    private func buildFills(in slotRect: NSRect, knobHeight: CGFloat) -> [(color: NSColor, path: NSBezierPath)] {
+        let tickWidth: CGFloat = 4
+        let tickHeight: CGFloat = 5
+        let x = slotRect.midX - tickWidth / 2
+        let travel = max(slotRect.height - knobHeight, 1)
+
+        var order: [ColorKey] = []
+        var colorByKey: [ColorKey: NSColor] = [:]
+        var rowsByKey: [ColorKey: Set<Int>] = [:]
+        var pathByKey: [ColorKey: NSBezierPath] = [:]
+        for marker in markers {
+            let f = min(max(marker.fraction, 0), 1)
+            let y = slotRect.minY + f * travel - tickHeight / 2
+            let row = Int(y.rounded())
+            let key = ColorKey(marker.color)
+            if colorByKey[key] == nil {
+                colorByKey[key] = marker.color
+                rowsByKey[key] = []
+                pathByKey[key] = NSBezierPath()
+                order.append(key)
+            }
+            if rowsByKey[key]!.insert(row).inserted {
+                pathByKey[key]!.appendRoundedRect(
+                    NSRect(x: x, y: CGFloat(row), width: tickWidth, height: tickHeight),
+                    xRadius: tickWidth / 2,
+                    yRadius: tickWidth / 2
+                )
+            }
+        }
+        return order.map { (colorByKey[$0]!, pathByKey[$0]!) }
     }
 }
 

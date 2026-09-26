@@ -106,10 +106,12 @@ targets:
       - Client/Views/TextRowView.swift
       - Client/Views/CodeCopyButton.swift
       - Client/Views/ReadOnlyCodeTextView.swift
-      # The file-browser content pane (FilePaneContainer + the reference-jump
-      # reveal). Its SyntaxHighlighter dependency is stubbed in the test
-      # bundle (it links Highlightr, which the renderer bundles don't).
-      - Client/Views/ReadOnlyFilePane.swift
+      # The diff viewer's code container (the scroll view + ruler + edit-map
+      # scroller that hosts a whole document). Its SyntaxHighlighter dependency
+      # is stubbed in the test bundle.
+      - Client/Views/CodePaneContainer.swift
+      # The diff loader (per-file interleaved diff), pure Core + file IO.
+      - Client/Support/DiffLoading.swift
       - Client/Accessibility/DisplayOptions.swift
       - Client/Support/FontSettings.swift
       - RenderingTests

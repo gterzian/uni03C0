@@ -12,8 +12,11 @@ import Foundation
 ///
 /// `CodeReference` freezes what a human was looking at (absolute path +
 /// snippet, never re-read from disk); this parses where the agent points and
-/// always opens CURRENT disk content through the existing pane-load path. The
-/// path is therefore RELATIVE to the session's `cwd`, forward-slash
+/// opens the file's section in the session's Changes (diff) viewer, scrolling
+/// to the named line when it is part of the shown diff window. Because that
+/// viewer shows only files with uncommitted changes, a link only ever lands on
+/// a CHANGED file — the bundled skill teaches the agent to reference only
+/// those. The path is RELATIVE to the session's `cwd`, forward-slash
 /// separated — the same string space the agent's own `edit`/`write` tool
 /// calls use — with no leading `/` and no `./`. There is no cross-project
 /// ambiguity to defend against: the agent only ever names a file inside its
@@ -88,7 +91,7 @@ public struct FileReferenceLink: Hashable, Sendable {
 
 extension Notification.Name {
     /// Posted by the transcript when the user clicks an agent-emitted
-    /// `pi-file://` reference link, so the session's file browser opens the
+    /// `pi-file://` reference link, so the session's Changes viewer reveals the
     /// referenced file. Payload keys (both required): `"cwd"` — the
     /// `URL` of the session folder the link names, so a tab only reacts to
     /// its own links — and `"link"`, the parsed `FileReferenceLink`.

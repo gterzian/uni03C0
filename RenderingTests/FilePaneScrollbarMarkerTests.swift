@@ -2,18 +2,17 @@ import AppKit
 import Core
 import XCTest
 
-/// Pins the file pane's SCROLLBAR edit map (`CodePaneEditMarkerScroller`,
-/// installed by `FilePaneContainer`): edit lines become colored ticks at their
-/// exact document fraction, whole-file edits tint the whole track, and every
-/// load replaces the previous map. The files are loaded WHOLE into the text
-/// view (no incremental loading), so markers are always exact positions —
-/// these tests freeze the mapping arithmetic that would change if that ever
-/// became windowed.
+/// Pins the diff viewer's SCROLLBAR edit map (`CodePaneEditMarkerScroller`,
+/// installed by `CodePaneContainer`): changed display lines become colored ticks
+/// at their exact document fraction, and every document swap replaces the
+/// previous map. The whole document is in the text view (no incremental
+/// loading), so markers are always exact positions — these tests freeze the
+/// mapping arithmetic that would change if that ever became windowed.
 final class FilePaneScrollbarMarkerTests: XCTestCase {
-    /// A container hosting a 900-line file, laid out in an offscreen window.
+    /// A container hosting a 900-line document, laid out in an offscreen window.
     @MainActor
-    private func makeContainer() -> FilePaneContainer {
-        let container = FilePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+    private func makeContainer() -> CodePaneContainer {
+        let container = CodePaneContainer(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
             styleMask: [.titled],
@@ -26,50 +25,39 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         return container
     }
 
-    private func paneText() -> NSAttributedString {
-        let lines = (1...900).map { "this is line number \($0) of the pane test — padding padding" }
-        let text = lines.joined(separator: "\n") + "\n"
+    private func paneText(lineCount: Int = 900, trailingNewline: Bool = true) -> NSAttributedString {
+        let lines = (1...lineCount).map { "this is line number \($0) of the pane test — padding padding" }
+        let text = lines.joined(separator: "\n") + (trailingNewline ? "\n" : "")
         return NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
     }
 
-    private func scroller(of container: FilePaneContainer) -> CodePaneEditMarkerScroller? {
+    private func scroller(of container: CodePaneContainer) -> CodePaneEditMarkerScroller? {
         container.scrollView.verticalScroller as? CodePaneEditMarkerScroller
     }
 
     @MainActor
     func testEditMapInstallsAMarkerScroller() {
-        // The scroll view must be using the marker subclass, and assigning a
-        // subclass forces the legacy (always-visible) style — the edit map is
-        // only useful while the bar is shown.
         let container = makeContainer()
-        XCTAssertNotNil(scroller(of: container), "the pane's vertical scroller is the marker subclass")
+        XCTAssertNotNil(scroller(of: container), "the viewer's vertical scroller is the marker subclass")
     }
 
     @MainActor
     func testEditedLinesBecomeTicksAtTheirDocumentFraction() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         let markers = scroller(of: container)?.markers ?? []
         XCTAssertEqual(markers.count, 2, "one tick per edited line")
-        // (line − 0.5) / lineCount — line 10 near the top, 858 near the bottom.
         XCTAssertEqual(markers[0].fraction, (10.0 - 0.5) / 900.0, accuracy: 0.001, "line 10 maps to its document fraction")
         XCTAssertEqual(markers[1].fraction, (858.0 - 0.5) / 900.0, accuracy: 0.001, "line 858 maps to its document fraction")
         XCTAssertEqual(markers[0].color, .systemGreen, "added lines are green (matches the text overlay)")
-        XCTAssertNil(scroller(of: container)?.wholeTrackColor)
     }
 
     @MainActor
     func testRemovedLinesBecomeRedTicks() {
         let container = makeContainer()
-        container.displayContent(
-            path: "/tmp/x.swift",
-            text: paneText(),
-            preserveScroll: false,
-            targetLines: nil,
-            markers: .lines(added: [10], removed: [858])
-        )
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10], removed: [858]))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
         let markers = scroller(of: container)?.markers ?? []
@@ -81,43 +69,42 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
     }
 
     @MainActor
-    func testWholeFileEditsTintTheTrack() {        let container = makeContainer()
-        container.displayContent(path: "/tmp/new.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .wholeAdded)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
-        XCTAssertNotNil(scroller(of: container)?.wholeTrackColor, "a brand-new file tints the whole track")
-        XCTAssertTrue(scroller(of: container)?.markers.isEmpty ?? false)
-
-        container.displayContent(path: "/tmp/gone.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .wholeDeleted)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
-        XCTAssertNotNil(scroller(of: container)?.wholeTrackColor, "a deleted file tints the whole track (the removed side)")
-    }
-
-    @MainActor
     func testEachLoadReplacesThePreviousMap() {
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [100], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [100], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertEqual(scroller(of: container)?.markers.count, 1)
 
-        // A plain reload of an unedited file clears the map.
-        container.displayContent(path: "/tmp/clean.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .none)
+        container.displayDocument(path: "/tmp/clean.swift", text: paneText(), markers: .none)
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
         XCTAssertTrue(scroller(of: container)?.markers.isEmpty ?? false, "ticks clear on a load with no edits")
-        XCTAssertNil(scroller(of: container)?.wholeTrackColor)
+    }
+
+    @MainActor
+    func testMarkerFractionsOverrideTheLineCountFallback() {
+        let container = makeContainer()
+        // The document mixes font sizes, so the builder supplies each line's
+        // real center fraction; the container must use it, not line/count.
+        container.displayDocument(
+            path: "/tmp/x.swift",
+            text: paneText(lineCount: 3),
+            markers: .lines(added: [2], removed: []),
+            markerFractions: [0.1, 0.9, 0.95]
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.03))
+
+        let markers = scroller(of: container)?.markers ?? []
+        XCTAssertEqual(markers.count, 1)
+        XCTAssertEqual(markers[0].fraction, 0.9, accuracy: 0.0001,
+                       "the builder's measured fraction wins over the uniform fallback")
     }
 
     @MainActor
     func testBatchedDrawingPaintsEveryTickAtItsFraction() {
-        // The scroller batches same-color ticks into ONE path + ONE fill (see
-        // `EditMarkerScroller.drawEditMarkers`); this pins that the batched
-        // drawing still paints a tick for EVERY marker at its mapped track
-        // position — a grouping bug would drop ticks or pile them at one spot.
         let container = makeContainer()
-        container.displayContent(path: "/tmp/x.swift", text: paneText(), preserveScroll: false, targetLines: nil, markers: .lines(added: [10, 858], removed: []))
+        container.displayDocument(path: "/tmp/x.swift", text: paneText(), markers: .lines(added: [10, 858], removed: []))
         RunLoop.current.run(until: Date().addingTimeInterval(0.03))
 
-        // Scroll to the middle so the knob (which covers whatever it overlaps)
-        // sits mid-track and neither edge tick hides under it.
         let clip = container.scrollView.contentView
         clip.scroll(to: NSPoint(x: 0, y: 6000))
         container.scrollView.reflectScrolledClipView(clip)
@@ -127,8 +114,6 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         guard let rep = scroller.bitmapImageRepForCachingDisplay(in: scroller.bounds) else { return XCTFail("could not rasterize the scroller") }
         scroller.cacheDisplay(in: scroller.bounds, to: rep)
 
-        // Scan for green-dominant pixels (the added-line tick color) and
-        // collect their row bands.
         let scale = CGFloat(rep.pixelsWide) / scroller.bounds.width
         var bands: [(start: CGFloat, end: CGFloat)] = []
         var inBand = false
@@ -157,10 +142,155 @@ final class FilePaneScrollbarMarkerTests: XCTestCase {
         guard bands.count == 2 else { return }
         let centers = bands.map { ($0.start + $0.end) / 2 }
         let height = scroller.bounds.height
-        // Line 10 sits at fraction ~0.01, line 858 at ~0.95 of the document —
-        // their ticks must land at the corresponding ends of the track.
         XCTAssertLessThan(centers[0] / height, 0.12, "the top tick paints near the top of the track")
         XCTAssertGreaterThan(centers[1] / height, 0.85, "the bottom tick paints near the bottom of the track")
         XCTAssertLessThan(centers[0], centers[1], "ticks keep document order")
+    }
+
+    // MARK: - Pinned document height (the scroller/map geometry)
+
+    /// `allowsNonContiguousLayout` makes `sizeToFit`/`usedRect` report an
+    /// ESTIMATE that grows as more of a large document is laid out, so an
+    /// auto-sizing text view shrank the document mid-scroll — which slid the
+    /// scroller and the edit map out from under the reader. A supplied exact
+    /// height must be pinned for the life of the document.
+    @MainActor
+    func testPinnedDocumentHeightStaysExactWhileScrolling() {
+        let container = makeContainer()
+        let view = container.codeView
+        let lineHeight = ReadOnlyCodeTextView.lineHeight(for: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+        let lineCount = 900
+        let textHeight = CGFloat(lineCount) * lineHeight
+        let expected = textHeight + view.textContainerInset.height * 2
+
+        container.displayDocument(
+            path: "/tmp/x.swift",
+            text: paneText(lineCount: lineCount, trailingNewline: false),
+            markers: .lines(added: [10, 858], removed: []),
+            contentHeight: textHeight
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(view.frame.height, expected, accuracy: 0.5, "the pinned height IS the document height")
+        XCTAssertEqual(scroller(of: container)?.knobProportion ?? 0,
+                       container.scrollView.contentView.bounds.height / expected,
+                       accuracy: 0.005,
+                       "the knob reflects the exact document height, not TextKit's estimate")
+
+        let clip = container.scrollView.contentView
+        for y in [expected / 3, expected / 2, max(0, expected - clip.bounds.height)] {
+            clip.scroll(to: NSPoint(x: 0, y: y))
+            container.scrollView.reflectScrolledClipView(clip)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            XCTAssertEqual(view.frame.height, expected, accuracy: 0.5,
+                           "laying out more of the document must not resize it")
+        }
+        // The document is fully scrollable: the bottom sits at the exact content
+        // height (an underestimated height left the last lines unreachable).
+        XCTAssertEqual(clip.bounds.minY, expected - clip.bounds.height, accuracy: 1.0,
+                       "the last line is reachable at the exact document height")
+    }
+
+    /// A rebuild (a background diff load, an expansion) swaps in a whole new
+    /// document. The restore must keep not only the same anchor LINE but the
+    /// same fraction of it on screen: an anchor line partly scrolled off stays
+    /// partly scrolled off, so the reader sees no jump at all.
+    @MainActor
+    func testRestoreKeepsTheExactViewportOffset() {
+        let container = makeContainer()
+        let view = container.codeView
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let lineHeight = ReadOnlyCodeTextView.lineHeight(for: font)
+
+        func topOffset(ofLine line: Int) -> CGFloat? {
+            guard let layoutManager = view.layoutManager,
+                  line >= 1, line - 1 < view.lineStartOffsets.count else { return nil }
+            let clip = container.scrollView.contentView
+            let clipTop = clip.convert(NSPoint(x: 0, y: clip.bounds.minY), to: view).y
+            let glyph = layoutManager.glyphIndexForCharacter(at: view.lineStartOffsets[line - 1])
+            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+            return (fragment.minY + view.textContainerInset.height) - clipTop
+        }
+
+        // First document: short lines. Scroll line 201 so its top sits 5pt
+        // ABOVE the viewport top (a negative offset), as a mid-line scroll is.
+        let short = (1...400).map { "L\($0)" }.joined(separator: "\n")
+        container.displayDocument(
+            path: "/tmp/old.swift",
+            text: NSAttributedString(string: short, attributes: [.font: font]),
+            contentHeight: CGFloat(400) * lineHeight
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        container.scrollCharacterToTop(view.lineStartOffsets[200], offset: -5)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let anchorOffset = topOffset(ofLine: 201) ?? 999
+        XCTAssertEqual(anchorOffset, -5, accuracy: 0.5, "the anchor line starts 5pt above the fold")
+
+        // Second document: every line before the anchor is longer, so the OLD
+        // document's character offsets no longer name the same place. Restoring
+        // with the NEW offset table (what the builder hands the view) must land
+        // on the same line at the same screen position.
+        let long = (1...400).map { index in
+            index < 201 ? "line \(index) with a much longer prefix than before" : "L\(index)"
+        }.joined(separator: "\n")
+        let offsets = ReadOnlyCodeTextView.lineStartOffsets(in: long)
+        container.displayDocument(
+            path: "/tmp/new.swift",
+            text: NSAttributedString(string: long, attributes: [.font: font]),
+            contentHeight: CGFloat(400) * lineHeight,
+            restoreCharacterIndex: offsets[200],
+            restoreCharacterOffset: -5,
+            lineStartOffsets: offsets
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(topOffset(ofLine: 201) ?? 999, -5, accuracy: 0.5,
+                       "the rebuilt document keeps the anchor line at the same pixel offset")
+    }
+
+    /// The diff document mixes the 12pt code font with the 11pt expand row
+    /// font, so the builder sums each line's own height. The total must equal
+    /// TextKit's laid-out height exactly, or the pinning is off by the
+    /// difference.
+    @MainActor
+    func testPinnedHeightEqualsTheLaidOutHeightForMixedFonts() {
+        let code = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let small = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let text = NSMutableAttributedString()
+        var height: CGFloat = 0
+        for index in 1...600 {
+            if index > 1 { text.append(NSAttributedString(string: "\n")) }
+            if index % 10 == 0 {
+                text.append(NSAttributedString(string: "  ⌃  \(index) more lines below — click to expand", attributes: [.font: small]))
+                height += ReadOnlyCodeTextView.lineHeight(for: small)
+            } else {
+                text.append(NSAttributedString(string: "code line \(index) — padding padding", attributes: [.font: code]))
+                height += ReadOnlyCodeTextView.lineHeight(for: code)
+            }
+        }
+
+        let container = makeContainer()
+        container.displayDocument(path: "/tmp/mix.swift", text: text, contentHeight: height)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let view = container.codeView
+        XCTAssertEqual(view.frame.height, height + view.textContainerInset.height * 2, accuracy: 0.5)
+
+        view.layoutManager?.ensureLayout(for: view.textContainer!)
+        XCTAssertEqual(view.layoutManager!.usedRect(for: view.textContainer!).height, height, accuracy: 0.5,
+                       "the builder's per-line font sum is exactly TextKit's laid-out height")
+    }
+
+    /// `ReadOnlyCodeTextView.lineHeight` is what the off-main builder totals,
+    /// so it must stay equal to TextKit's own line height for the fonts the
+    /// differ uses.
+    @MainActor
+    func testLineHeightMatchesTextKit() {
+        let layoutManager = NSLayoutManager()
+        for size in [5.0, 10.0, 11.0, 12.0] as [CGFloat] {
+            let font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            XCTAssertEqual(ReadOnlyCodeTextView.lineHeight(for: font),
+                           layoutManager.defaultLineHeight(for: font),
+                           accuracy: 0.001,
+                           "line height at \(size)pt")
+        }
     }
 }

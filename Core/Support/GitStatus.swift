@@ -2,7 +2,7 @@ import Foundation
 import Subprocess
 import System
 
-/// Git plumbing behind the file browser and the "N edited" gating button.
+/// Git plumbing behind the Changes viewer and the "N edited" gating button.
 ///
 /// The app itself is not sandboxed (the seatbelt policy applies to agent
 /// subprocesses only), so spawning git from here is unconstrained; the spawns
@@ -32,6 +32,15 @@ public enum GitStatus {
             self.added = added
             self.deleted = deleted
         }
+
+        /// Component-wise sum, for aggregating a changeset's totals.
+        public static func + (lhs: DiffStats, rhs: DiffStats) -> DiffStats {
+            DiffStats(added: lhs.added + rhs.added, deleted: lhs.deleted + rhs.deleted)
+        }
+
+        /// Added + deleted lines — zero means an empty/countable-but-unchanged
+        /// file, not "no stats".
+        public var total: Int { added + deleted }
     }
 
     /// One classified project file (the tree's leaf model).
@@ -73,14 +82,44 @@ public enum GitStatus {
         case untracked
     }
 
-    /// Posted whenever a session's agent tool touched a file on disk
-    /// (`edit`/`write`, or the turn settled). Payload keys: `"cwd"` (the URL
-    /// of the session folder) and `"path"` (the file that changed, or nil when
-    /// the whole turn settled and any file may have changed). A payload is
-    /// needed (unlike `FontSettings.didChangeNotification`, which posts no
-    /// payload) because more than one project's file browser window can be
-    /// open at once, each caring only about its own `cwd`.
+    /// Posted whenever a session's git state may have changed: an agent tool
+    /// touched a file on disk (`edit`/`write`, or the turn settled), or the
+    /// app re-entered the foreground / opened a review surface to re-check a
+    /// change pi never saw (a `git commit` run in a terminal). Payload keys:
+    /// `"cwd"` (the URL of the session folder) and `"path"` (the file that
+    /// changed, or nil when the whole turn settled, the app returned, or any
+    /// file may have changed). A payload is needed (unlike
+    /// `FontSettings.didChangeNotification`, which posts no payload) because
+    /// more than one project's Changes viewer can be open at once, each
+    /// caring only about its own `cwd`.
     public static let didChangeNotification = Notification.Name("GitStatus.didChange")
+
+    // MARK: - Turn baseline
+
+    /// Git's well-known empty-tree object id. Used as the diff baseline for a
+    /// repository with no commits yet, so a turn's first changes still diff
+    /// from "nothing" instead of failing on an unborn `HEAD`.
+    public static let emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+    /// The commit to diff a turn against: the live `HEAD`, or `emptyTree` when
+    /// the repository has no commits (a fresh `git init`). Captured once at the
+    /// start of a user turn and then kept — so a commit the agent makes
+    /// mid-turn moves `HEAD` without emptying the Changes viewer; only the next
+    /// turn re-baselines.
+    public static func resolveHead(at cwd: URL) async -> String {
+        guard let out = await gitOutput(["rev-parse", "--verify", "--quiet", "HEAD"], cwd: cwd) else {
+            return emptyTree
+        }
+        let sha = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sha.isEmpty ? emptyTree : sha
+    }
+
+    /// Resolves an explicit baseline, or falls back to the live `HEAD` when the
+    /// caller has not pinned one (before the first user turn).
+    private static func resolvedBase(_ base: String?, at cwd: URL) async -> String {
+        if let base, !base.isEmpty { return base }
+        return await resolveHead(at: cwd)
+    }
 
     // MARK: - Plumbing
 
@@ -114,6 +153,21 @@ public enum GitStatus {
         return lines
     }
 
+    // MARK: - Changeset totals
+
+    /// The whole changeset's line totals: the sum of every entry's
+    /// added/deleted counts. Entries with no countable baseline (untracked,
+    /// binary, `.normal`) contribute nothing; nil when nothing countable
+    /// changed, so the caller can tell "no diff" from "+0 −0".
+    public static func totalStats(of entries: [FileEntry]) -> DiffStats? {
+        var total: DiffStats?
+        for entry in entries {
+            guard let stats = entry.stats else { continue }
+            total = (total ?? DiffStats(added: 0, deleted: 0)) + stats
+        }
+        return total
+    }
+
     // MARK: - Listing + classification
 
     /// Every file the user would consider part of the project:
@@ -129,6 +183,17 @@ public enum GitStatus {
             cwd: cwd
         ) else { return [] }
         return splitLines(out).map(Self.unquote)
+    }
+
+    /// Every path git does not track yet (`--others --exclude-standard`), with
+    /// the same C-style unquote as the listing. `git diff` never reports these,
+    /// so `classify` unions them in separately.
+    public static func untrackedPaths(at cwd: URL) async -> Set<String> {
+        guard let out = await gitOutput(
+            ["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard"],
+            cwd: cwd
+        ) else { return [] }
+        return Set(splitLines(out).map(Self.unquote))
     }
 
     /// One parsed `--porcelain=v1` status line: the two-character XY code and
@@ -212,84 +277,98 @@ public enum GitStatus {
     }
 
     /// The batched line-count pass behind `classify`: per-path added/deleted
-    /// counts from TWO `git diff --numstat` runs — the worktree delta
-    /// (`git diff`, index→worktree) and the staged delta (`git diff --cached`,
-    /// HEAD→index), the worktree delta winning when both would count a path
-    /// (an `MM` file's two passes overlap). Two git calls total, no content
-    /// reads, no subprocess per file — this is what paints each file name's
-    /// deletion-vs-addition fill without the slow per-file listing. The
-    /// worktree-first rule keeps the fill on the AGENT'S live edits: a staged
-    /// file the agent then changed scores its worktree delta (deletions
-    /// included), while a staged-only file scores against HEAD — and in a
-    /// repo with no commits yet the staged pass still counts new files
-    /// against the empty tree, so a freshly `git add`ed file reads as all
-    /// additions rather than vanishing. Untracked paths never appear in
-    /// either pass (they have no baseline).
-    private static func diffStatsByPath(at cwd: URL) async -> [String: DiffStats] {
+    /// counts against the SAME baseline the diff viewer renders —
+    /// `base`→working tree (`git diff <base>`), so a file's `+N −M` in the
+    /// sidebar always matches the red/green in its diff. One git call, no
+    /// content reads, no subprocess per file. `base` is always a concrete
+    /// tree-ish (`classify` resolves an unborn `HEAD` to `emptyTree`), so there
+    /// is no separate `--cached` fallback.
+    private static func diffStatsByPath(at cwd: URL, base: String) async -> [String: DiffStats] {
+        guard let out = await gitOutput(
+            ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--numstat", base],
+            cwd: cwd
+        ) else { return [:] }
         var stats: [String: DiffStats] = [:]
-        for staged in [false, true] {
-            let args = staged
-                ? ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--cached", "--numstat"]
-                : ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--numstat"]
-            guard let out = await gitOutput(args, cwd: cwd) else { continue }
-            for record in out.split(separator: "\0") where !record.isEmpty {
-                guard let parsed = parseNumstatRecord(String(record)) else { continue }
-                if stats[parsed.path] == nil {
-                    stats[parsed.path] = parsed.stats
-                }
-            }
+        for record in out.split(separator: "\0") where !record.isEmpty {
+            guard let parsed = parseNumstatRecord(String(record)) else { continue }
+            stats[parsed.path] = parsed.stats
         }
         return stats
     }
 
-    /// Count of changed paths for the gating badge — nil when the folder is
-    /// not a git repository (or git errored). This is a porcelain LINE count
-    /// only: no file content is read or diffed, so it stays cheap even when
-    /// hundreds of files changed.
-    public static func changedFileCount(at cwd: URL) async -> Int? {
+    /// Count of paths changed since `base` for the gating badge — nil when the
+    /// folder is not a git repository (or git errored). Tracked changes come
+    /// from one `git diff --name-status`; untracked files are added from a
+    /// second listing (a diff never reports them). No file content is read, so
+    /// it stays cheap even when hundreds of files changed. `base` should be the
+    /// same turn baseline the Changes viewer uses, so the badge and the viewer
+    /// never disagree.
+    public static func changedFileCount(at cwd: URL, base: String? = nil) async -> Int? {
+        let reference = await resolvedBase(base, at: cwd)
         guard let out = await gitOutput(
-            ["-c", "core.quotepath=false", "--no-optional-locks", "status", "--porcelain=v1"],
+            ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--name-status", reference],
             cwd: cwd
         ) else { return nil }
-        return splitLines(out).filter { !$0.hasPrefix("##") }.count
+        let tracked = parseNameStatusZ(out).count
+        let untracked = await untrackedPaths(at: cwd)
+        return tracked + untracked.count
     }
 
-    /// Lists every project file (per `trackedAndVisiblePaths`) and classifies
-    /// it via `git status --porcelain=v1`, then attaches per-path added/
-    /// deleted line counts from one batched two-pass numstat
-    /// (`diffStatsByPath`) — three or four read-only git calls in total, NO
-    /// subprocess per file and no per-file content diffs, so the listing
-    /// stays instant even with hundreds of changed files. The tree's
-    /// deletion-vs-addition fill comes from `FileEntry.stats`; the content
-    /// pane still computes the exact interleaved added/deleted lines for the
-    /// ONE selected file, on demand.
-    public static func classify(at cwd: URL) async -> [FileEntry] {
+    /// One parsed `--name-status -z` record: the status letter (`A`/`M`/`D`/
+    /// `T`/`U`) and the raw path. The `-z` form never C-style-quotes, so a path
+    /// with tabs/spaces is intact. Renames are disabled by the caller, so every
+    /// record is exactly two NUL-terminated fields.
+    public static func parseNameStatusZ(_ output: String) -> [(code: String, path: String)] {
+        guard !output.isEmpty else { return [] }
+        var fields = output.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+        if fields.last == "" { fields.removeLast() }
+        var records: [(code: String, path: String)] = []
+        var index = 0
+        while index + 1 < fields.count {
+            records.append((fields[index], fields[index + 1]))
+            index += 2
+        }
+        return records
+    }
+
+    /// Lists every project file (per `trackedAndVisiblePaths`), classifies what
+    /// changed since `base` via one `git diff --name-status` (untracked files
+    /// unioned in separately), then attaches per-path added/deleted line counts
+    /// from one batched numstat (`diffStatsByPath`) — a handful of read-only
+    /// git calls in total, NO subprocess per file and no per-file content
+    /// diffs. `base` is the turn baseline (`nil` means the live `HEAD`); a
+    /// commit the agent makes mid-turn therefore does not clear the view. The
+    /// tree's deletion-vs-addition fill comes from `FileEntry.stats`.
+    public static func classify(at cwd: URL, base: String? = nil) async -> [FileEntry] {
+        let reference = await resolvedBase(base, at: cwd)
         let listed = await trackedAndVisiblePaths(at: cwd)
+        let untracked = await untrackedPaths(at: cwd)
         let raw = await gitOutput(
-            ["-c", "core.quotepath=false", "--no-optional-locks", "status", "--porcelain=v1"],
+            ["-c", "core.quotepath=false", "--no-optional-locks", "diff", "-z", "--no-renames", "--name-status", reference],
             cwd: cwd
         ) ?? ""
 
         var classByPath: [String: StatusClass] = [:]
-        for line in splitLines(raw) {
-            guard let parsed = parsePorcelainLine(line) else { continue }
-            classByPath[parsed.path] = statusClass(forPorcelainCode: parsed.code)
+        for record in parseNameStatusZ(raw) {
+            classByPath[record.path] = statusClass(forPorcelainCode: record.code)
+        }
+        for path in untracked {
+            classByPath[path] = .untracked
         }
 
         // The diff pass pays for itself only when a path has a countable
         // baseline change — a tree with nothing but untracked additions (or
         // nothing at all) skips it: untracked files never appear in a git
-        // diff, so both numstat runs would be wasted.
+        // diff, so the numstat run would be wasted.
         var needsStats = false
         for cls in classByPath.values where cls != .untracked {
             needsStats = true
             break
         }
-        let statsByPath = needsStats ? await diffStatsByPath(at: cwd) : [:]
+        let statsByPath = needsStats ? await diffStatsByPath(at: cwd, base: reference) : [:]
 
-        // Union of listed and status-reported paths, so a status-only entry
-        // (staged change to a path that ls-files already dropped — the
-        // staged-deletion gap is the named exception) still shows.
+        // Union of listed and diff-reported paths, so a path git lists but no
+        // longer reports (or vice versa) still shows.
         var allPaths = Set(listed)
         allPaths.formUnion(classByPath.keys)
 
@@ -322,10 +401,11 @@ public enum GitStatus {
         return String(data: data, encoding: .utf8)
     }
 
-    /// The file's committed content at HEAD (`git show HEAD:<path>`); nil for
-    /// untracked files and paths outside HEAD (the deleted-file content pane
-    /// loads this).
-    public static func headContent(of path: String, cwd: URL) async -> String? {
-        await gitOutput(["show", "HEAD:\(path)"], cwd: cwd)
+    /// The file's content at `reference` (`git show <reference>:<path>`); nil
+    /// for untracked files and paths outside the revision. The Changes viewer
+    /// passes the turn baseline, so a file committed mid-turn still diffs
+    /// against the content it had when the turn began.
+    public static func content(of path: String, at reference: String, cwd: URL) async -> String? {
+        await gitOutput(["show", "\(reference):\(path)"], cwd: cwd)
     }
 }

@@ -11,10 +11,10 @@ import SwiftUI
 ///
 /// The one place that resolves appearance ONCE and caches the result is syntax
 /// highlighting — Highlightr bakes fixed RGB values out of a highlight.js
-/// theme CSS file. `FilePaneContainer.viewDidChangeEffectiveAppearance` reacts
-/// to the change and re-highlights the open file with the matching theme (see
-/// `ReadOnlyFilePane`), so the code pane follows both an explicit app toggle
-/// and a system appearance change.
+/// theme CSS file. `CodePaneContainer.viewDidChangeEffectiveAppearance` reacts
+/// to the change and the diff viewer rebuilds the document with the matching
+/// theme, so the code views follow both an explicit app toggle and a system
+/// appearance change.
 @MainActor
 @Observable
 final class AppearanceSettings {

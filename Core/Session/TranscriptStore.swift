@@ -67,7 +67,7 @@ public final class TranscriptStore: @unchecked Sendable {
     /// The path of the file an `edit`/`write` tool just finished writing
     /// (`tool_execution_end`), when one completed. This is the client's
     /// file-change signal: it drives the git-derived UI (the "N edited"
-    /// button and any open file browser window) the moment the tool that
+    /// button and any open Changes viewer) the moment the tool that
     /// wrote the file finishes, without re-inferring completion from a card's
     /// rendered state. Written under the lock by `apply`, read-and-cleared by
     /// the session view model after each awaited fold (see

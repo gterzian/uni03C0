@@ -7,13 +7,10 @@ rules, sandbox constraints, commands, and paid-for gotchas — not a design doc.
 
 - Keep: an instruction, a constraint, a command, a non-obvious failure mode.
 - Cut: type-by-type descriptions, architecture narration, feature inventories,
-  "how it works" prose, test inventories, design rationale. The code and commit
-  messages are the source of truth for those.
-- Prefer one imperative line over a paragraph. Record history only when it
-  prevents a regression.
-- **Budget: keep this file under 300 lines.** Adding a section means deleting at
-  least as much stale text. If a change only makes the file longer, the
-  information belongs in a code comment or a commit message instead.
+  "how it works" prose, design rationale — the code and commits are the source.
+- Prefer one imperative line; record history only when it prevents a regression.
+- **Budget: under 300 lines.** Adding a section means deleting as much stale
+  text; if a change only makes the file longer, it belongs in a code comment.
 
 ---
 
@@ -30,12 +27,16 @@ history.
   `filter-branch` — anything that writes.
 - When the user asks to "commit", **suggest a commit message**; never run it.
 
-## Two properties every change must preserve
+## Three properties every change must preserve
 
 1. **Fast UI** — cost scales with *visible* rows, never context/message size;
    no full-CoreText work or synchronous re-measure on hot paths.
 2. **Sandbox fails closed** — default-deny policy, loopback proxy the only
    egress, denials never bypassed or hidden.
+3. **Render ahead of the viewport** — never render on demand for content the
+   reader can scroll to; keep a buffer rendered beyond the viewport and
+   prefetch compounding blocks (transcript rows, diff colors), so nothing is
+   rendered as it arrives on screen.
 
 ---
 
@@ -79,14 +80,12 @@ read-only mirror. **Never alter what pi records or sends for the same actions.**
 - A prompt is the user's text verbatim (only whitespace trimming, as the TUI
   does). No re-sends, retries, or duplicates; `ProcessController.send` writes
   each request exactly once.
-- Rendering caches (heights, expansion, fonts, diffs) are pure UI: never
-  serialized, sent, or written, and nothing derived from them may feed back into
-  what pi records.
+- Rendering caches (heights, expansion, fonts, diffs) are pure UI: never sent,
+  and nothing derived from them may feed back into what pi records.
 - One deliberate deviation: queued steering flushes as ONE combined prompt,
   appended in order — never re-sent, split, or reordered.
 
-When adding a feature ask: *does this change what pi would record or send?* If
-yes, find another way.
+Ask before a feature: does it change what pi records or sends? If yes, find another way.
 
 ## Naming
 
@@ -120,16 +119,14 @@ app is titled "uni03C0".
   module plus `swiftc`.
 - **CoordinatorTests:** `scripts/run-coordinator-tests.sh`
   (`TEST_FILTER=<substr>` for a subset).
-- `--disable-sandbox` is required because SPM otherwise evaluates the manifest
-  under its own `sandbox-exec`, which the policy denies. xcodebuild only works
-  from a terminal; if its package resolution fails inside the sandbox, run
-  `./run.sh` once in the terminal, then it succeeds in the sandbox.
+- `--disable-sandbox` is required (SPM's manifest `sandbox-exec` is denied).
+  xcodebuild works only from a terminal; if package resolution fails in the
+  sandbox, run `./run.sh` once in the terminal.
 
-Writing tests: RenderingTests are plain `XCTestCase` subclasses on the main
-actor; use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`. Keep the
-load-bearing invariant asserted: `TranscriptText.measuredHeight` must equal the
-cell's layout-manager height; pass the **same** parameters to `configure` and
-`measuredHeight`. Tests never spawn a real `pi` or hit a live model.
+Writing tests: use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`; keep
+`TranscriptText.measuredHeight` equal to the cell's layout-manager height (pass
+the **same** parameters to `configure` and `measuredHeight`). Tests never spawn a
+real `pi` or hit a live model.
 
 ---
 
@@ -184,17 +181,17 @@ cell's layout-manager height; pass the **same** parameters to `configure` and
 - **Never** use `paragraphSpacingBefore`/`paragraphSpacing` for block
   separation: on this SDK they inflate **every line fragment** of a multi-line
   paragraph (verified). `MarkdownText` uses explicit empty spacer lines.
-- **Soft breaks parse to a SPACE, not `\n`.** `AttributedString(markdown:)`
-  emits an intra-paragraph newline as a `.softBreak` run whose text is a space;
-  re-emit a real `\n` for soft and hard (`.lineBreak`) breaks, or multi-line
-  prose collapses.
-- **`AttributedString(markdown:)` has no table extension.** `MarkdownText`
-  detects GFM header + delimiter rows (never inside a fence) and renders
-  tab-stop-positioned lines inside the row's one attributed string, so the
-  measurement invariant holds. Use `NSTextTab`s at column edges (a right-aligned
-  stop lands text flush); space padding drifts, and a leading tab stop at 0 is
-  skipped, so add a leading tab only when column 1 is not left-aligned. Keep the
-  no-`|` fast path on the streaming hot path.
+- **Soft breaks parse to a SPACE, not `\n`.** `AttributedString(markdown:)` emits
+  an intra-paragraph newline as a `.softBreak` run whose text is a space; re-emit
+  a real `\n` for soft and hard (`.lineBreak`) breaks or multi-line prose collapses.
+- **`AttributedString(markdown:)` has no table extension.** `MarkdownText` detects
+  GFM header + delimiter rows (never inside a fence) and renders an `NSTextTable`
+  grid — one block per cell, content-proportional `contentWidth` percentages, and
+  the header hairline/tint from the block. NSTextTable sizes columns to the row
+  width at layout time, so the string stays width-independent and the measurement
+  invariant holds. Tab stops were the old approach and overflowed: a long cell
+  sized a stop past the viewport and shoved later columns onto their own lines.
+  Keep the no-`|` fast path on the streaming hot path.
 - **Row-height under-measure clips the TOP.** The text view is flipped but the
   row is not, so a too-tall text view overflows **upward**; and measuring at
   `tableView.bounds.width` (which includes the ~32pt scroller gutter) over-reports,
@@ -240,8 +237,8 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 
 - Replacing the whole text storage every batch instead of the append-only
   `applyAttributedString` delta.
-- Clearing the height cache on session switch — off-main pre-measure keeps the
-  tab switch free of synchronous re-measure.
+- Clearing the height cache on session switch, or pre-measuring rows already
+  cached for the same tag+width (a rebind re-offers the whole window).
 - Serving `heightOfRow` with a fresh full measure of growing text.
 - A streaming crossfade that doesn't settle to the built string's colors:
   superseded batches must be settled, the last step must restore the captured
@@ -256,43 +253,50 @@ Failed fixes (each saturated the main thread; do not re-introduce):
 
 ---
 
-## Session pages & file browser (do not break)
+## Session pages & the Changes viewer (do not break)
 
-Both pages stay mounted and swap by visibility; never rebuild the transcript to
-show Files. The session owns its `FileBrowserStore`; the view renders only
-visible rows.
+The conversation and Changes pages stay mounted and swap by visibility — never
+rebuild the transcript for Changes.
 
 Rules:
 
-- A page switch is a visibility flip (opacity + hit-testing), never a rebuild.
-  The transcript representable has **no `.id`** and is rebound; the Files view is
-  `.id`-keyed per tab (its state belongs to that tab).
-- The inactive page does zero work, gated by `pageActive` — no folding, no file
-  IO, no highlighting.
-- All file data comes from the store's `nonisolated` `FileTreeBuilder` off the
-  main thread; views never build trees/indexes or run git. Tree nodes are
-  **classes**, and the flattened list is memoized on (store version, expansion).
-- First-load auto-expand is capped; ancestor folders of every changed file are
-  always opened.
-- Row stats come from one batched two-pass `git diff --numstat`, never a diff per
-  file.
-- `pi-file://` links (`FileReferenceLink`) post a cwd-keyed `openFileReference`
-  notification; selection/reveal is store state. A reveal anchors the start line
-  at the viewport top, flashes the range, and leaves a persistent anchor; the
-  reference target travels with its reload task.
-- The vertical scroller doubles as an edit map (`EditMarkerScroller` /
-  `CodePaneEditMarkerScroller`); ticks mirror the overlay exactly.
-- The content pane renders the interleaved diff (removed lines inline in red),
-  not added-lines-only. Loading/chrome spinners are AppKit `SpinnerView`, never a
-  SwiftUI `ProgressView` in a mounted view.
+- A page switch is a visibility flip (opacity + hit-testing), never a rebuild:
+  transcript has **no `.id`** and is rebound; Changes is `.id`-keyed per tab.
+- The inactive page does zero work, gated by `pageActive` — no file IO, no diff
+  loading, no highlighting.
+- Changed files + stats via `GitStatus.classify`/`DiffLoader` against the turn
+  baseline (`beginTurn` pins `HEAD` when a prompt is sent), so a mid-turn
+  `git commit` never clears the viewer; only a new turn re-baselines. The store
+  advances only on `GitStatus.didChangeNotification` — a commit emits none.
+- The viewer is ONE `CodePaneContainer` (scroll view + code view + ruler +
+  edit-map scroller) over every file's diff in path order, each opened by a
+  header band. A file renders only its changed runs + 3 context lines
+  (`DiffPlan`, Core); each gap under 10 lines renders inline, larger gaps
+  collapse to ONE expand control revealing a compounding block from both edges
+  — never the contiguous first-change→last-change span. Built PLAIN off-main
+  (`DiffDocumentBuilder`);
+  `DiffHighlightPlan` prefetches `DiffHighlighter` colors past the viewport in
+  compounding blocks; `sizeThatFits` fills the slot and a copy tags the file.
+- Header bands paint full-width in `ReadOnlyCodeTextView.drawBackground`, never
+  a `.backgroundColor` attribute. The scroller IS the edit map
+  (`EditMarkerScroller`): green/red ticks at rendered changed-line fractions.
+- Cmd+Up / Cmd+Down jump between changed-line runs (`DiffEditCycler`, Core),
+  anchored at the viewport top like the transcript's user-message cycle.
+- A tab switch commits the selected-tab frame before the incoming session's
+  rebind: `Coordinator.beginSwitch(to:)` blanks a first visit behind an AppKit
+  spinner and defers `rebind` one run-loop turn.
+- Search (`CodeSearchModel`) scans the whole viewer buffer and re-runs on expansion.
+- `pi-file://` links reveal the file only when it is in the changeset (unchanged
+  → dead), at the named line; a pre-document reveal defers to the next build.
+- Diff egress is interleaved (removed inline in red); spinners are AppKit `SpinnerView`.
 - New `NSEvent` window monitors: use a NONISOLATED `@Sendable` closure handing
   off via `MainActor.assumeIsolated`; an inferred `@MainActor` closure crashes in
   `swift_getObjectType`.
 
 Failed fixes (do not re-introduce):
 
-- Value-type tree nodes flattened per row (deep-copied subtrees; ~800MB and
-  multi-second stalls).
-- Folding the listing / building the tree on the main thread.
-- A SwiftUI `List` (or a per-body flatten) over the expanded tree.
-- Rendering only added lines, so a deletion-only change looked uncolored.
+- Rebuilding the viewer document on every scroll tick/tab switch, or loading
+  diffs on main.
+- Coloring the visible range on demand (colors land after the content does), or
+  highlighting the whole diff on main; prefetch a window ahead instead.
+- `sizeToFit` without `allowsNonContiguousLayout`: full-document layout is seconds.
