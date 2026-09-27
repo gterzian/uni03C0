@@ -64,15 +64,15 @@ struct SessionContent: View {
                 // view can never inflate the page past its slot (belt to the
                 // `sizeThatFits` braces on the viewer).
                 GeometryReader { proxy in
-                    ChangesView(store: tab.changes, pageActive: tab.page == .changes)
+                    ChangesView(store: tab.changes, pageActive: tab.page == .changes, bottomInset: promptBarHeight)
                         .id(tab.id)
                         .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
                 }
                 // The Changes page owns its own floating diff header and a
-                // sidebar, so it sits BELOW the tab panel and above the floating
-                // prompt bar rather than under either.
+                // sidebar, so it sits BELOW the tab panel. It extends to the
+                // bottom edge (the diff document carries the prompt bar as a
+                // bottom inset) so the code bleeds under the floating bar.
                 .padding(.top, topInset)
-                .padding(.bottom, promptBarHeight)
                 .opacity(tab.page == .changes ? 1 : 0)
                 .allowsHitTesting(tab.page == .changes)
                 .accessibilityHidden(tab.page != .changes)
@@ -159,39 +159,80 @@ struct SessionContent: View {
                 onAbort: { Task { try? await vm.abort() } },
                 onContentHeightChange: { needed in
                     // Auto-grow with content until the user has pinned the
-                    // height with the resize handle. Always at least the
-                    // minimum, so a cleared prompt snaps back to a compact bar.
+                    // height with the resize handle. Grow only: a re-measure
+                    // when the input merely gains focus must never shrink the
+                    // bar; a cleared prompt snaps back to the compact minimum.
                     guard !tab.promptHeightIsCustom else { return }
-                    tab.promptHeight = PromptBarMetrics.clamp(max(needed, PromptBarMetrics.minHeight))
+                    if needed <= 0 {
+                        tab.promptHeight = PromptBarMetrics.minHeight
+                    } else {
+                        tab.promptHeight = PromptBarMetrics.clamp(
+                            max(tab.promptHeight, needed, PromptBarMetrics.minHeight)
+                        )
+                    }
                 }
             )
             .frame(height: tab.promptHeight)
+            // The composer's Liquid Glass surface, applied as a BACKGROUND so
+            // the focus system never treats the glass as the focused control
+            // (which adapted/scaled it when the input was clicked). Transparent
+            // with a strong system blur, so the transcript or diff behind it
+            // can't interfere with the text.
+            .background {
+                // `.regular`: strong enough that the transcript/diff behind
+                // can't interfere with the typed text, without the near-solid
+                // look of a tinted material.
+                Color.clear
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: WindowChrome.cornerRadius))
+            }
+            // The model / context / thinking readout, in its own glass pill at
+            // the composer's bottom-right. A separate view so a context-usage
+            // poll re-renders only the pill.
+            .overlay(alignment: .bottomTrailing) {
+                PromptStatusPill(vm: vm)
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 5)
+            }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-        }
-        // The cluster's glass surface: a material masked to fade out toward
-        // its top edge, so conversation text passing under it dissolves
-        // instead of meeting a hard edge (the hand-built scroll-edge effect
-        // AppKit does not provide).
-        .background {
-            Rectangle()
-                .fill(.regularMaterial)
-                .mask(
-                    LinearGradient(
-                        stops: [
-                            .init(color: .black, location: 0),
-                            .init(color: .black, location: 0.75),
-                            .init(color: .clear, location: 1),
-                        ],
-                        startPoint: .bottom,
-                        endPoint: .top
-                    )
-                )
         }
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(key: PromptBarHeightKey.self, value: proxy.size.height)
             }
+        }
+    }
+
+    /// The model / context / thinking readout at the composer's bottom-right,
+    /// in its own Liquid Glass pill. A separate view so a context-usage poll
+    /// re-renders only this pill, never the whole session body.
+    private struct PromptStatusPill: View {
+        let vm: SessionViewModel
+
+        var body: some View {
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .glassEffect(.regular, in: Capsule())
+                    .accessibilityLabel(text)
+            }
+        }
+
+        private var text: String {
+            var parts: [String] = []
+            if let percent = vm.contextUsage?.percent {
+                parts.append("ctx \(Int(percent.rounded()))%")
+            }
+            if let name = vm.model?.name ?? vm.model?.id {
+                parts.append(name)
+            }
+            if let level = vm.thinkingLevel {
+                parts.append(level)
+            }
+            return parts.joined(separator: " · ")
         }
     }
 
@@ -306,7 +347,9 @@ struct SessionContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .background(Color.red.opacity(0.08))
+        // Liquid Glass so the banner's text never fights the conversation/diff
+        // behind it; the red tint rides the glass instead of a flat fill.
+        .glassEffect(.regular.tint(.red.opacity(0.35)), in: RoundedRectangle(cornerRadius: 10))
     }
 
     /// Banner above the prompt bar while steering messages are queued: one
@@ -349,6 +392,7 @@ struct SessionContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

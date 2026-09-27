@@ -33,7 +33,6 @@
 		3619ABBCBC26300D95338CDF /* SandboxSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53E6C820CF5034AE8FF7D6AE /* SandboxSettingsView.swift */; };
 		377A78F57A80973F3B88FD9C /* ReadOnlyCodeTextView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4652B010CD5FE45320885615 /* ReadOnlyCodeTextView.swift */; };
 		377B63879619BEE7C5FB74D5 /* ToolCardExpansionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 382EA95199A6AB2ACEFF09CB /* ToolCardExpansionTests.swift */; };
-		3B6BFF381D6B0FEA68770F33 /* EditTick.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF597DEA1D6AB3473C65764D /* EditTick.swift */; };
 		3D61D43303B9566A4FC08ABB /* SyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7675CA8B8AF58E9930D3AE44 /* SyntaxHighlighter.swift */; };
 		3DD5EFBDB22331D3F8BB1749 /* Announcements.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B2C2B7F9B6B85FE912D2441 /* Announcements.swift */; };
 		44329294BDAA4BCF3B9F4E60 /* RowMeasurement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FD240102C73DEBC79325D4A /* RowMeasurement.swift */; };
@@ -341,7 +340,6 @@
 		D9B90831DDDFAC4742C0CC30 /* TranscriptCycler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptCycler.swift; sourceTree = "<group>"; };
 		D9F3C6A5785814142A50ED3F /* DiffLoading.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiffLoading.swift; sourceTree = "<group>"; };
 		DD2E0E1238AD9B7245123060 /* TranscriptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptView.swift; sourceTree = "<group>"; };
-		DF597DEA1D6AB3473C65764D /* EditTick.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditTick.swift; sourceTree = "<group>"; };
 		E00A41C3109873692C0F0B82 /* TextRowViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextRowViewTests.swift; sourceTree = "<group>"; };
 		E4BD9FDA171935C600EF3AC9 /* StreamingFadeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamingFadeTests.swift; sourceTree = "<group>"; };
 		E512CEE54BE52B85E61D96FD /* SandboxSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SandboxSettings.swift; sourceTree = "<group>"; };
@@ -664,7 +662,6 @@
 				BF253680189735DC77DF05CB /* ChangesStore.swift */,
 				4C1906C50E8F94D3B499793E /* CodeSearchModel.swift */,
 				D9F3C6A5785814142A50ED3F /* DiffLoading.swift */,
-				DF597DEA1D6AB3473C65764D /* EditTick.swift */,
 				C06D3D3454A4ACFE68639AB6 /* FontSettings.swift */,
 				E5E874A878E044EBBA8E03F5 /* SandboxSettingsModel.swift */,
 				A975E19AE806AF8AE1BE9654 /* SessionTab.swift */,
@@ -1057,7 +1054,6 @@
 				5C446BAB4271898E7636BEE8 /* DiffBrowserView.swift in Sources */,
 				882C49BE5D4AD98B77E00CC9 /* DiffLoading.swift in Sources */,
 				179805BBBDFCB5F0D2181019 /* DisplayOptions.swift in Sources */,
-				3B6BFF381D6B0FEA68770F33 /* EditTick.swift in Sources */,
 				A0894F05B44AA2AC9A362A77 /* FontSettings.swift in Sources */,
 				EDE3362C53404D1D0AAD8EB7 /* MainWindowView.swift in Sources */,
 				343957A1FF02F25818E72854 /* MarkdownText.swift in Sources */,

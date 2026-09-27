@@ -57,13 +57,6 @@ final class ChangesStore {
     @ObservationIgnored private var cachedDocument: DiffDocument?
     @ObservationIgnored private var cachedDocumentVersion = -1
 
-    /// The document's edit-map ticks, keyed to a fraction of the document
-    /// height and published so the Changes sidebar can reuse the viewer's own
-    /// change density as a non-textual bleed-through signal (the code text
-    /// itself stays opaque). Derived from the built document, so there is no
-    /// second diff pass.
-    private(set) var editTicks: [EditTick] = []
-
     // MARK: The loaded diffs (off-main data, read by the document builder)
 
     @ObservationIgnored private(set) var diffs: [String: LoadedFileDiff] = [:]
@@ -262,29 +255,6 @@ final class ChangesStore {
     func cacheBuiltDocument(_ document: DiffDocument, version: Int) {
         cachedDocument = document
         cachedDocumentVersion = version
-        editTicks = Self.ticks(from: document)
-    }
-
-    /// Flattens the built document's markers + per-line fractions into one
-    /// ascending `[EditTick]` for the sidebar rail. `added`/`removed` are
-    /// sorted, so this is a merge, not a sort of a huge changeset.
-    private static func ticks(from document: DiffDocument) -> [EditTick] {
-        guard case .lines(let added, let removed) = document.markers else { return [] }
-        let fractions = document.markerFractions
-        var result: [EditTick] = []
-        result.reserveCapacity(added.count + removed.count)
-        var i = 0, j = 0
-        while i < added.count || j < removed.count {
-            let takeAdded: Bool
-            if j >= removed.count { takeAdded = true }
-            else if i >= added.count { takeAdded = false }
-            else { takeAdded = added[i] <= removed[j] }
-            let line = takeAdded ? added[i] : removed[j]
-            if takeAdded { i += 1 } else { j += 1 }
-            guard line >= 1, line - 1 < fractions.count else { continue }
-            result.append(EditTick(fraction: fractions[line - 1], kind: takeAdded ? .added : .removed))
-        }
-        return result
     }
 
     /// The cached document when it matches `version`, else nil (the viewer

@@ -22,6 +22,14 @@ struct ChangesView: View {
 
     /// Find-in-diff state for the whole viewer (Cmd+F).
     @State private var search = CodeSearchModel()
+    /// Whether the floating file list is open. CLOSED by default: the diff is
+    /// the page, and the list floats over it only while navigating.
+    @State private var showSidebar = false
+    /// The floating sidebar width.
+    private let sidebarWidth: CGFloat = 280
+    /// Height of the floating prompt cluster below the diff viewer: the diff
+    /// document's bottom inset, so its last lines scroll above the bar.
+    var bottomInset: CGFloat = 0
     /// Respect Reduce Motion: the scroll-spy bridge animates the sidebar
     /// highlight, which must become an instant jump when motion is reduced.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -36,18 +44,22 @@ struct ChangesView: View {
     @State private var headerHeight: CGFloat = 0
 
     var body: some View {
-        NavigationSplitView {
-            changedList
-                .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 420)
-        } detail: {
+        // One full-bleed diff. The file list is not a split-view column: it
+        // floats ABOVE the diff while open, so the diff is always the whole
+        // page and closing the list reveals the full width.
+        ZStack(alignment: .topLeading) {
             diffArea
+            if showSidebar {
+                GeometryReader { proxy in
+                    changedList
+                        .frame(width: sidebarWidth, height: max(0, proxy.size.height - 16))
+                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+                        .padding(8)
+                }
+                .transition(.move(edge: .leading).combined(with: .opacity))
+            }
         }
-        .navigationSplitViewStyle(.balanced)
-        // The Changes page stays mounted while the conversation is shown, so
-        // the split view's automatic sidebar-toggle toolbar item would leak
-        // onto the conversation page. The sidebar is always visible (drag its
-        // divider to resize), so the toggle is not needed.
-        .toolbar(removing: .sidebarToggle)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showSidebar)
         .onAppear { reconcileSelection() }
         .onChange(of: pageActive) { _, active in
             if active { reconcileSelection() }
@@ -96,12 +108,13 @@ struct ChangesView: View {
             } else {
                 ScrollViewReader { proxy in
                     // A real sidebar `List`: the platform's own selection
-                    // highlight and Liquid Glass sidebar material, instead of
-                    // a fixed-width column with a hand-picked opacity fill.
+                    // highlight and Liquid Glass sidebar material.
                     List(store.entries, id: \.path, selection: $listSelection) { entry in
                         fileRow(entry)
                     }
                     .listStyle(.sidebar)
+                    .scrollContentBackground(.hidden)
+                    .tint(Color.secondary)
                     // The scroll spy moves the highlight as the user scrolls
                     // the viewer: keep the row visible, and mirror the spy's
                     // choice into the local selection without requesting a
@@ -129,14 +142,6 @@ struct ChangesView: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             listHeader
-            Divider()
-        }
-        // The rail is the viewer's own edit-map data reused as a glanceable,
-        // non-textual signal toward the sidebar — the code text stays opaque.
-        .overlay(alignment: .trailing) {
-            EditDensityRail(ticks: store.editTicks)
-                .frame(width: 3)
-                .allowsHitTesting(false)
         }
     }
 
@@ -199,7 +204,7 @@ struct ChangesView: View {
     // MARK: - Diff viewer
 
     private var diffArea: some View {
-        ZStack(alignment: .top) {
+        ZStack(alignment: .topLeading) {
             if store.entries.isEmpty {
                 ContentUnavailableView(
                     "No changes",
@@ -217,16 +222,17 @@ struct ChangesView: View {
                     onTopSectionChanged: { store.setTopSection($0) },
                     pageActive: pageActive,
                     topInset: headerHeight,
+                    bottomInset: bottomInset,
                     search: search
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            // The header FLOATS over the document instead of pushing it down:
-            // the document's top content inset is the measured header height,
-            // so the first line reaches the top of the pane and scrolls under
-            // the glass, softened by the material's fading bottom edge.
-            viewerHeader
-                .background(headerBackground)
+            // Floating pills replace the old full-width header bar: the sidebar
+            // toggle and the file title float over the document like the tab
+            // pills do, with no painted band behind them. Shifted clear of the
+            // floating file list while it is open.
+            floatingDiffHeader
+                .padding(.leading, showSidebar ? sidebarWidth + 16 : 0)
                 .background {
                     GeometryReader { proxy in
                         Color.clear.preference(key: ViewerHeaderHeightKey.self, value: proxy.size.height)
@@ -247,57 +253,56 @@ struct ChangesView: View {
         }
     }
 
-    /// The floating header's surface: the Liquid Glass material masked to fade
-    /// out over its last ~18%, so text passing under it dissolves instead of
-    /// meeting a hard edge — the hand-built scroll-edge effect an AppKit
-    /// document cannot get from the system.
-    private var headerBackground: some View {
-        Rectangle()
-            .fill(.regularMaterial)
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black, location: 0.82),
-                        .init(color: .clear, location: 1),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-    }
+    /// The diff panel's floating chrome: the sidebar toggle plus the selected
+    /// file's title (and position in the changeset), each a glass pill over the
+    /// code — no full-width bar.
+    private var floatingDiffHeader: some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                    showSidebar.toggle()
+                }
+            } label: {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.glass)
+            .help(showSidebar ? "Hide the file list" : "Show the file list")
+            .accessibilityLabel("Toggle the changed-files sidebar")
 
-    private var viewerHeader: some View {
-        HStack(spacing: 8) {
             if let selected = store.selectedPath {
                 // The title IS the open-in-default-app affordance: the viewer
                 // shows a diff window, so the title hands the whole file to an
                 // editor. Plain text for a deleted file (nothing on disk).
-                if store.canOpenInDefaultApp(selected) {
-                    FileTitleLink(path: selected) { store.openInDefaultApp(selected) }
-                } else {
-                    Text(selected)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                Group {
+                    if store.canOpenInDefaultApp(selected) {
+                        FileTitleLink(path: selected) { store.openInDefaultApp(selected) }
+                    } else {
+                        Text(selected)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .glassEffect(.regular, in: Capsule())
+
                 if let index = store.entries.firstIndex(where: { $0.path == selected }) {
                     Text("\(index + 1) of \(store.entries.count)")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .glassEffect(.regular, in: Capsule())
                         .accessibilityLabel("File \(index + 1) of \(store.entries.count)")
                 }
-            } else {
-                Text("Changes")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 9)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
     }
 
     // MARK: - Shared bits
@@ -372,31 +377,6 @@ private struct FileTitleLink: View {
         .help("Open \(path) in the default application")
         .accessibilityAddTraits(.isLink)
         .accessibilityLabel("Open \(path) in the default application")
-    }
-}
-
-/// The sidebar's edit-density rail: the diff viewer's own edit-map ticks reused
-/// as a thin, glanceable strip along the sidebar's trailing edge. Purely
-/// decorative and non-textual — the code content stays opaque — and drawn with
-/// `Canvas` so a large changeset paints in one pass instead of one view per
-/// tick.
-private struct EditDensityRail: View {
-    let ticks: [EditTick]
-
-    var body: some View {
-        Canvas { context, size in
-            guard !ticks.isEmpty, size.height > 0 else { return }
-            let width = size.width
-            for tick in ticks {
-                let y = min(max(tick.fraction, 0), 1) * size.height
-                let color: Color = tick.kind == .added ? .green : .red
-                context.fill(
-                    Path(CGRect(x: 0, y: y, width: width, height: 1.5)),
-                    with: .color(color.opacity(0.55))
-                )
-            }
-        }
-        .accessibilityHidden(true)
     }
 }
 

@@ -29,9 +29,9 @@ struct SessionTabsView: View {
     }
 
     var body: some View {
-        // The tab panel FLOATS over the session content: content scrolls
-        // under its glass and fades against its masked bottom edge, instead
-        // of being pushed down by a solid row.
+        // The tab panel FLOATS over the session content: the pills carry their
+        // own Liquid Glass, and the content scrolls under them (no painted
+        // bar, per Apple's "reduce custom backgrounds in navigation").
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
                 if let active = activeTab {
@@ -40,7 +40,6 @@ struct SessionTabsView: View {
                 tabShortcuts
             }
             tabPanel
-                .background(tabPanelBackground)
                 .background {
                     GeometryReader { proxy in
                         Color.clear.preference(key: TabPanelHeightKey.self, value: proxy.size.height)
@@ -48,6 +47,10 @@ struct SessionTabsView: View {
                 }
         }
         .onPreferenceChange(TabPanelHeightKey.self) { tabPanelHeight = $0 }
+        // The split view's automatic sidebar toggle lives in the window
+        // toolbar; remove it and keep the toggle in the diff panel's own
+        // floating chrome instead.
+        .toolbar(removing: .sidebarToggle)
         .navigationTitle(activeTab?.cwd.lastPathComponent ?? "uni03C0")
         .toolbar {
             if let active = activeTab {
@@ -161,37 +164,20 @@ struct SessionTabsView: View {
     /// active pill, shares the panel's background, and disappears when another
     /// session tab is selected (each session keeps its own page choice).
     private var tabPanel: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             // One shared glass container batches the pills' effects and makes
             // the selection morph coherent (Apple's performance note on
             // combining custom glass effects).
             GlassEffectContainer(spacing: 8) {
                 outerTabBar
+                    .padding(.horizontal, 10)
+                    .padding(.top, 6)
             }
             if let active = activeTab {
                 nestedPageTabs(active)
             }
         }
-    }
-
-    /// The floating tab panel's surface: the Liquid Glass material masked to
-    /// fade out over its last ~25%, so conversation text passing under it
-    /// dissolves instead of meeting a hard edge — the hand-built scroll-edge
-    /// effect AppKit does not give us.
-    private var tabPanelBackground: some View {
-        Rectangle()
-            .fill(.regularMaterial)
-            .mask(
-                LinearGradient(
-                    stops: [
-                        .init(color: .black, location: 0),
-                        .init(color: .black, location: 0.75),
-                        .init(color: .clear, location: 1),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var outerTabBar: some View {
@@ -209,10 +195,14 @@ struct SessionTabsView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Start a new session in another folder")
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        // One liquid group: a low-blur capsule that gathers the small pills
+        // into a single, findable unit. It is sized to its content — never a
+        // full-width bar — and the pills keep their own (stronger) glass.
+        .fixedSize()
+        .glassEffect(.clear, in: Capsule())
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under
@@ -224,20 +214,41 @@ struct SessionTabsView: View {
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
         @Bindable var tab = tab
         return HStack(spacing: 8) {
-            Picker("Page", selection: $tab.page) {
-                Text("Session")
-                    .tag(SessionPage.conversation)
-                Text(changesTitle(tab.gitChangeCount))
-                    .tag(SessionPage.changes)
+            // A neutral glass segmented control: the native segmented picker
+            // paints its selection in the system accent (too loud here), so
+            // this keeps the same floating-pill language as the tabs and marks
+            // the selected segment with a quiet primary tint instead.
+            HStack(spacing: 0) {
+                pageTab("Session", selected: tab.page == .conversation) {
+                    tab.page = .conversation
+                }
+                pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
+                    tab.page = .changes
+                }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .help("Switch between the conversation and this session's uncommitted changes")
+            .padding(2)
+            .glassEffect(.regular, in: Capsule())
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
+    }
+
+    /// One segment of the Session/Changes switch. Neutral by design: a
+    /// primary-tint fill marks the selection instead of the accent colour.
+    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .accessibilityLabel(title)
     }
 
     /// The Changes segment's title, carrying the edited-file count when there
@@ -262,9 +273,10 @@ struct SessionTabsView: View {
                     statusIcon(tab)
                     Image(systemName: "folder")
                         .font(.system(size: 11))
-                        .foregroundStyle(.blue)
+                        .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
                     Text(tab.cwd.lastPathComponent)
-                        .font(.system(size: 12))
+                        .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                        .foregroundStyle(isActive ? Color.primary : Color.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -288,7 +300,10 @@ struct SessionTabsView: View {
         .padding(.leading, 10)
         .padding(.trailing, tabs.count > 1 ? 6 : 10)
         .padding(.vertical, 4)
-        .glassEffect(isActive ? .regular.tint(.accentColor) : .regular, in: Capsule())
+        // Liquid Glass behind EVERY tab (active and inactive) so the pills stay
+        // legible over scrolling content; the active one carries only a faint
+        // accent tint, not a solid fill.
+        .glassEffect(isActive ? .regular.tint(Color.accentColor.opacity(0.12)) : .regular, in: Capsule())
         .glassEffectID(tab.id, in: glassNamespace)
         .contentShape(Rectangle())
         .onTapGesture { activeID = tab.id }

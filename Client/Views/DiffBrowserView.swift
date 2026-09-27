@@ -119,6 +119,10 @@ struct DiffBrowserView: NSViewRepresentable {
     /// The floating header height the document scrolls under (Liquid Glass
     /// content-under-chrome). Zero when there is no floating chrome.
     var topInset: CGFloat = 0
+    /// The floating prompt cluster height below the diff pane: the document's
+    /// bottom inset, so its last lines scroll above the bar while the code
+    /// still bleeds under it.
+    var bottomInset: CGFloat = 0
     /// The page's find-in-buffer model.
     var search: (any CodeSearching)? = nil
 
@@ -128,7 +132,7 @@ struct DiffBrowserView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> CodePaneContainer {
         let container = CodePaneContainer()
-        container.setTopInset(topInset)
+        container.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.container = container
         container.onAppearanceChange = { [weak coordinator = context.coordinator] in
             coordinator?.appearanceChanged()
@@ -146,7 +150,7 @@ struct DiffBrowserView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: CodePaneContainer, context: Context) {
-        nsView.setTopInset(topInset)
+        nsView.setContentInsets(top: topInset, bottom: bottomInset)
         context.coordinator.setActive(pageActive)
         context.coordinator.setSearch(search)
         context.coordinator.update(

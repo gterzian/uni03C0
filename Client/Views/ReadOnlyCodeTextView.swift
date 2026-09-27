@@ -50,15 +50,6 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the reader mid-scroll. While this is set the view refuses
     /// every height change (see `setFrameSize`). nil = the view sizes itself.
     private(set) var fixedContentHeight: CGFloat?
-    /// The buffer's own laid-out height (text-container insets excluded),
-    /// remembered from `load(contentHeight:)` so a later top-padding change can
-    /// re-pin the document height exactly.
-    private(set) var baseContentHeight: CGFloat?
-    /// Extra blank space at the TOP of the buffer, for content that scrolls under
-    /// floating chrome: the clip view spans the full pane, and only the document
-    /// is padded, so the first line starts below the chrome and scrolls up under
-    /// it (a scroll-view content inset would clip instead of bleed).
-    private(set) var topPadding: CGFloat = 0
     /// For an interleaved diff buffer, the REAL current-file line number of
     /// each 1-based DISPLAY line (`nil` for a removed line, which is old-side
     /// content). nil → the buffer is the real file and display line == real
@@ -181,7 +172,6 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the fading fill (see `startReveal`).
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        drawHeaderBands(in: rect)
         if let anchorRect = revealAnchorRect {
             Self.revealColor.withAlphaComponent(0.6).setFill()
             NSRect(x: 0, y: anchorRect.minY, width: 3, height: max(anchorRect.height, 1)).fill()
@@ -300,32 +290,12 @@ final class ReadOnlyCodeTextView: NSTextView {
         }
         // Pin the height BEFORE sizing, so `sizeToFit` may still fit the width
         // but can never install TextKit's lazy estimate as the document height.
-        baseContentHeight = contentHeight
         let pinnedHeight = contentHeight.map { $0 + textContainerInset.height * 2 }
         fixedContentHeight = pinnedHeight
         sizeToFit()
         if let pinnedHeight { setFrameSize(NSSize(width: frame.width, height: pinnedHeight)) }
         // New file: show the top.
         scrollRangeToVisible(NSRange(location: 0, length: 0))
-    }
-
-    /// Sets the blank space at the top of the buffer for floating chrome the
-    /// document scrolls under. Applied as document padding (not a scroll-view
-    /// inset) so the clip view still spans the full pane and content bleeds
-    /// under the chrome; re-pins the document height when a known content
-    /// height exists.
-    func setTopPadding(_ extra: CGFloat) {
-        let clamped = max(0, extra)
-        guard abs(clamped - topPadding) > 0.5 else { return }
-        let baseInset = textContainerInset.height - topPadding
-        topPadding = clamped
-        textContainerInset = NSSize(width: textContainerInset.width, height: baseInset + clamped)
-        if let baseContentHeight {
-            let pinned = baseContentHeight + textContainerInset.height * 2
-            fixedContentHeight = pinned
-            setFrameSize(NSSize(width: frame.width, height: pinned))
-        }
-        needsDisplay = true
     }
 
     /// Keeps a caller-supplied exact height (`load(contentHeight:)`) even as
@@ -377,53 +347,14 @@ final class ReadOnlyCodeTextView: NSTextView {
         sectionPaths = paths
     }
 
-    /// The 1-based display lines carrying a file header band. Drawn here as a
-    /// full-width fill UNDER the glyphs (a background color attribute would
-    /// only span the text's own width), so a scroll reads as clearly separated
-    /// per-file sections. Set with the document; empty clears the bands.
+    /// The 1-based display lines carrying a file header band. Kept as data (the
+    /// diff starts each file with a header line whose bold path already
+    /// separates sections), but no band is painted: Liquid Glass keeps the
+    /// surface flat rather than layering grey bars over the code.
     private(set) var headerLines: [Int] = []
 
     func setHeaderLines(_ lines: [Int]) {
         headerLines = lines
-        needsDisplay = true
-    }
-
-    /// Paints a subtle band and a hairline rule behind each visible header
-    /// line. Only lines intersecting the dirty rect are touched, and each band
-    /// spans the viewport (never just the header text's width), so the
-    /// separator reads even for a short path in a wide window.
-    private func drawHeaderBands(in rect: NSRect) {
-        guard !headerLines.isEmpty, let layoutManager, let textContainer else { return }
-        let length = (string as NSString).length
-        guard length > 0 else { return }
-        let inset = textContainerInset
-        // The characters intersecting the dirty rect. Restricting the layout
-        // queries to them keeps a changeset with hundreds of files from
-        // locating every header band on every repaint — only the headers the
-        // pass could actually paint are looked up.
-        let containerRect = NSRect(
-            x: rect.minX - inset.width,
-            y: rect.minY - inset.height,
-            width: max(rect.width, 1),
-            height: max(rect.height, 1)
-        )
-        let visibleGlyphs = layoutManager.glyphRange(forBoundingRect: containerRect, in: textContainer)
-        guard visibleGlyphs.length > 0 else { return }
-        let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
-        let bandWidth = max(bounds.width, enclosingScrollView?.contentSize.width ?? bounds.width)
-        for line in headerLines {
-            guard line >= 1, line - 1 < lineStartOffsets.count else { continue }
-            let charIndex = lineStartOffsets[line - 1]
-            guard charIndex < length, NSLocationInRange(charIndex, visibleChars) else { continue }
-            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
-            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-            let y = fragment.minY + inset.height
-            guard y < rect.maxY, y + fragment.height > rect.minY else { continue }
-            NSColor.labelColor.withAlphaComponent(0.10).setFill()
-            NSRect(x: 0, y: y, width: bandWidth, height: fragment.height).fill()
-            NSColor.separatorColor.setFill()
-            NSRect(x: 0, y: y, width: bandWidth, height: 1).fill()
-        }
     }
 
     /// The file section owning a character index, with its diff-character
@@ -756,6 +687,16 @@ final class CodeLineRulerView: NSRulerView {
 
     @objc private func gutterSourceChanged(_ notification: Notification) {
         needsDisplay = true
+    }
+
+    /// Draws only the numbers: skips `NSRulerView`'s default background and the
+    /// separator hairline at the content edge, which read as a grey line
+    /// against the flat diff surface. The ruler's own area is filled with the
+    /// code background so nothing ghosts between frames.
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.textBackgroundColor.setFill()
+        dirtyRect.fill()
+        drawHashMarksAndLabels(in: dirtyRect)
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {

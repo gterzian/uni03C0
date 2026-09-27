@@ -106,11 +106,12 @@ final class CodePaneContainer: NSView {
     var onLinkClick: ((URL) -> Void)?
     /// The sections of the current document, in document order.
     private(set) var sections: [CodeSection] = []
-    /// The floating chrome height the document scrolls UNDER (the Changes
-    /// viewer's header): document top padding so the first line can reach the
-    /// top of the pane and scroll under the translucent header instead of
-    /// stopping below it.
+    /// The floating chrome the document scrolls UNDER: the header above (top)
+    /// and the prompt cluster below (bottom). Applied as `NSScrollView`
+    /// content insets on the flipped text view, so the document spans the full
+    /// pane and bleeds under the chrome while still scrolling clear of it.
     private(set) var contentTopInset: CGFloat = 0
+    private(set) var contentBottomInset: CGFloat = 0
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -141,26 +142,28 @@ final class CodePaneContainer: NSView {
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         codeView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         codeView.textColor = .labelColor
         codeView.textContainerInset = NSSize(width: 8, height: 6)
-        // No wrapping: the viewer shows real diff lines, which keeps the
-        // ruler's uniform line-height math exact.
-        codeView.textContainer?.widthTracksTextView = false
-        codeView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        // Soft-wrap: the diff always fits the pane's width (no lateral
+        // scrolling), so long diff lines flow onto the next row instead of
+        // widening the document. The ruler still numbers only the first
+        // fragment of a wrapped logical line.
+        codeView.textContainer?.widthTracksTextView = true
+        codeView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         codeView.isVerticallyResizable = true
-        codeView.isHorizontallyResizable = true
+        codeView.isHorizontallyResizable = false
         codeView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        codeView.autoresizingMask = []
+        codeView.autoresizingMask = [.width]
         // A large changeset's document must stay lazily laid out: with
         // non-contiguous layout `sizeToFit` no longer forces a full-document
         // pass (which cost seconds at 100k+ lines) and TextKit lays out the
         // visible band on demand, the same lazy model the ruler already uses.
-        codeView.layoutManager?.allowsNonContiguousLayout = true
+        codeView.layoutManager?.allowsNonContiguousLayout = false
         codeView.onLinkClick = { [weak self] url in self?.onLinkClick?(url) }
         scrollView.documentView = codeView
 
@@ -239,7 +242,10 @@ final class CodePaneContainer: NSView {
         (scrollView.verticalRulerView as? CodeLineRulerView)?.anchorLine = nil
         self.sections = sections
 
-        codeView.load(path: path, text: text, lineNumbers: lineNumbers, gutterLineNumbers: gutterLineNumbers, lineStartOffsets: lineStartOffsets, contentHeight: contentHeight)
+        // Soft-wrapping means the builder's unwrapped content height no longer
+        // matches: leave the height to the layout manager (a pinned frame would
+        // clip the wrapped rows).
+        codeView.load(path: path, text: text, lineNumbers: lineNumbers, gutterLineNumbers: gutterLineNumbers, lineStartOffsets: lineStartOffsets, contentHeight: nil)
         // The document is every file's diff in one buffer: each file's diff
         // lines map to that file's canonical absolute path, so a copy inside
         // the diff tags a reference to the FILE (never to "the diff").
@@ -267,15 +273,19 @@ final class CodePaneContainer: NSView {
         busyIndicator.isHidden = !busy
     }
 
-    /// Sets the floating chrome height the document scrolls under. Applied as
-    /// document top padding (not a scroll-view inset, which would clip content
-    /// at the chrome edge instead of letting it bleed underneath), so the ruler
-    /// and the edit-map math keep working off the same layout geometry.
-    func setTopInset(_ inset: CGFloat) {
-        let clamped = max(0, inset)
-        guard abs(clamped - contentTopInset) > 0.5 else { return }
-        contentTopInset = clamped
-        codeView.setTopPadding(clamped)
+    /// Sets the floating chrome the diff document scrolls under: the header
+    /// above, the prompt cluster below. `NSScrollView.contentInsets` on the
+    /// flipped code view adds scrollable margin while the clip view still
+    /// spans the pane, so code genuinely bleeds under the chrome instead of
+    /// being clipped at its edge.
+    func setContentInsets(top: CGFloat, bottom: CGFloat) {
+        let top = max(0, top)
+        let bottom = max(0, bottom)
+        guard abs(top - contentTopInset) > 0.5 || abs(bottom - contentBottomInset) > 0.5 else { return }
+        contentTopInset = top
+        contentBottomInset = bottom
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
     }
 
     /// Centered status text (loading / no changed files / unreadable) over a
@@ -308,7 +318,7 @@ final class CodePaneContainer: NSView {
         let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
         let topInCodeView = fragment.minY + codeView.textContainerInset.height - offset
         let clipY = clipView.convert(NSPoint(x: 0, y: topInCodeView), from: codeView).y
-        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: max(0, clipY)))
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: max(-contentTopInset, clipY)))
         scrollView.reflectScrolledClipView(clipView)
     }
 
@@ -326,19 +336,19 @@ final class CodePaneContainer: NSView {
             NSPoint(x: 0, y: box.midY + codeView.textContainerInset.height),
             from: codeView
         ).y
-        let target = max(0, matchCenterInClip - clipView.bounds.height / 2)
+        let target = max(-contentTopInset, matchCenterInClip - clipView.bounds.height / 2)
         clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: target))
         scrollView.reflectScrolledClipView(clipView)
     }
 
     func scrollToTop() {
-        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: 0))
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: -contentTopInset))
         scrollView.reflectScrolledClipView(clipView)
     }
 
     /// Scrolls to the end of the document (the last edit-cycle fallback).
     func scrollToBottom() {
-        let maxY = max(0, codeView.frame.height - clipView.bounds.height)
+        let maxY = max(-contentTopInset, codeView.frame.height + contentBottomInset - clipView.bounds.height)
         clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: maxY))
         scrollView.reflectScrolledClipView(clipView)
     }
