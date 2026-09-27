@@ -22,10 +22,21 @@ enum PromptBarMetrics {
 /// owns the toolbar.
 struct SessionContent: View {
     @Bindable var tab: SessionTab
+    /// Height of the floating tab panel above this content. The conversation
+    /// transcript insets by it so rows scroll under the glass; the Changes
+    /// page (a split view with its own sidebar and header) is pushed below it.
+    var topInset: CGFloat = 0
+    /// The measured height of the floating prompt cluster (banners + resize
+    /// handle + input): the transcript's bottom content inset and the Changes
+    /// page's bottom padding.
+    @State private var promptBarHeight: CGFloat = 0
 
     var body: some View {
         let vm = tab.viewModel
-        VStack(spacing: 0) {
+        // The pages fill the whole content area; the prompt cluster FLOATS
+        // over their bottom edge (content scrolls and bleeds under it) instead
+        // of stacking below and shrinking the transcript's frame.
+        ZStack(alignment: .bottom) {
             // Two pages stay mounted so switching between them is a pure
             // visibility flip, never a rebuild:
             //  - The transcript must NOT be torn down on a page switch: a
@@ -57,58 +68,20 @@ struct SessionContent: View {
                         .id(tab.id)
                         .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
                 }
+                // The Changes page owns its own floating diff header and a
+                // sidebar, so it sits BELOW the tab panel and above the floating
+                // prompt bar rather than under either.
+                .padding(.top, topInset)
+                .padding(.bottom, promptBarHeight)
                 .opacity(tab.page == .changes ? 1 : 0)
                 .allowsHitTesting(tab.page == .changes)
                 .accessibilityHidden(tab.page != .changes)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            Divider()
-
-            // Error surfacing: a disconnected agent or the last send failure
-            // (auth/preflight/network) — never silently swallowed.
-            if case .disconnected(let message) = vm.connectionState {
-                errorBanner("Disconnected: \(message)", dismiss: nil)
-            } else if let error = vm.lastError {
-                errorBanner(error, dismiss: { vm.lastError = nil })
-            }
-
-            if vm.hasQueuedSteering {
-                queuedSteeringBar(vm)
-            }
-
-            // The resize handle pins the height (and disables auto-grow);
-            // until then the input grows with its content, clamped by
-            // PromptBarMetrics.
-            PromptResizeHandle(
-                currentHeight: tab.promptHeight,
-                onBegan: { tab.promptHeightIsCustom = true },
-                onResize: { tab.promptHeight = PromptBarMetrics.clamp($0) }
-            )
-
-            PromptInputView(
-                cwd: tab.cwd,
-                sessionID: tab.id,
-                isEnabled: inputEnabled(vm),
-                fontSize: FontSettings.shared.bodySize,
-                viewModel: vm,
-                draft: tab.promptDraft,
-                restoreRequest: tab.restoreRequest,
-                onRestoreConsumed: { tab.restoreRequest = nil },
-                onDraftChange: { tab.promptDraft = $0 },
-                onSubmit: submit,
-                onAbort: { Task { try? await vm.abort() } },
-                onContentHeightChange: { needed in
-                    // Auto-grow with content until the user has pinned the
-                    // height with the resize handle. Always at least the
-                    // minimum, so a cleared prompt snaps back to a compact bar.
-                    guard !tab.promptHeightIsCustom else { return }
-                    tab.promptHeight = PromptBarMetrics.clamp(max(needed, PromptBarMetrics.minHeight))
-                }
-            )
-            .frame(height: tab.promptHeight)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            floatingPromptBar(vm)
         }
+        .onPreferenceChange(PromptBarHeightKey.self) { promptBarHeight = $0 }
         .sheet(isPresented: $tab.showingHistory) {
             SessionHistorySheet(cwd: tab.cwd, viewModel: vm)
         }
@@ -142,6 +115,86 @@ struct SessionContent: View {
         }
     }
 
+    /// The floating prompt cluster: banners, the resize handle, and the input
+    /// as ONE glass surface pinned to the content's bottom edge. Content
+    /// scrolls/bleeds under its masked top; the transcript's bottom inset is
+    /// its measured height, so nothing important hides behind it.
+    private func floatingPromptBar(_ vm: SessionViewModel) -> some View {
+        VStack(spacing: 0) {
+            // Error surfacing: a disconnected agent or the last send failure
+            // (auth/preflight/network) — never silently swallowed. As an
+            // overlay in the floating cluster it no longer resizes the
+            // transcript's frame on every appear/disappear.
+            if case .disconnected(let message) = vm.connectionState {
+                errorBanner("Disconnected: \(message)", dismiss: nil)
+            } else if let error = vm.lastError {
+                errorBanner(error, dismiss: { vm.lastError = nil })
+            }
+
+            if vm.hasQueuedSteering {
+                queuedSteeringBar(vm)
+            }
+
+            // The resize handle pins the height (and disables auto-grow);
+            // until then the input grows with its content, clamped by
+            // PromptBarMetrics. It floats as part of the cluster rather than
+            // sitting as a separate hairline strip above the input.
+            PromptResizeHandle(
+                currentHeight: tab.promptHeight,
+                onBegan: { tab.promptHeightIsCustom = true },
+                onResize: { tab.promptHeight = PromptBarMetrics.clamp($0) }
+            )
+
+            PromptInputView(
+                cwd: tab.cwd,
+                sessionID: tab.id,
+                isEnabled: inputEnabled(vm),
+                fontSize: FontSettings.shared.bodySize,
+                viewModel: vm,
+                draft: tab.promptDraft,
+                restoreRequest: tab.restoreRequest,
+                onRestoreConsumed: { tab.restoreRequest = nil },
+                onDraftChange: { tab.promptDraft = $0 },
+                onSubmit: submit,
+                onAbort: { Task { try? await vm.abort() } },
+                onContentHeightChange: { needed in
+                    // Auto-grow with content until the user has pinned the
+                    // height with the resize handle. Always at least the
+                    // minimum, so a cleared prompt snaps back to a compact bar.
+                    guard !tab.promptHeightIsCustom else { return }
+                    tab.promptHeight = PromptBarMetrics.clamp(max(needed, PromptBarMetrics.minHeight))
+                }
+            )
+            .frame(height: tab.promptHeight)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+        // The cluster's glass surface: a material masked to fade out toward
+        // its top edge, so conversation text passing under it dissolves
+        // instead of meeting a hard edge (the hand-built scroll-edge effect
+        // AppKit does not provide).
+        .background {
+            Rectangle()
+                .fill(.regularMaterial)
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .black, location: 0),
+                            .init(color: .black, location: 0.75),
+                            .init(color: .clear, location: 1),
+                        ],
+                        startPoint: .bottom,
+                        endPoint: .top
+                    )
+                )
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: PromptBarHeightKey.self, value: proxy.size.height)
+            }
+        }
+    }
+
     /// The conversation page: transcript (AppKit) + its in-page overlays.
     /// Kept mounted across page switches (hidden while the Changes page is up)
     /// so the transcript's coordinator, per-session height caches, and scroll
@@ -151,7 +204,7 @@ struct SessionContent: View {
     private var conversationPage: some View {
         let vm = tab.viewModel
         return ZStack {
-            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation)
+            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight)
                 .background(Color(nsColor: .textBackgroundColor))
             if vm.isReloading {
                 // In-app spinner while the store rebuilds the whole
@@ -296,6 +349,15 @@ struct SessionContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(.regularMaterial)
+    }
+}
+
+/// Reports the floating prompt cluster's height to `SessionContent`, which
+/// passes it to the transcript as a bottom content inset (and pads the Changes
+/// page by it) so nothing hides behind the floating bar.
+private struct PromptBarHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

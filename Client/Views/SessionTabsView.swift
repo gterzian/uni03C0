@@ -19,20 +19,35 @@ struct SessionTabsView: View {
     /// Shared namespace for the outer tabs' glass pills, so the system can
     /// morph the selection between tabs as one coherent glass cluster.
     @Namespace private var glassNamespace
+    /// The measured height of the floating tab panel: the transcript's top
+    /// content inset, so conversation content scrolls to the very top and
+    /// bleeds under the glass instead of stopping below it.
+    @State private var tabPanelHeight: CGFloat = 0
 
     init(initialCwd: URL) {
         self.initialCwd = initialCwd
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            tabPanel
-            Divider()
-            if let active = activeTab {
-                SessionContent(tab: active)
+        // The tab panel FLOATS over the session content: content scrolls
+        // under its glass and fades against its masked bottom edge, instead
+        // of being pushed down by a solid row.
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                if let active = activeTab {
+                    SessionContent(tab: active, topInset: tabPanelHeight)
+                }
+                tabShortcuts
             }
-            tabShortcuts
+            tabPanel
+                .background(tabPanelBackground)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: TabPanelHeightKey.self, value: proxy.size.height)
+                    }
+                }
         }
+        .onPreferenceChange(TabPanelHeightKey.self) { tabPanelHeight = $0 }
         .navigationTitle(activeTab?.cwd.lastPathComponent ?? "uni03C0")
         .toolbar {
             if let active = activeTab {
@@ -157,7 +172,26 @@ struct SessionTabsView: View {
                 nestedPageTabs(active)
             }
         }
-        .background(.regularMaterial)
+    }
+
+    /// The floating tab panel's surface: the Liquid Glass material masked to
+    /// fade out over its last ~25%, so conversation text passing under it
+    /// dissolves instead of meeting a hard edge — the hand-built scroll-edge
+    /// effect AppKit does not give us.
+    private var tabPanelBackground: some View {
+        Rectangle()
+            .fill(.regularMaterial)
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .black, location: 0),
+                        .init(color: .black, location: 0.75),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
     }
 
     private var outerTabBar: some View {
@@ -277,5 +311,17 @@ struct SessionTabsView: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 16)
         }
+    }
+}
+
+// MARK: - Tab panel height preference
+
+/// Reports the floating tab panel's height to `SessionTabsView`, which passes
+/// it to the transcript as a top content inset — the conversation scrolls
+/// under the panel, never hidden behind it.
+private struct TabPanelHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

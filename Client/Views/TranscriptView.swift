@@ -45,6 +45,12 @@ struct TranscriptView: NSViewRepresentable {
     /// or re-measures the transcript (a rebuilt transcript used to show a
     /// blank conversation until a tab switch forced a reload).
     var isPageActive = true
+    /// Document scroll insets so the transcript bleeds under floating chrome
+    /// (the tab panel above, the prompt bar below) instead of being clipped by
+    /// it. Applied as `NSScrollView.contentInsets` on the flipped table, which
+    /// adds scroll margin while the clip view still spans the pane.
+    var topInset: CGFloat = 0
+    var bottomInset: CGFloat = 0
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -57,6 +63,7 @@ struct TranscriptView: NSViewRepresentable {
         // handle a window-value swap defensively.
         context.coordinator.setViewModel(viewModel)
         context.coordinator.setPageActive(isPageActive)
+        context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
     }
 }
 
@@ -217,6 +224,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// arrow scroll) never act on an invisible conversation while the user
     /// browses files.
     private var pageActive = true
+
+    /// Content-under-chrome scroll insets (the floating tab panel above, the
+    /// prompt bar below). Kept on the coordinator so the scroll math below can
+    /// compensate for the extra scrollable margin the insets add. See
+    /// `setContentInsets`.
+    private var topInset: CGFloat = 0
+    private var bottomInset: CGFloat = 0
 
     /// Whether the user is pinned to the tail and wants to auto-follow. Once
     /// they scroll up, this turns off so streaming doesn't keep yanking them
@@ -641,6 +655,25 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         // populates the table itself.
         guard pendingSwitch == nil else { return }
         applyModelChanges()
+    }
+
+    /// Applies the floating-chrome insets to the transcript's scroll view.
+    /// `contentInsets` on the flipped table adds scrollable margin while the
+    /// clip view still spans the pane, so rows scroll UNDER the chrome rather
+    /// than being clipped at it. A bottom inset keeps the tail above the
+    /// floating prompt bar; the scroll math below adds `bottomInset` back to
+    /// every max-scroll computation (and allows `-topInset` at the top).
+    func setContentInsets(top: CGFloat, bottom: CGFloat) {
+        let top = max(0, top)
+        let bottom = max(0, bottom)
+        guard abs(top - topInset) > 0.5 || abs(bottom - bottomInset) > 0.5 else { return }
+        topInset = top
+        bottomInset = bottom
+        scrollView?.automaticallyAdjustsContentInsets = false
+        scrollView?.contentInsets = NSEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
+        lastVisibleMaxY = scrollView?.documentVisibleRect.maxY ?? 0
+        // Keep the tail pinned above the (now taller) bottom chrome.
+        if isFollowing { scheduleScrollToBottom() }
     }
 
     /// Reconciles the representable's incoming session with the coordinator's.
@@ -1278,7 +1311,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private func isNearBottom(threshold: CGFloat) -> Bool {
         guard let documentView = scrollView.documentView else { return true }
         let visibleMaxY = scrollView.documentVisibleRect.maxY
-        return documentView.frame.height - visibleMaxY <= threshold
+        // `visibleMaxY` includes the bottom inset at the true end, so add it
+        // back to measure the real distance to the bottom.
+        return documentView.frame.height + bottomInset - visibleMaxY <= threshold
     }
 
     // MARK: - Fetching older history (compounding, with spinner)
@@ -1335,7 +1370,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let row = anchorRow - drop
         guard row >= 0, row < (windowEnd - windowStart) else { return }
         let rowY = tableView.rect(ofRow: row).origin.y
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, rowY - anchorOffset)))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(-topInset, rowY - anchorOffset)))
         scrollView.reflectScrolledClipView(scrollView.contentView)
 
         // The last fetch was given back: restart the compounding block so a
@@ -1485,7 +1520,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 return
             }
             let rowY = self.tableView.rect(ofRow: row).origin.y
-            let targetY = max(0, rowY - pixelOffset)
+            let targetY = max(-self.topInset, rowY - pixelOffset)
             self.scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             self.scrollView.reflectScrolledClipView(self.scrollView.contentView)
             self.lastVisibleMaxY = self.scrollView.documentVisibleRect.maxY
@@ -1736,8 +1771,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard lastRow >= 0 else { return }
         tableView.tile()
         let rowRect = tableView.rect(ofRow: lastRow)
-        let targetY = rowRect.maxY - scrollView.contentView.bounds.height
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+        // + bottomInset keeps the tail's bottom above the floating prompt bar;
+        // -topInset lets a short conversation sit against the top margin.
+        let targetY = rowRect.maxY - scrollView.contentView.bounds.height + bottomInset
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(-topInset, targetY)))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
@@ -1757,7 +1794,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tableView.tile()
         let rowRect = tableView.rect(ofRow: row)
         let targetY = rowRect.midY - scrollView.contentView.bounds.height / 2
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, targetY)))
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(-topInset, targetY)))
         scrollView.reflectScrolledClipView(scrollView.contentView)
         lastVisibleMaxY = scrollView.documentVisibleRect.maxY
     }
@@ -2077,8 +2114,8 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
         let step = max(arrowScrollStep, viewport / 8)
-        let maxY = max(0, documentView.frame.height - viewport)
-        let target = min(maxY, max(0, scrollView.contentView.bounds.origin.y + direction * step))
+        let maxY = max(-topInset, documentView.frame.height + bottomInset - viewport)
+        let target = min(maxY, max(-topInset, scrollView.contentView.bounds.origin.y + direction * step))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -2090,8 +2127,8 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         cancelOngoingScroll()
         guard let scrollView, let documentView = scrollView.documentView else { return }
         let viewport = scrollView.contentView.bounds.height
-        let maxY = max(0, documentView.frame.height - viewport)
-        let target = min(maxY, max(0, scrollView.contentView.bounds.origin.y + direction * viewport))
+        let maxY = max(-topInset, documentView.frame.height + bottomInset - viewport)
+        let target = min(maxY, max(-topInset, scrollView.contentView.bounds.origin.y + direction * viewport))
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: target))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
@@ -2246,8 +2283,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         isFollowing = false
         tableView.tile()
         let rowRect = tableView.rect(ofRow: row)
-        let docMaxY = max(0, (scrollView.documentView?.frame.height ?? 0) - scrollView.contentView.bounds.height)
-        let targetY = min(max(0, rowRect.origin.y - 8), docMaxY)
+        let docMaxY = max(-topInset, (scrollView.documentView?.frame.height ?? 0) + bottomInset - scrollView.contentView.bounds.height)
+        // Anchor the message 8pt below the BOTTOM of the floating top chrome,
+        // not at the clip's raw top edge (which the chrome covers).
+        let targetY = min(max(-topInset, rowRect.origin.y - topInset - 8), docMaxY)
         scrollView.contentView.scroll(to: NSPoint(x: 0, y: targetY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
         lastVisibleMaxY = scrollView.documentVisibleRect.maxY
@@ -2366,9 +2405,11 @@ final class TranscriptScrollView: NSScrollView {
 extension NSScrollView {
     func scrollToBottom() {
         guard let documentView else { return }
+        // A short document (height < viewport) clamps to the top inset so its
+        // first row sits BELOW the floating chrome, never under it.
         let point = NSPoint(
             x: 0,
-            y: max(0, documentView.frame.height - contentView.bounds.height)
+            y: max(-contentInsets.top, documentView.frame.height + contentInsets.bottom - contentView.bounds.height)
         )
         contentView.scroll(to: point)
         reflectScrolledClipView(contentView)
