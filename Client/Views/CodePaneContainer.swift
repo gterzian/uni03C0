@@ -106,6 +106,11 @@ final class CodePaneContainer: NSView {
     var onLinkClick: ((URL) -> Void)?
     /// The sections of the current document, in document order.
     private(set) var sections: [CodeSection] = []
+    /// The floating chrome height the document scrolls UNDER (the Changes
+    /// viewer's header): document top padding so the first line can reach the
+    /// top of the pane and scroll under the translucent header instead of
+    /// stopping below it.
+    private(set) var contentTopInset: CGFloat = 0
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -260,6 +265,17 @@ final class CodePaneContainer: NSView {
             busyIndicator.stopAnimation(nil)
         }
         busyIndicator.isHidden = !busy
+    }
+
+    /// Sets the floating chrome height the document scrolls under. Applied as
+    /// document top padding (not a scroll-view inset, which would clip content
+    /// at the chrome edge instead of letting it bleed underneath), so the ruler
+    /// and the edit-map math keep working off the same layout geometry.
+    func setTopInset(_ inset: CGFloat) {
+        let clamped = max(0, inset)
+        guard abs(clamped - contentTopInset) > 0.5 else { return }
+        contentTopInset = clamped
+        codeView.setTopPadding(clamped)
     }
 
     /// Centered status text (loading / no changed files / unreadable) over a

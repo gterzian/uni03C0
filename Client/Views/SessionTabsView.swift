@@ -16,6 +16,9 @@ struct SessionTabsView: View {
 
     @State private var tabs: [SessionTab] = []
     @State private var activeID: SessionTab.ID?
+    /// Shared namespace for the outer tabs' glass pills, so the system can
+    /// morph the selection between tabs as one coherent glass cluster.
+    @Namespace private var glassNamespace
 
     init(initialCwd: URL) {
         self.initialCwd = initialCwd
@@ -144,12 +147,17 @@ struct SessionTabsView: View {
     /// session tab is selected (each session keeps its own page choice).
     private var tabPanel: some View {
         VStack(spacing: 0) {
-            outerTabBar
+            // One shared glass container batches the pills' effects and makes
+            // the selection morph coherent (Apple's performance note on
+            // combining custom glass effects).
+            GlassEffectContainer(spacing: 8) {
+                outerTabBar
+            }
             if let active = activeTab {
                 nestedPageTabs(active)
             }
         }
-        .background(.bar)
+        .background(.regularMaterial)
     }
 
     private var outerTabBar: some View {
@@ -174,88 +182,37 @@ struct SessionTabsView: View {
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under
-    /// its outer pill (see `tabPanel`). The Changes tab carries the
-    /// edited-file count so a session with uncommitted changes advertises them
-    /// at the tab level.
+    /// its outer pill (see `tabPanel`). A real segmented control, so the Liquid
+    /// Glass segmented look and the platform's own semantics (selected state,
+    /// group traits, keyboard traversal) come for free — the old custom pills
+    /// had to stitch those together by hand. A segment has no native badge
+    /// slot, so the edited-file count rides in the Changes label.
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
-        HStack(spacing: 3) {
-            pageTabButton(
-                title: "Session",
-                icon: "text.bubble",
-                isSelected: tab.page == .conversation,
-                help: "Show the conversation with the agent"
-            ) {
-                tab.page = .conversation
+        @Bindable var tab = tab
+        return HStack(spacing: 8) {
+            Picker("Page", selection: $tab.page) {
+                Text("Session")
+                    .tag(SessionPage.conversation)
+                Text(changesTitle(tab.gitChangeCount))
+                    .tag(SessionPage.changes)
             }
-            pageTabButton(
-                title: "Changes",
-                icon: "plus.forwardslash.minus",
-                isSelected: tab.page == .changes,
-                badge: tab.gitChangeCount,
-                help: "Review the uncommitted diff of this session's folder"
-            ) {
-                tab.page = .changes
-            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("Switch between the conversation and this session's uncommitted changes")
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
     }
 
-    /// One nested page tab: a compact pill in the outer pills' visual language
-    /// (accent-tinted when selected), with the edited-file count badge on the
-    /// Changes tab.
-    private func pageTabButton(
-        title: String,
-        icon: String,
-        isSelected: Bool,
-        badge: Int? = nil,
-        help: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        // The badge is visual-only; the selected state and the badge count go
-        // into the accessibility label + traits so VoiceOver announces
-        // "Changes, 3 edited files, selected" instead of a plain unselected
-        // button (the custom pills carry none of the segmented control's
-        // free semantics — selected state, group traits).
-        let accessibilityLabel: String
-        if let badge, badge > 0 {
-            accessibilityLabel = "\(title), \(badge) edited file\(badge == 1 ? "" : "s")"
-        } else {
-            accessibilityLabel = title
+    /// The Changes segment's title, carrying the edited-file count when there
+    /// is one (the badge the custom pill used to draw).
+    private func changesTitle(_ count: Int?) -> String {
+        if let count, count > 0 {
+            return "Changes (\(count))"
         }
-        return Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 10))
-                Text(title)
-                    .font(.system(size: 11))
-                    .fontWeight(isSelected ? .semibold : .regular)
-                if let badge, badge > 0 {
-                    Text("\(badge)")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 0.5)
-                        .background(
-                            Color.accentColor.opacity(isSelected ? 0.3 : 0.18),
-                            in: Capsule()
-                        )
-                }
-            }
-            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .background(
-                isSelected ? Color.accentColor.opacity(0.14) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 6)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        return "Changes"
     }
 
     /// One tab: the session's folder name, its live status icon (spinner
@@ -297,10 +254,8 @@ struct SessionTabsView: View {
         .padding(.leading, 10)
         .padding(.trailing, tabs.count > 1 ? 6 : 10)
         .padding(.vertical, 4)
-        .background(
-            isActive ? Color.accentColor.opacity(0.14) : Color.clear,
-            in: RoundedRectangle(cornerRadius: 7)
-        )
+        .glassEffect(isActive ? .regular.tint(.accentColor) : .regular, in: Capsule())
+        .glassEffectID(tab.id, in: glassNamespace)
         .contentShape(Rectangle())
         .onTapGesture { activeID = tab.id }
         .help(tab.cwd.path)

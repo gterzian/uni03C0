@@ -50,6 +50,15 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the reader mid-scroll. While this is set the view refuses
     /// every height change (see `setFrameSize`). nil = the view sizes itself.
     private(set) var fixedContentHeight: CGFloat?
+    /// The buffer's own laid-out height (text-container insets excluded),
+    /// remembered from `load(contentHeight:)` so a later top-padding change can
+    /// re-pin the document height exactly.
+    private(set) var baseContentHeight: CGFloat?
+    /// Extra blank space at the TOP of the buffer, for content that scrolls under
+    /// floating chrome: the clip view spans the full pane, and only the document
+    /// is padded, so the first line starts below the chrome and scrolls up under
+    /// it (a scroll-view content inset would clip instead of bleed).
+    private(set) var topPadding: CGFloat = 0
     /// For an interleaved diff buffer, the REAL current-file line number of
     /// each 1-based DISPLAY line (`nil` for a removed line, which is old-side
     /// content). nil → the buffer is the real file and display line == real
@@ -291,12 +300,32 @@ final class ReadOnlyCodeTextView: NSTextView {
         }
         // Pin the height BEFORE sizing, so `sizeToFit` may still fit the width
         // but can never install TextKit's lazy estimate as the document height.
+        baseContentHeight = contentHeight
         let pinnedHeight = contentHeight.map { $0 + textContainerInset.height * 2 }
         fixedContentHeight = pinnedHeight
         sizeToFit()
         if let pinnedHeight { setFrameSize(NSSize(width: frame.width, height: pinnedHeight)) }
         // New file: show the top.
         scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    /// Sets the blank space at the top of the buffer for floating chrome the
+    /// document scrolls under. Applied as document padding (not a scroll-view
+    /// inset) so the clip view still spans the full pane and content bleeds
+    /// under the chrome; re-pins the document height when a known content
+    /// height exists.
+    func setTopPadding(_ extra: CGFloat) {
+        let clamped = max(0, extra)
+        guard abs(clamped - topPadding) > 0.5 else { return }
+        let baseInset = textContainerInset.height - topPadding
+        topPadding = clamped
+        textContainerInset = NSSize(width: textContainerInset.width, height: baseInset + clamped)
+        if let baseContentHeight {
+            let pinned = baseContentHeight + textContainerInset.height * 2
+            fixedContentHeight = pinned
+            setFrameSize(NSSize(width: frame.width, height: pinned))
+        }
+        needsDisplay = true
     }
 
     /// Keeps a caller-supplied exact height (`load(contentHeight:)`) even as

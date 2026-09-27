@@ -116,6 +116,9 @@ struct DiffBrowserView: NSViewRepresentable {
     /// rebuilds (no highlighting for a page nothing shows) and catch up on
     /// activation.
     var pageActive = true
+    /// The floating header height the document scrolls under (Liquid Glass
+    /// content-under-chrome). Zero when there is no floating chrome.
+    var topInset: CGFloat = 0
     /// The page's find-in-buffer model.
     var search: (any CodeSearching)? = nil
 
@@ -125,6 +128,7 @@ struct DiffBrowserView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> CodePaneContainer {
         let container = CodePaneContainer()
+        container.setTopInset(topInset)
         context.coordinator.container = container
         container.onAppearanceChange = { [weak coordinator = context.coordinator] in
             coordinator?.appearanceChanged()
@@ -142,6 +146,7 @@ struct DiffBrowserView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: CodePaneContainer, context: Context) {
+        nsView.setTopInset(topInset)
         context.coordinator.setActive(pageActive)
         context.coordinator.setSearch(search)
         context.coordinator.update(

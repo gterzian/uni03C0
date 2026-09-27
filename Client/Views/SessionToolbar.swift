@@ -16,12 +16,26 @@ enum SessionToolbar {
                 SessionSearchBar(vm: tab.viewModel)
             }
         }
+        // Cluster related controls with fixed spacers so the system renders
+        // them as separate glass pills (work | model | resume | appearance)
+        // instead of one fused strip — Liquid Glass groups by function, not by
+        // a painted bar. The toolbar itself stays an NSToolbar (unified
+        // titlebar, traffic lights, window dragging).
         ToolbarItemGroup(placement: .primaryAction) {
             stopButton(tab.viewModel)
             reloadButton(tab.viewModel)
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItemGroup(placement: .primaryAction) {
             modelMenu(tab.viewModel)
             thinkingMenu(tab.viewModel)
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
             resumeMenu(tab)
+        }
+        ToolbarSpacer(.fixed, placement: .primaryAction)
+        ToolbarItem(placement: .primaryAction) {
             // App-wide appearance (light / dark / system). A single window is
             // the app, so the toggle lives on the session toolbar but applies
             // to every window and pane.

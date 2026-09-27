@@ -269,17 +269,14 @@ final class PromptContainerView: NSView {
         applyInputAppearance()
     }
 
-    /// The window's corner radius, matched by the prompt input so the two
-    /// read as one surface instead of a square field poking into a rounded
-    /// window.
-    private static let cornerRadius: CGFloat = 10
-
     /// Rounds the input and paints its background/border. Layer colors don't
     /// follow the effective appearance automatically, so this re-runs on
     /// light/dark changes.
     private func applyInputAppearance() {
         guard let layer = scrollView.layer else { return }
-        layer.cornerRadius = Self.cornerRadius
+        // One shared constant so the prompt tracks the window's curvature
+        // (Liquid Glass rounds windows) instead of chasing it with a literal.
+        layer.cornerRadius = WindowChrome.cornerRadius
         layer.borderWidth = 1
         layer.borderColor = NSColor.separatorColor.cgColor
         layer.backgroundColor = NSColor.textBackgroundColor.cgColor
@@ -1535,15 +1532,28 @@ final class CompletionWindowController: NSObject, NSTableViewDataSource, NSTable
         )
         super.init()
         window.level = .popUpMenu
-        window.backgroundColor = NSColor.windowBackgroundColor
+        // A popover by behavior (transient, contextual, dismissed on
+        // selection): back it with the popover material instead of a flat
+        // window fill, so it matches every system popover.
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.hasShadow = true
         window.isReleasedWhenClosed = false
         window.ignoresMouseEvents = true // keyboard-only completion for v1
+
+        let effect = NSVisualEffectView()
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = WindowChrome.pillCornerRadius
+        effect.layer?.masksToBounds = true
 
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         tableView.headerView = nil
         tableView.rowHeight = 22
@@ -1556,7 +1566,14 @@ final class CompletionWindowController: NSObject, NSTableViewDataSource, NSTable
         tableView.addTableColumn(column)
 
         scrollView.documentView = tableView
-        window.contentView = scrollView
+        effect.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: effect.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+        ])
+        window.contentView = effect
     }
 
     var isVisible: Bool { window.isVisible }
