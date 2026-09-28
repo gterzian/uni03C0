@@ -1,3 +1,4 @@
+import AppKit
 import Core
 import SwiftUI
 
@@ -25,8 +26,20 @@ struct ChangesView: View {
     /// Whether the floating file list is open. CLOSED by default: the diff is
     /// the page, and the list floats over it only while navigating.
     @State private var showSidebar = false
-    /// The floating sidebar width.
-    private let sidebarWidth: CGFloat = 280
+    /// The floating file list's minimum width: a comfortable reading width for
+    /// the header and short paths before it grows to fit the longest one.
+    private let minimumSidebarWidth: CGFloat = 220
+    /// The horizontal room the sidebar's `List` rows and header add around
+    /// their content (row insets, the header's own padding, and the overlay
+    /// scroller), added to the measured content so nothing truncates. Given
+    /// generously — a path truncating is the exact failure this width exists
+    /// to prevent.
+    private let sidebarChromeWidth: CGFloat = 40
+    /// The widest thing the file list must show in full (a row's badge + path
+    /// + stats, or the header), measured once per changeset.
+    @State private var fileListContentWidth: CGFloat = 0
+    /// The page's own width, so the list never opens wider than the window.
+    @State private var pageWidth: CGFloat = 0
     /// Height of the floating prompt cluster below the diff viewer: the diff
     /// document's bottom inset, so its last lines scroll above the bar.
     var bottomInset: CGFloat = 0
@@ -59,14 +72,84 @@ struct ChangesView: View {
                 .transition(.move(edge: .leading).combined(with: .opacity))
             }
         }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: PageWidthKey.self, value: proxy.size.width)
+            }
+        }
+        .onPreferenceChange(PageWidthKey.self) { pageWidth = $0 }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showSidebar)
-        .onAppear { reconcileSelection() }
+        .onAppear {
+            reconcileSelection()
+            measureFileListContentWidth()
+        }
         .onChange(of: pageActive) { _, active in
             if active { reconcileSelection() }
         }
         .onChange(of: store.listVersion) { _, _ in
             reconcileSelection()
+            measureFileListContentWidth()
         }
+    }
+
+    /// The floating file list's width: as far as the widest file path needs to
+    /// read in full, and no further than the window (the list's own 8pt margin
+    /// on each side is the only allowance). `fileListContentWidth` is measured
+    /// once per changeset; the window clamp is re-evaluated live, so a resize
+    /// shrank/grows it without re-measuring.
+    private var sidebarWidth: CGFloat {
+        let limit = max(0, pageWidth - 16)
+        guard limit > 0 else { return minimumSidebarWidth }
+        let desired = fileListContentWidth + sidebarChromeWidth
+        return min(max(minimumSidebarWidth, desired), limit)
+    }
+
+    /// Measures the widest file list row (kind badge + path + stats, or the
+    /// untracked note) and the header row, in points, from the same fonts the
+    /// rows render with. Called when the changed set moves, never per body
+    /// evaluation (a large changeset's paths must not be re-measured every
+    /// frame).
+    private func measureFileListContentWidth() {
+        func width(_ text: String, _ font: NSFont) -> CGFloat {
+            (text as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        }
+        func statsWidth(added: Int, deleted: Int, font: NSFont) -> CGFloat {
+            var total: CGFloat = 0
+            if added > 0 { total += width("+\(added)", font) }
+            if deleted > 0 {
+                if added > 0 { total += 4 }
+                total += width("−\(deleted)", font)
+            }
+            return total
+        }
+
+        let pathFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let statFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        let titleFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let countFont = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        let noteFont = NSFont.systemFont(ofSize: 10)
+
+        // The header: "Changed Files" + count capsule + total stats.
+        var widest = width("Changed Files", titleFont)
+        if !store.entries.isEmpty {
+            widest += 8 + width("\(store.entries.count)", countFont) + 10
+        }
+        if let total = store.totalStats, total.total > 0 {
+            widest += 8 + statsWidth(added: total.added, deleted: total.deleted, font: statFont)
+        }
+
+        for entry in store.entries {
+            // 12pt badge frame + 6pt HStack spacing + path + 4pt minimum
+            // spacer, then the row's stats (or the "new" note).
+            var row = 12 + 6 + width(entry.path, pathFont)
+            if let stats = entry.stats, stats.added + stats.deleted > 0 {
+                row += 4 + statsWidth(added: stats.added, deleted: stats.deleted, font: statFont)
+            } else if entry.kind == .untracked {
+                row += 4 + width("new", noteFont)
+            }
+            widest = max(widest, row)
+        }
+        fileListContentWidth = widest
     }
 
     // MARK: - Selection
@@ -201,6 +284,14 @@ struct ChangesView: View {
         .accessibilityLabel("\(entry.path) — show diff")
     }
 
+    /// Closes the floating file list when the reader clicks back into the
+    /// diff. The list is navigation-only, so any click on the diff dismisses
+    /// it; the outer ZStack's `.animation` drives the transition.
+    private func dismissSidebar() {
+        guard showSidebar else { return }
+        showSidebar = false
+    }
+
     // MARK: - Diff viewer
 
     private var diffArea: some View {
@@ -223,7 +314,8 @@ struct ChangesView: View {
                     pageActive: pageActive,
                     topInset: headerHeight,
                     bottomInset: bottomInset,
-                    search: search
+                    search: search,
+                    onBackgroundClick: { dismissSidebar() }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -385,6 +477,15 @@ private struct FileTitleLink: View {
 /// can scroll to the top of the pane, under the header, instead of stopping
 /// below it.
 private struct ViewerHeaderHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Reports the Changes page's own width up to `ChangesView`, so the floating
+/// file list can grow to fit the longest path but never beyond the window.
+private struct PageWidthKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())

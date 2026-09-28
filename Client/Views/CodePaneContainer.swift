@@ -104,6 +104,9 @@ final class CodePaneContainer: NSView {
     var onScroll: (() -> Void)?
     /// Called when a link in the buffer is clicked (an expand control).
     var onLinkClick: ((URL) -> Void)?
+    /// Called on every click in the code view, so the owner can dismiss
+    /// floating chrome (the changed-files list) that overlaps the diff.
+    var onBackgroundClick: (() -> Void)?
     /// The sections of the current document, in document order.
     private(set) var sections: [CodeSection] = []
     /// The floating chrome the document scrolls UNDER: the header above (top)
@@ -165,6 +168,7 @@ final class CodePaneContainer: NSView {
         // visible band on demand, the same lazy model the ruler already uses.
         codeView.layoutManager?.allowsNonContiguousLayout = false
         codeView.onLinkClick = { [weak self] url in self?.onLinkClick?(url) }
+        codeView.onMouseDown = { [weak self] in self?.onBackgroundClick?() }
         scrollView.documentView = codeView
 
         let ruler = CodeLineRulerView(scrollView: scrollView)

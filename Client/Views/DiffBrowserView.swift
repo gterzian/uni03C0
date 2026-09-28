@@ -125,6 +125,9 @@ struct DiffBrowserView: NSViewRepresentable {
     var bottomInset: CGFloat = 0
     /// The page's find-in-buffer model.
     var search: (any CodeSearching)? = nil
+    /// Called on every click in the diff, so the page can dismiss floating
+    /// chrome (the changed-files list) that overlaps the viewer.
+    var onBackgroundClick: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -143,6 +146,9 @@ struct DiffBrowserView: NSViewRepresentable {
         container.onLinkClick = { [weak coordinator = context.coordinator] url in
             coordinator?.handleLink(url)
         }
+        container.onBackgroundClick = { [weak coordinator = context.coordinator] in
+            coordinator?.backgroundClicked()
+        }
         container.linkTextAttributes()
         context.coordinator.installKeyMonitor()
         context.coordinator.installEditJumpMonitor()
@@ -159,7 +165,8 @@ struct DiffBrowserView: NSViewRepresentable {
             revealPath: revealPath,
             revealLine: revealLine,
             onRevealConsumed: onRevealConsumed,
-            onTopSectionChanged: onTopSectionChanged
+            onTopSectionChanged: onTopSectionChanged,
+            onBackgroundClick: onBackgroundClick
         )
     }
 
@@ -184,6 +191,7 @@ struct DiffBrowserView: NSViewRepresentable {
         private weak var store: ChangesStore?
         private var onRevealConsumed: (() -> Void)?
         private var onTopSectionChanged: ((String?) -> Void)?
+        private var onBackgroundClick: (() -> Void)?
         private var appliedDocumentVersion = -1
         /// The reveal request already applied, as (path, line), so a second
         /// link to the same file at a different line still jumps.
@@ -282,11 +290,13 @@ struct DiffBrowserView: NSViewRepresentable {
             revealPath: String?,
             revealLine: Int?,
             onRevealConsumed: @escaping () -> Void,
-            onTopSectionChanged: @escaping (String?) -> Void
+            onTopSectionChanged: @escaping (String?) -> Void,
+            onBackgroundClick: @escaping () -> Void
         ) {
             self.store = store
             self.onRevealConsumed = onRevealConsumed
             self.onTopSectionChanged = onTopSectionChanged
+            self.onBackgroundClick = onBackgroundClick
 
             if documentVersion != appliedDocumentVersion {
                 appliedDocumentVersion = documentVersion
@@ -469,6 +479,12 @@ struct DiffBrowserView: NSViewRepresentable {
         }
 
         // MARK: Scroll spy + links
+
+        /// A click landed in the diff: hand it to the page so it can dismiss
+        /// floating chrome. Never consumed — AppKit still handles selection.
+        func backgroundClicked() {
+            onBackgroundClick?()
+        }
 
         func scrollSpy() {
             guard isActive, let container else { return }

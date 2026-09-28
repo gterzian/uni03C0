@@ -35,6 +35,10 @@ final class ReadOnlyCodeTextView: NSTextView {
     private var sectionPaths: [(range: NSRange, absolutePath: String)] = []
     /// Clicks on links in the buffer (the diff viewer's expand controls).
     var onLinkClick: ((URL) -> Void)?
+    /// Fired at the start of every click in the buffer, before AppKit's own
+    /// selection handling. The diff viewer uses it to dismiss its floating
+    /// file list when the reader clicks back into the diff.
+    var onMouseDown: (() -> Void)?
     /// Start offset (UTF-16) of every line, ascending, built once per load.
     /// `lineStartOffsets[k]` is where line k+1 begins; the line's end is the
     /// next entry (or the text length for the last line). The final entry is
@@ -484,6 +488,11 @@ final class ReadOnlyCodeTextView: NSTextView {
             location = segmentEnd
         }
         return snippet
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
+        super.mouseDown(with: event)
     }
 
     // MARK: - Copy → frozen reference
