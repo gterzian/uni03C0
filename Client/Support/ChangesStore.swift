@@ -48,6 +48,16 @@ final class ChangesStore {
     /// mid-turn from clearing the viewer: the changed set and diffs are net
     /// changes since the turn began, and only the next turn re-baselines.
     @ObservationIgnored private(set) var baseline: String?
+    /// The branch `baseline` was pinned on, or nil when detached / not a git
+    /// repository. A refresh that finds a different branch name re-pins the
+    /// baseline, so an out-of-band branch switch never leaves the viewer
+    /// diffing against the previous branch's commit (which would show both
+    /// branches' work at once — the two same-project tabs disagreeing bug).
+    @ObservationIgnored private var baselineBranch: String?
+    /// Called when `baseline` moves to a new commit — a new turn or a branch
+    /// switch — so the changed-file count re-checks against the same commit
+    /// the viewer uses and the badge can never disagree with the list.
+    @ObservationIgnored var onBaselineChanged: (() -> Void)?
 
     /// The assembled document for `documentVersion`, from the viewer's off-main
     /// builder. The Changes page is `.id`-keyed per tab, so a tab switch
@@ -121,7 +131,9 @@ final class ChangesStore {
     /// state. Called when a prompt is sent, never on a git commit.
     func beginTurn() async {
         baseline = await GitStatus.resolveHead(at: cwd)
+        baselineBranch = await GitStatus.resolveBranch(at: cwd)
         gapExpansion = [:]
+        onBaselineChanged?()
         await refresh()
     }
 
@@ -139,6 +151,23 @@ final class ChangesStore {
             refreshQueued = false
             guard !Task.isCancelled else { return }
             let cwd = self.cwd
+            // A branch switch moves HEAD to a commit on another branch, so the
+            // pinned turn baseline no longer describes "this branch's
+            // uncommitted work": diffing against it would merge both
+            // branches' changes into the viewer. Re-pin to the current HEAD
+            // when the branch NAME changed; a commit on the same branch
+            // leaves the name alone, so a mid-turn commit still keeps the
+            // accumulated diff. Detached HEAD (nil) is a switch like any
+            // other.
+            let branch = await GitStatus.resolveBranch(at: cwd)
+            if GitStatus.shouldRepinBaseline(hasBaseline: baseline != nil, pinnedBranch: baselineBranch, currentBranch: branch) {
+                baseline = await GitStatus.resolveHead(at: cwd)
+                baselineBranch = branch
+                gapExpansion = [:]
+                onBaselineChanged?()
+            } else {
+                baselineBranch = branch
+            }
             // Read the baseline each iteration: `beginTurn` may pin a new one
             // while a refresh is already in flight (the queued repeat picks it
             // up instead of the old base).

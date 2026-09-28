@@ -114,6 +114,33 @@ public enum GitStatus {
         return sha.isEmpty ? emptyTree : sha
     }
 
+    /// The short name of the branch `HEAD` is on, or nil when the repository is
+    /// detached or not a git repository at all. Watched across refreshes to
+    /// notice a branch switch: a commit keeps the branch name, so the pinned
+    /// turn baseline survives it, while a checkout/switch changes it and the
+    /// stale baseline must be re-pinned (see `shouldRepinBaseline`).
+    public static func resolveBranch(at cwd: URL) async -> String? {
+        guard let out = await gitOutput(
+            ["-c", "core.quotepath=false", "symbolic-ref", "--short", "-q", "HEAD"],
+            cwd: cwd
+        ) else { return nil }
+        let name = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// Whether a refresh must re-pin the turn baseline because `HEAD` has
+    /// moved to a different branch. A commit on the same branch leaves the
+    /// branch name untouched — that is exactly the mid-turn commit the viewer
+    /// must keep showing — while a checkout/switch changes it, and diffing
+    /// against the old branch's commit would present the whole cross-branch
+    /// delta as uncommitted changes. Detached HEAD (a nil current branch)
+    /// counts as a switch away from any named branch. With no pinned baseline
+    /// there is nothing to re-pin: the base is already the live `HEAD`.
+    public static func shouldRepinBaseline(hasBaseline: Bool, pinnedBranch: String?, currentBranch: String?) -> Bool {
+        guard hasBaseline, let pinnedBranch else { return false }
+        return pinnedBranch != currentBranch
+    }
+
     /// Resolves an explicit baseline, or falls back to the live `HEAD` when the
     /// caller has not pinned one (before the first user turn).
     private static func resolvedBase(_ base: String?, at cwd: URL) async -> String {
