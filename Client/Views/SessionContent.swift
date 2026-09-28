@@ -173,21 +173,27 @@ struct SessionContent: View {
                 }
             )
             .frame(height: tab.promptHeight)
-            // The composer's Liquid Glass surface, applied as a BACKGROUND so
-            // the focus system never treats the glass as the focused control
-            // (which adapted/scaled it when the input was clicked). Transparent
-            // with a strong system blur, so the transcript or diff behind it
-            // can't interfere with the text.
+            // The composer's Liquid Glass surface, as a BACKGROUND so the focus
+            // system never treats the glass as the focused control.
+            //
+            // AppKit Liquid Glass (`NSGlassEffectView`, see `GlassBackground`),
+            // NOT SwiftUI's `.glassEffect`: the SwiftUI modifier renders through
+            // the hosting tree and re-renders the whole sampled backdrop (the
+            // session) whenever the content behind it changes — the whole-window
+            // Quartz Debug tint during a stream and while scrolling.
+            //
+            // NOTE: never wrap this chain in a `GlassEffectContainer`. The
+            // container captures its content to render; the composer is an
+            // `NSViewRepresentable` (a live `NSTextView`), and capturing it
+            // blanks the view and breaks typing.
             .background {
-                // `.regular`: strong enough that the transcript/diff behind
-                // can't interfere with the typed text, without the near-solid
-                // look of a tinted material.
-                Color.clear
-                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: WindowChrome.cornerRadius))
+                GlassBackground(shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius))
             }
-            // The model / context / thinking readout, in its own glass pill at
-            // the composer's bottom-right. A separate view so a context-usage
-            // poll re-renders only the pill.
+            // The model / context / thinking readout, on the composer's own
+            // glass at the bottom-right — no glass of its own (a nested second
+            // glass would have to sample the composer's glass, which Liquid
+            // Glass cannot do consistently). A separate view so a context-usage
+            // poll re-renders only the pill, never the session body.
             .overlay(alignment: .bottomTrailing) {
                 PromptStatusPill(vm: vm)
                     .padding(.trailing, 8)
@@ -204,8 +210,10 @@ struct SessionContent: View {
     }
 
     /// The model / context / thinking readout at the composer's bottom-right,
-    /// in its own Liquid Glass pill. A separate view so a context-usage poll
-    /// re-renders only this pill, never the whole session body.
+    /// drawn on the composer's own Liquid Glass (it deliberately carries no
+    /// glass of its own — see `floatingPromptBar`). A separate view so a
+    /// context-usage poll re-renders only this pill, never the whole session
+    /// body.
     private struct PromptStatusPill: View {
         let vm: SessionViewModel
 
@@ -216,7 +224,6 @@ struct SessionContent: View {
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .glassEffect(.regular, in: Capsule())
                     .accessibilityLabel(text)
             }
         }
@@ -245,8 +252,12 @@ struct SessionContent: View {
     private var conversationPage: some View {
         let vm = tab.viewModel
         return ZStack {
+            // No SwiftUI background behind the transcript: the AppKit scroll
+            // view/table now draw the opaque page colour themselves (see
+            // `TranscriptView.makeScrollView`). A clear AppKit surface over a
+            // SwiftUI fill made the compositor blend two surfaces across the
+            // whole streaming area.
             TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight)
-                .background(Color(nsColor: .textBackgroundColor))
             if vm.isReloading {
                 // In-app spinner while the store rebuilds the whole
                 // history off the main thread (no system beachball).
@@ -349,7 +360,13 @@ struct SessionContent: View {
         .padding(.vertical, 6)
         // Liquid Glass so the banner's text never fights the conversation/diff
         // behind it; the red tint rides the glass instead of a flat fill.
-        .glassEffect(.regular.tint(.red.opacity(0.35)), in: RoundedRectangle(cornerRadius: 10))
+        // AppKit glass — see `GlassBackground`.
+        .background {
+            GlassBackground(
+                shape: .roundedRectangle(cornerRadius: 10),
+                tint: NSColor.systemRed.withAlphaComponent(0.35)
+            )
+        }
     }
 
     /// Banner above the prompt bar while steering messages are queued: one
@@ -392,7 +409,7 @@ struct SessionContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 10))
+        .background { GlassBackground(shape: .roundedRectangle(cornerRadius: 10)) }
     }
 }
 

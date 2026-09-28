@@ -66,7 +66,13 @@ struct ChangesView: View {
                 GeometryReader { proxy in
                     changedList
                         .frame(width: sidebarWidth, height: max(0, proxy.size.height - 16))
-                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+                        // AppKit Liquid Glass (see `GlassBackground`), not
+                        // SwiftUI's `.glassEffect`, which renders through the
+                        // hosting tree and re-renders the whole sampled backdrop
+                        // whenever the content behind it changes.
+                        .background {
+                            GlassBackground(shape: .roundedRectangle(cornerRadius: 12))
+                        }
                         .padding(8)
                 }
                 .transition(.move(edge: .leading).combined(with: .opacity))
@@ -357,8 +363,15 @@ struct ChangesView: View {
             } label: {
                 Image(systemName: "sidebar.left")
                     .font(.system(size: 12, weight: .semibold))
+                    // Match the system glass button's label padding so replacing
+                    // `.buttonStyle(.glass)` with plain + AppKit glass keeps the
+                    // same pill size and hit area.
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .contentShape(Capsule())
             }
-            .buttonStyle(.glass)
+            .buttonStyle(.plain)
+            .background { GlassBackground(shape: .capsule) }
             .help(showSidebar ? "Hide the file list" : "Show the file list")
             .accessibilityLabel("Toggle the changed-files sidebar")
 
@@ -379,7 +392,7 @@ struct ChangesView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .glassEffect(.regular, in: Capsule())
+                .background { GlassBackground(shape: .capsule) }
 
                 if let index = store.entries.firstIndex(where: { $0.path == selected }) {
                     Text("\(index + 1) of \(store.entries.count)")
@@ -387,7 +400,7 @@ struct ChangesView: View {
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .glassEffect(.regular, in: Capsule())
+                        .background { GlassBackground(shape: .capsule) }
                         .accessibilityLabel("File \(index + 1) of \(store.entries.count)")
                 }
             }

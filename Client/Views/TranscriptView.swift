@@ -337,7 +337,13 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         tv.selectionHighlightStyle = .none
         tv.usesAutomaticRowHeights = false // we own height, not AppKit layout
         tv.intercellSpacing = .zero
-        tv.backgroundColor = .clear
+        // Opaque, matching the SwiftUI page background: a clear AppKit layer
+        // over a SwiftUI background makes the compositor blend two surfaces in
+        // the transcript area (and can keep the window from being treated as
+        // opaque), which is what let a streaming delta re-composite far more
+        // than the changed row under the glass chrome. Let the AppKit surface
+        // BE the opaque background instead.
+        tv.backgroundColor = .textBackgroundColor
         tv.rowHeight = 24
         tv.allowsColumnReordering = false
         // Layer-back the table so each row cell's raster is cached in its own
@@ -361,7 +367,10 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         sv.documentView = tv
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
-        sv.drawsBackground = false
+        // Same reason as the table background above: draw the opaque page
+        // colour here, not leave the surface transparent for SwiftUI to fill.
+        sv.drawsBackground = true
+        sv.backgroundColor = .textBackgroundColor
 
         tableView = tv
         scrollView = sv

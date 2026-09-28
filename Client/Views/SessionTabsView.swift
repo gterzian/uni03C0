@@ -16,9 +16,6 @@ struct SessionTabsView: View {
 
     @State private var tabs: [SessionTab] = []
     @State private var activeID: SessionTab.ID?
-    /// Shared namespace for the outer tabs' glass pills, so the system can
-    /// morph the selection between tabs as one coherent glass cluster.
-    @Namespace private var glassNamespace
     /// The measured height of the floating tab panel: the transcript's top
     /// content inset, so conversation content scrolls to the very top and
     /// bleeds under the glass instead of stopping below it.
@@ -164,15 +161,16 @@ struct SessionTabsView: View {
     /// active pill, shares the panel's background, and disappears when another
     /// session tab is selected (each session keeps its own page choice).
     private var tabPanel: some View {
+        // The panel's glass lives on the two capsules (the tab row and the
+        // nested Session/Changes switch), each an AppKit `NSGlassEffectView`
+        // (see `GlassBackground`) rather than SwiftUI's `.glassEffect`: the
+        // SwiftUI modifier renders through the hosting tree and re-renders the
+        // whole sampled backdrop (the session window) whenever the streaming
+        // content behind it changes.
         VStack(alignment: .leading, spacing: 0) {
-            // One shared glass container batches the pills' effects and makes
-            // the selection morph coherent (Apple's performance note on
-            // combining custom glass effects).
-            GlassEffectContainer(spacing: 8) {
-                outerTabBar
-                    .padding(.horizontal, 10)
-                    .padding(.top, 6)
-            }
+            outerTabBar
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
             if let active = activeTab {
                 nestedPageTabs(active)
             }
@@ -200,9 +198,11 @@ struct SessionTabsView: View {
         .padding(.vertical, 4)
         // One liquid group: a low-blur capsule that gathers the small pills
         // into a single, findable unit. It is sized to its content — never a
-        // full-width bar — and the pills keep their own (stronger) glass.
+        // full-width bar. The one glass surface for the whole tab row (the
+        // pills themselves are plain content on it): AppKit Liquid Glass, see
+        // `GlassBackground`.
         .fixedSize()
-        .glassEffect(.clear, in: Capsule())
+        .background { GlassBackground(shape: .capsule, style: .clear) }
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under
@@ -227,7 +227,7 @@ struct SessionTabsView: View {
                 }
             }
             .padding(2)
-            .glassEffect(.regular, in: Capsule())
+            .background { GlassBackground(shape: .capsule) }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
@@ -300,11 +300,16 @@ struct SessionTabsView: View {
         .padding(.leading, 10)
         .padding(.trailing, tabs.count > 1 ? 6 : 10)
         .padding(.vertical, 4)
-        // Liquid Glass behind EVERY tab (active and inactive) so the pills stay
-        // legible over scrolling content; the active one carries only a faint
-        // accent tint, not a solid fill.
-        .glassEffect(isActive ? .regular.tint(Color.accentColor.opacity(0.12)) : .regular, in: Capsule())
-        .glassEffectID(tab.id, in: glassNamespace)
+        // The pills are plain content on the row's single AppKit glass capsule
+        // (see `outerTabBar`); the active one carries only a faint accent fill.
+        // A per-pill glass would nest glass shapes over the streaming content —
+        // another sampled backdrop — and Liquid Glass can't sample glass
+        // consistently.
+        .background {
+            if isActive {
+                Capsule().fill(Color.accentColor.opacity(0.12))
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { activeID = tab.id }
         .help(tab.cwd.path)
