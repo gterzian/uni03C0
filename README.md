@@ -30,8 +30,6 @@ After that, pick a project and start prompting; the sandbox is applied uniformly
 
 A settings page is available to change the sandbox policy, taking effect on next launch.
 
-![uni03C0](artifacts/example_screen.png)
-
 ## Sandbox
 
 The agent runs inside a **Seatbelt sandbox** (default-deny): the policy
