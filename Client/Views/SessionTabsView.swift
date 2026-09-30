@@ -196,13 +196,14 @@ struct SessionTabsView: View {
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
-        // One liquid group: a low-blur capsule that gathers the small pills
-        // into a single, findable unit. It is sized to its content — never a
+        // One liquid group: a capsule that gathers the small pills into a
+        // single, findable unit. It is sized to its content — never a
         // full-width bar. The one glass surface for the whole tab row (the
         // pills themselves are plain content on it): AppKit Liquid Glass, see
-        // `GlassBackground`.
+        // `GlassBackground` — the SAME material as the nested page tabs, the
+        // composer, and every other glass surface.
         .fixedSize()
-        .background { GlassBackground(shape: .capsule, style: .clear) }
+        .background { GlassBackground(shape: .capsule) }
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under

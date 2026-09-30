@@ -363,7 +363,7 @@ struct SessionContent: View {
         // AppKit glass — see `GlassBackground`.
         .background {
             GlassBackground(
-                shape: .roundedRectangle(cornerRadius: 10),
+                shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius),
                 tint: NSColor.systemRed.withAlphaComponent(0.35)
             )
         }
@@ -409,7 +409,7 @@ struct SessionContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background { GlassBackground(shape: .roundedRectangle(cornerRadius: 10)) }
+        .background { GlassBackground(shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius)) }
     }
 }
 

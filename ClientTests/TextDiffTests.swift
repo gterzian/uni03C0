@@ -139,4 +139,31 @@ final class TextDiffTests: XCTestCase {
         let diff = TextDiff.diff(oldLines: old, newLines: new)
         XCTAssertEqual(Array(diff.suffix(50)), shared.map { DiffLine(kind: .same, text: $0) })
     }
+
+    func testFarApartEditsInALargeFileStaySmall() {
+        // Regression: two one-line edits far apart used to trap every line
+        // between them in one over-cap DP matrix, so the whole span rendered
+        // as removed-then-added (the "diff shows changes that never happened"
+        // bug). The shared lines between the edits must diff as context.
+        var old = (0..<5_000).map { "line \($0)" }
+        var new = old
+        old[1_000] = "old near the top"
+        new[1_000] = "new near the top"
+        old[4_000] = "old near the bottom"
+        new[4_000] = "new near the bottom"
+
+        let diff = TextDiff.diff(oldLines: old, newLines: new)
+        XCTAssertEqual(diff.filter { $0.kind == .removed }.count, 2)
+        XCTAssertEqual(diff.filter { $0.kind == .added }.count, 2)
+        XCTAssertEqual(diff.filter { $0.kind == .same }.count, 4_998)
+        // The unchanged run between the edits is one long context span, not a
+        // delete/add block.
+        var longestSameRun = 0
+        var run = 0
+        for line in diff {
+            run = line.kind == .same ? run + 1 : 0
+            longestSameRun = max(longestSameRun, run)
+        }
+        XCTAssertGreaterThan(longestSameRun, 2_000)
+    }
 }

@@ -24,13 +24,17 @@ public struct DiffLine: Hashable, Sendable {
 ///
 /// Algorithm: trim the common prefix and suffix (edits touch the middle of a
 /// file, so this shrinks the problem to almost nothing), then an LCS dynamic
-/// program over the remaining middle. A size guard bounds the DP matrix: for
-/// pathological inputs the middle falls back to a whole-block replace (all old
-/// lines removed, then all new lines added) — still correct, just less pretty.
+/// program over the remaining middle. A size guard bounds the DP matrix: when
+/// the middle is too large the diff splits on lines unique to both sides
+/// (patience-style anchors) and recurses, so a large file with two far-apart
+/// small edits still reports just those edits instead of the whole span as
+/// changed. Only a middle with no shared line at all falls back to a
+/// whole-block replace (all old lines removed, then all new lines added) —
+/// still correct, just less pretty.
 public enum TextDiff {
     /// Cap on the LCS middle-matrix size (cells). Beyond this the middle is
-    /// emitted as a whole-block replace. 4M Int32 cells ≈ 16MB peak, freed
-    /// after the call.
+    /// split on shared unique lines (or, failing that, emitted as a whole-block
+    /// replace). 4M Int32 cells ≈ 16MB peak, freed after the call.
     public static let maxLCSCells = 4_000_000
 
     public static func diff(old: String, new: String) -> [DiffLine] {
@@ -39,35 +43,38 @@ public enum TextDiff {
 
     public static func diff(oldLines: [String], newLines: [String]) -> [DiffLine] {
         var result: [DiffLine] = []
-        var old = oldLines
-        var new = newLines
+        appendRegion(oldLines[...], newLines[...], to: &result)
+        return result
+    }
 
+    /// One diff region: trim the common prefix and suffix (edits touch the
+    /// middle of a file, so this shrinks the problem to almost nothing), then
+    /// diff what is left. Recurses through `appendAnchored` for a middle too
+    /// large for the DP.
+    private static func appendRegion(_ old: ArraySlice<String>, _ new: ArraySlice<String>, to result: inout [DiffLine]) {
         // Common prefix: identical lines at the top are context.
         var prefix = 0
         let minPrefixCount = min(old.count, new.count)
-        while prefix < minPrefixCount, old[prefix] == new[prefix] {
+        while prefix < minPrefixCount, old[old.startIndex + prefix] == new[new.startIndex + prefix] {
             prefix += 1
         }
         for i in 0..<prefix {
-            result.append(DiffLine(kind: .same, text: old[i]))
+            result.append(DiffLine(kind: .same, text: old[old.startIndex + i]))
         }
-        old = Array(old.dropFirst(prefix))
-        new = Array(new.dropFirst(prefix))
+        let oldMiddle = old.dropFirst(prefix)
+        let newMiddle = new.dropFirst(prefix)
 
         // Common suffix: identical lines at the bottom are context.
         var suffix = 0
-        let minSuffixCount = min(old.count, new.count)
-        while suffix < minSuffixCount, old[old.count - 1 - suffix] == new[new.count - 1 - suffix] {
+        let minSuffixCount = min(oldMiddle.count, newMiddle.count)
+        while suffix < minSuffixCount,
+              oldMiddle[oldMiddle.endIndex - 1 - suffix] == newMiddle[newMiddle.endIndex - 1 - suffix] {
             suffix += 1
         }
-        let middleOld = Array(old.dropLast(suffix))
-        let middleNew = Array(new.dropLast(suffix))
-        appendMiddleDiff(middleOld, middleNew, to: &result)
-
+        appendMiddleDiff(Array(oldMiddle.dropLast(suffix)), Array(newMiddle.dropLast(suffix)), to: &result)
         for i in 0..<suffix {
-            result.append(DiffLine(kind: .same, text: old[old.count - suffix + i]))
+            result.append(DiffLine(kind: .same, text: oldMiddle[oldMiddle.endIndex - suffix + i]))
         }
-        return result
     }
 
     // MARK: - Middle
@@ -81,8 +88,12 @@ public enum TextDiff {
             for line in old { result.append(DiffLine(kind: .removed, text: line)) }
             return
         }
-        // Size guard: whole-block replace for huge middles.
+        // Size guard: split an over-cap middle on shared unique lines
+        // (patience-style) so two far-apart edits do not trap the whole
+        // unchanged span between them in one DP matrix. Only a middle with no
+        // unique shared line falls back to a whole-block replace.
         if old.count * new.count > maxLCSCells {
+            if appendAnchored(old, new, to: &result) { return }
             for line in old { result.append(DiffLine(kind: .removed, text: line)) }
             for line in new { result.append(DiffLine(kind: .added, text: line)) }
             return
@@ -135,6 +146,77 @@ public enum TextDiff {
             j -= 1
         }
         result.append(contentsOf: ops.reversed())
+    }
+
+    /// Splits an over-cap middle on lines that occur exactly once in BOTH
+    /// sides, using the longest increasing subsequence of those matches as
+    /// anchors. Returns false when no such anchor exists (the caller then does
+    /// a whole-block replace).
+    ///
+    /// This is what keeps a large file with two far-apart small edits from
+    /// being reported as "every line changed": the unchanged span between them
+    /// is matched as context instead of being trapped in one DP matrix.
+    private static func appendAnchored(_ old: [String], _ new: [String], to result: inout [DiffLine]) -> Bool {
+        var oldIndex: [String: Int] = [:]
+        var oldRepeated: Set<String> = []
+        for (index, line) in old.enumerated() {
+            if oldIndex.updateValue(index, forKey: line) != nil { oldRepeated.insert(line) }
+        }
+        var newIndex: [String: Int] = [:]
+        var newRepeated: Set<String> = []
+        for (index, line) in new.enumerated() {
+            if newIndex.updateValue(index, forKey: line) != nil { newRepeated.insert(line) }
+        }
+        var matches: [(old: Int, new: Int)] = []
+        for (line, oldPosition) in oldIndex
+        where !oldRepeated.contains(line) && !newRepeated.contains(line) {
+            if let newPosition = newIndex[line] {
+                matches.append((old: oldPosition, new: newPosition))
+            }
+        }
+        guard !matches.isEmpty else { return false }
+        matches.sort { $0.old < $1.old }
+        let anchors = longestIncreasingSubsequence(matches)
+        guard !anchors.isEmpty else { return false }
+
+        var oldCursor = 0
+        var newCursor = 0
+        for anchor in anchors {
+            appendRegion(old[oldCursor..<anchor.old], new[newCursor..<anchor.new], to: &result)
+            result.append(DiffLine(kind: .same, text: old[anchor.old]))
+            oldCursor = anchor.old + 1
+            newCursor = anchor.new + 1
+        }
+        appendRegion(old[oldCursor..<old.count], new[newCursor..<new.count], to: &result)
+        return true
+    }
+
+    /// The longest subsequence of `matches` (sorted by `old`) whose `new`
+    /// indices strictly increase — O(n log n) patience sorting. These are the
+    /// anchors that can be matched in order, so the spans between them are
+    /// independent subproblems.
+    private static func longestIncreasingSubsequence(_ matches: [(old: Int, new: Int)]) -> [(old: Int, new: Int)] {
+        var tails: [Int] = []
+        var previous = [Int](repeating: -1, count: matches.count)
+        for index in matches.indices {
+            let value = matches[index].new
+            var low = 0
+            var high = tails.count
+            while low < high {
+                let mid = (low + high) / 2
+                if matches[tails[mid]].new < value { low = mid + 1 } else { high = mid }
+            }
+            if low > 0 { previous[index] = tails[low - 1] }
+            if low == tails.count { tails.append(index) } else { tails[low] = index }
+        }
+        var anchors: [(old: Int, new: Int)] = []
+        var cursor = tails.last
+        while let index = cursor {
+            anchors.append(matches[index])
+            let prior = previous[index]
+            cursor = prior >= 0 ? prior : nil
+        }
+        return anchors.reversed()
     }
 
     // MARK: - Hunks

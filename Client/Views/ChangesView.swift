@@ -69,9 +69,10 @@ struct ChangesView: View {
                         // AppKit Liquid Glass (see `GlassBackground`), not
                         // SwiftUI's `.glassEffect`, which renders through the
                         // hosting tree and re-renders the whole sampled backdrop
-                        // whenever the content behind it changes.
+                        // whenever the content behind it changes. Same material
+                        // and corner radius as every other glass surface.
                         .background {
-                            GlassBackground(shape: .roundedRectangle(cornerRadius: 12))
+                            GlassBackground(shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius))
                         }
                         .padding(8)
                 }

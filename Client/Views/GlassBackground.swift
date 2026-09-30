@@ -23,7 +23,9 @@ struct GlassBackground: NSViewRepresentable {
     }
 
     var shape: Shape = .roundedRectangle(cornerRadius: WindowChrome.cornerRadius)
-    var style: NSGlassEffectView.Style = .regular
+    /// A semantic tint (the error banner rides the glass in red). Every other
+    /// surface leaves this nil, so the untinted material is identical across
+    /// all chrome.
     var tint: NSColor?
 
     func makeNSView(context: Context) -> AdaptiveGlassView {
@@ -37,7 +39,13 @@ struct GlassBackground: NSViewRepresentable {
     }
 
     private func apply(to view: AdaptiveGlassView) {
-        view.style = style
+        // ONE material for every glass surface in the app (toolbar chrome,
+        // tab bars, the composer, panels, banners). The style is deliberately
+        // not a parameter: a single `.clear` capsule used to sit next to
+        // `.regular` ones and read as a different material (the "nav bar
+        // doesn't match the sub-nav/prompt" mismatch). Shape may vary (a
+        // capsule pill vs a rounded panel); the material may not.
+        view.style = .regular
         view.tintColor = tint
         switch shape {
         case .roundedRectangle(let radius):
