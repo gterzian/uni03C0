@@ -70,11 +70,13 @@ final class AdaptiveGlassView: NSGlassEffectView {
 
     override func layout() {
         super.layout()
+        let radius: CGFloat
         switch cornerMode {
-        case .fixed(let radius):
-            cornerRadius = radius
-        case .capsule:
-            cornerRadius = bounds.height / 2
+        case .fixed(let value): radius = value
+        case .capsule: radius = bounds.height / 2
         }
+        // Only when it actually changes: an unconditional set re-renders the
+        // glass on every layout pass, which during streaming is every frame.
+        if cornerRadius != radius { cornerRadius = radius }
     }
 }

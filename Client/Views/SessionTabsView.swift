@@ -16,44 +16,54 @@ struct SessionTabsView: View {
 
     @State private var tabs: [SessionTab] = []
     @State private var activeID: SessionTab.ID?
-    /// The measured height of the floating tab panel: the transcript's top
-    /// content inset, so conversation content scrolls to the very top and
-    /// bleeds under the glass instead of stopping below it.
-    @State private var tabPanelHeight: CGFloat = 0
+    /// The measured height of the floating top chrome (the tab nav on the left,
+    /// the session controls on the right): the transcript's top content inset,
+    /// so conversation content scrolls to the very top and bleeds under the
+    /// glass instead of stopping below it.
+    @State private var topChromeHeight: CGFloat = 0
 
     init(initialCwd: URL) {
         self.initialCwd = initialCwd
     }
 
     var body: some View {
-        // The tab panel FLOATS over the session content: the pills carry their
-        // own Liquid Glass, and the content scrolls under them (no painted
-        // bar, per Apple's "reduce custom backgrounds in navigation").
+        // The whole top bar FLOATS over the session content: the native
+        // titlebar is transparent with no toolbar (see `MainWindowTag`), and
+        // every control carries its own Liquid Glass, so the content scrolls
+        // under it (no painted bar, per Apple's "reduce custom backgrounds in
+        // navigation"). The tab nav + page switch sit top-left; the app-level
+        // session controls (stop/reload, model, thinking, resume, appearance)
+        // sit top-right — the same functional split the old toolbar had.
         ZStack(alignment: .top) {
             VStack(spacing: 0) {
                 if let active = activeTab {
-                    SessionContent(tab: active, topInset: tabPanelHeight)
+                    SessionContent(tab: active, topInset: topChromeHeight)
                 }
                 tabShortcuts
             }
-            tabPanel
+            // The floating chrome overlays the content: each control cluster
+            // carries its own AppKit Liquid Glass, so the pills blur whatever
+            // is behind THEM — there is no backdrop band, content stays sharp
+            // right up to the window's top edge.
+            topChrome
                 .background {
                     GeometryReader { proxy in
-                        Color.clear.preference(key: TabPanelHeightKey.self, value: proxy.size.height)
+                        Color.clear.preference(key: TopChromeHeightKey.self, value: proxy.size.height)
                     }
                 }
         }
-        .onPreferenceChange(TabPanelHeightKey.self) { tabPanelHeight = $0 }
-        // The split view's automatic sidebar toggle lives in the window
-        // toolbar; remove it and keep the toggle in the diff panel's own
-        // floating chrome instead.
-        .toolbar(removing: .sidebarToggle)
+        .onPreferenceChange(TopChromeHeightKey.self) { topChromeHeight = $0 }
+        // The titlebar is hidden (see `ClientApp` / `MainWindowTag`), but
+        // SwiftUI still reserves its height as a top safe area — that reserved
+        // strip is the empty band above the floating chrome. Draw from the
+        // window's very top edge instead; the chrome clears the traffic lights
+        // with its own leading padding, and the transcript/diff scroll under
+        // both. The chrome's measured height (including this padding) is what
+        // the content insets by, so nothing hides behind it.
+        .ignoresSafeArea(.container, edges: .top)
+        // The window title is hidden by the transparent titlebar, but kept for
+        // the Window menu / Mission Control.
         .navigationTitle(activeTab?.cwd.lastPathComponent ?? "uni03C0")
-        .toolbar {
-            if let active = activeTab {
-                SessionToolbar.content(tab: active)
-            }
-        }
         .task { await bootstrap() }
         .onDisappear { tearDownAll() }
     }
@@ -152,30 +162,48 @@ struct SessionTabsView: View {
         .accessibilityHidden(true)
     }
 
-    // MARK: - Tab panel
+    // MARK: - Top chrome
 
-    /// The whole tab chrome: the outer session tabs (one per folder) plus, for
-    /// the ACTIVE session only, its nested page tabs — Session / Changes. The
-    /// nested strip lives in the PANEL (not the session content) so it reads as
-    /// navigation within the active top-level tab: it hangs directly under the
-    /// active pill, shares the panel's background, and disappears when another
-    /// session tab is selected (each session keeps its own page choice).
-    private var tabPanel: some View {
-        // The panel's glass lives on the two capsules (the tab row and the
-        // nested Session/Changes switch), each an AppKit `NSGlassEffectView`
-        // (see `GlassBackground`) rather than SwiftUI's `.glassEffect`: the
-        // SwiftUI modifier renders through the hosting tree and re-renders the
-        // whole sampled backdrop (the session window) whenever the streaming
-        // content behind it changes.
-        VStack(alignment: .leading, spacing: 0) {
-            outerTabBar
-                .padding(.horizontal, 10)
-                .padding(.top, 6)
+    /// The floating top chrome: the tab navigation on the left (outer session
+    /// tabs plus the active session's nested Session / Changes switch) and the
+    /// app-level session controls on the right. An in-session find bar, when
+    /// open, floats between them. Each cluster carries its own AppKit Liquid
+    /// Glass (see `GlassBackground`), never SwiftUI's `.glassEffect`: the
+    /// SwiftUI modifier renders through the hosting tree and re-renders the
+    /// whole sampled backdrop (the session window) whenever the streaming
+    /// content behind it changes.
+    ///
+    /// With the native titlebar transparent and no toolbar, the traffic lights
+    /// float at the window's top-left, so the leading padding clears them.
+    private var topChrome: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
+                outerTabBar
+                    .padding(.horizontal, 10)
+                if let active = activeTab {
+                    nestedPageTabs(active)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 8)
+
+            if let active = activeTab, active.viewModel.isSearchVisible {
+                SessionSearchBar(vm: active.viewModel)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background { GlassBackground(shape: .capsule) }
+            }
+
+            Spacer(minLength: 8)
+
             if let active = activeTab {
-                nestedPageTabs(active)
+                SessionToolbarView(tab: active)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 78)
+        .padding(.trailing, 12)
+        .padding(.top, 6)
     }
 
     private var outerTabBar: some View {
@@ -207,30 +235,30 @@ struct SessionTabsView: View {
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under
-    /// its outer pill (see `tabPanel`). A real segmented control, so the Liquid
+    /// its outer pill (see `topChrome`). A real segmented control, so the Liquid
     /// Glass segmented look and the platform's own semantics (selected state,
     /// group traits, keyboard traversal) come for free — the old custom pills
     /// had to stitch those together by hand. A segment has no native badge
     /// slot, so the edited-file count rides in the Changes label.
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
         @Bindable var tab = tab
-        return HStack(spacing: 8) {
-            // A neutral glass segmented control: the native segmented picker
-            // paints its selection in the system accent (too loud here), so
-            // this keeps the same floating-pill language as the tabs and marks
-            // the selected segment with a quiet primary tint instead.
-            HStack(spacing: 0) {
-                pageTab("Session", selected: tab.page == .conversation) {
-                    tab.page = .conversation
-                }
-                pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
-                    tab.page = .changes
-                }
+        // A neutral glass segmented control: the native segmented picker
+        // paints its selection in the system accent (too loud here), so
+        // this keeps the same floating-pill language as the tabs and marks
+        // the selected segment with a quiet primary tint instead.
+        return HStack(spacing: 0) {
+            pageTab("Session", selected: tab.page == .conversation) {
+                tab.page = .conversation
             }
-            .padding(2)
-            .background { GlassBackground(shape: .capsule) }
-            Spacer(minLength: 0)
+            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
+                tab.page = .changes
+            }
         }
+        .padding(2)
+        .background { GlassBackground(shape: .capsule) }
+        .fixedSize()
+        // Content-sized: the nested switch hangs under the outer pills and
+        // must not stretch the leading cluster into the settings cluster.
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
     }
@@ -335,12 +363,12 @@ struct SessionTabsView: View {
     }
 }
 
-// MARK: - Tab panel height preference
+// MARK: - Top chrome height preference
 
-/// Reports the floating tab panel's height to `SessionTabsView`, which passes
+/// Reports the floating top chrome's height to `SessionTabsView`, which passes
 /// it to the transcript as a top content inset — the conversation scrolls
-/// under the panel, never hidden behind it.
-private struct TabPanelHeightKey: PreferenceKey {
+/// under the chrome, never hidden behind it.
+private struct TopChromeHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())

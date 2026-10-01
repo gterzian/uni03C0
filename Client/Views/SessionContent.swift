@@ -3,9 +3,13 @@ import Core
 import SwiftUI
 
 /// Shared metrics for the prompt bar height: the auto-grow minimum/maximum
-/// and the resize-handle clamp. The default matches the old fixed height.
+/// and the resize-handle clamp. `defaultHeight` and `minHeight` are the SAME
+/// on purpose: sending a prompt reports a zero content height, which snaps the
+/// bar to `minHeight`, so a taller default used to collapse on the first send
+/// (sending looked like the box shrinking). The resting size is one value —
+/// half of the old 208 default.
 enum PromptBarMetrics {
-    static let minHeight: CGFloat = 64
+    static let minHeight: CGFloat = 104
     static let maxHeight: CGFloat = 400
     static let defaultHeight: CGFloat = 104
 
@@ -64,15 +68,22 @@ struct SessionContent: View {
                 // view can never inflate the page past its slot (belt to the
                 // `sizeThatFits` braces on the viewer).
                 GeometryReader { proxy in
-                    ChangesView(store: tab.changes, pageActive: tab.page == .changes, bottomInset: promptBarHeight)
-                        .id(tab.id)
-                        .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+                    ChangesView(
+                        store: tab.changes,
+                        pageActive: tab.page == .changes,
+                        topInset: topInset,
+                        bottomInset: promptBarHeight
+                    )
+                    .id(tab.id)
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
                 }
-                // The Changes page owns its own floating diff header and a
-                // sidebar, so it sits BELOW the tab panel. It extends to the
-                // bottom edge (the diff document carries the prompt bar as a
-                // bottom inset) so the code bleeds under the floating bar.
-                .padding(.top, topInset)
+                // The Changes page fills the slot to the top edge — the diff
+                // bleeds under the floating tab chrome, which is what "no top
+                // bar" means on this page too. `topInset` is handed to the page
+                // instead of padding the page down: its own floating header and
+                // file list are offset by it, and the diff document carries it
+                // (plus that header) as its top content inset. It extends to the
+                // bottom edge the same way (the prompt bar as bottom inset).
                 .opacity(tab.page == .changes ? 1 : 0)
                 .allowsHitTesting(tab.page == .changes)
                 .accessibilityHidden(tab.page != .changes)

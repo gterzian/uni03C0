@@ -27,10 +27,15 @@ struct MainWindowView: View {
 
 /// Tags the window this view lives in, so menu commands and the app
 /// delegate's single-window guard can identify the main window (as opposed to
-/// the Settings window). It also removes the split view's automatic
-/// sidebar-toggle toolbar item: SwiftUI adds it for `NavigationSplitView`, and
-/// `.toolbar(removing:)` does not reliably win, but the toggle belongs in the
-/// diff panel's own floating chrome.
+/// the Settings window), and turns the native titlebar into an invisible frame
+/// for the window's OWN floating glass chrome. `ClientApp` already asks for
+/// `.windowStyle(.hiddenTitleBar)` (the declarative route Apple recommends);
+/// this is the AppKit backstop — it re-asserts the hidden title, transparent
+/// titlebar, and full-size content on every update, and drops any toolbar
+/// SwiftUI re-adds (the sidebar toggle), so the window never grows a painted
+/// bar behind the floating capsules. The traffic lights float at the top-left;
+/// every navigation and session control is an AppKit Liquid Glass capsule
+/// inside the content (see `SessionTabsView`).
 struct MainWindowTag: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -50,12 +55,25 @@ struct MainWindowTag: NSViewRepresentable {
 
         func attach(to view: NSView) {
             DispatchQueue.main.async { [weak self, weak view] in
-                guard let self, let view else { return }
-                view.window?.identifier = NSUserInterfaceItemIdentifier(SceneIDs.mainWindow)
-                guard let toolbar = view.window?.toolbar else { return }
+                guard let self, let view, let window = view.window else { return }
+                window.identifier = NSUserInterfaceItemIdentifier(SceneIDs.mainWindow)
+                Self.configureChrome(window)
+                guard let toolbar = window.toolbar else { return }
                 self.observe(toolbar)
                 Self.removeToggle(from: toolbar)
             }
+        }
+
+        /// Hides the native titlebar/toolbar so the content's floating glass is
+        /// the top bar. Idempotent: SwiftUI can re-apply window state on an
+        /// update, so this runs on every `updateNSView`. `titlebarAppearsTransparent`
+        /// + `fullSizeContentView` let the transcript/diff draw all the way to
+        /// the window's top edge under the glass capsules.
+        static func configureChrome(_ window: NSWindow) {
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.styleMask.insert(.fullSizeContentView)
+            window.toolbar?.isVisible = false
         }
 
         private func observe(_ toolbar: NSToolbar) {

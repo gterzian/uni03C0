@@ -21,6 +21,14 @@ struct ChangesView: View {
     /// syntax highlighting for an off-screen page).
     var pageActive = true
 
+    /// Height of the floating top chrome (the app's session tabs + the
+    /// Session/Changes switch) that this page scrolls under. The page itself
+    /// fills the window's top edge; the floating diff header and file list are
+    /// offset by this so they clear the chrome, and the diff document carries
+    /// it (plus the header) as its top content inset so the code bleeds under
+    /// both instead of stopping below a painted band.
+    var topInset: CGFloat = 0
+
     /// Find-in-diff state for the whole viewer (Cmd+F).
     @State private var search = CodeSearchModel()
     /// Whether the floating file list is open. CLOSED by default: the diff is
@@ -65,7 +73,7 @@ struct ChangesView: View {
             if showSidebar {
                 GeometryReader { proxy in
                     changedList
-                        .frame(width: sidebarWidth, height: max(0, proxy.size.height - 16))
+                        .frame(width: sidebarWidth, height: max(0, proxy.size.height - 16 - topInset))
                         // AppKit Liquid Glass (see `GlassBackground`), not
                         // SwiftUI's `.glassEffect`, which renders through the
                         // hosting tree and re-renders the whole sampled backdrop
@@ -75,6 +83,9 @@ struct ChangesView: View {
                             GlassBackground(shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius))
                         }
                         .padding(8)
+                        // The floating file list is navigation chrome: it sits
+                        // clear of the app's floating tab chrome above it.
+                        .padding(.top, topInset)
                 }
                 .transition(.move(edge: .leading).combined(with: .opacity))
             }
@@ -339,17 +350,6 @@ struct ChangesView: View {
                 }
         }
         .onPreferenceChange(ViewerHeaderHeightKey.self) { headerHeight = $0 }
-        // Find-in-diff now lives in the window toolbar (exactly where the
-        // session find bar already lives), instead of inline in the header.
-        // Gated on `pageActive` because the Changes page stays mounted: an
-        // ungated toolbar item would leak onto the conversation page.
-        .toolbar {
-            if pageActive, search.isVisible {
-                ToolbarItem(placement: .primaryAction) {
-                    CodeSearchBar(model: search, placeholder: "Find in diffs…")
-                }
-            }
-        }
     }
 
     /// The diff panel's floating chrome: the sidebar toggle plus the selected
@@ -405,9 +405,22 @@ struct ChangesView: View {
                         .accessibilityLabel("File \(index + 1) of \(store.entries.count)")
                 }
             }
+
+            // Find-in-diff lives in the floating header (the window toolbar is
+            // gone), as its own glass capsule beside the file title.
+            if search.isVisible {
+                CodeSearchBar(model: search, placeholder: "Find in diffs…")
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background { GlassBackground(shape: .capsule) }
+            }
         }
         .padding(.horizontal, 10)
-        .padding(.top, 8)
+        // The header floats directly under the app's tab chrome; `topInset` is
+        // its height, so the pill lands below the chrome. The measured header
+        // height includes it, which is why the document's own top inset is just
+        // `headerHeight` (see `diffArea`).
+        .padding(.top, 8 + topInset)
         .padding(.bottom, 6)
     }
 
