@@ -91,6 +91,12 @@ final class SessionTab: Identifiable {
         self.cwd = cwd
         self.viewModel = SessionViewModel(cwd: cwd, projectsRoot: projectsRoot)
         self.changes = ChangesStore(cwd: cwd)
+        // Keep the badge on the same baseline as the viewer: when the store
+        // re-pins it (a new turn, or an out-of-band branch switch it detected),
+        // re-count against that commit so the two surfaces never disagree.
+        changes.onBaselineChanged = { [weak self] in
+            self?.scheduleGitCountRefresh()
+        }
         // When an abort ends the turn, queued steering is appended back into
         // the prompt input (a push-back that coexists with any in-flight
         // streamed paste, which keeps pushing to the front).

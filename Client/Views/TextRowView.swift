@@ -109,7 +109,7 @@ enum TranscriptText {
             result.append(NSAttributedString(string: "▌", attributes: [
                 .font: bodyFont,
                 // Light base; TextRowView pulses it between light and lighter.
-                .foregroundColor: NSColor.systemBlue.withAlphaComponent(0.6),
+                .foregroundColor: NSColor.systemBlue.faded(alpha: 0.6),
             ]))
         }
         // Cache read rate for the finished turn, below the final response.
@@ -218,6 +218,31 @@ enum SearchMatchHighlight {
         return dark
             ? NSColor(calibratedRed: 0.40, green: 0.33, blue: 0.12, alpha: 1.0)
             : NSColor(calibratedRed: 0.99, green: 0.88, blue: 0.40, alpha: 1.0)
+    }
+}
+
+extension NSColor {
+    /// Returns this color with `alpha` applied, staying DYNAMIC.
+    ///
+    /// `NSColor.withAlphaComponent` collapses a catalog color (`labelColor`,
+    /// `secondaryLabelColor`) into fixed components resolved in whatever
+    /// appearance is current at CALL time. Outside a drawing pass that is the
+    /// process/system appearance — not the window's — so with the app's
+    /// appearance forced darker than the system's (Appearance → Dark on a
+    /// light Mac) `labelColor.withAlphaComponent(0.5)` is BLACK at half alpha.
+    /// The streaming fade stored that in the text storage and painted the
+    /// newest text black on the dark background ("black on black") until the
+    /// fade ended or the row was rebuilt. A dynamic provider applies the alpha
+    /// in the appearance the color is drawn in, so it stays correct in both
+    /// appearances and across a mid-session toggle.
+    nonisolated func faded(alpha: CGFloat) -> NSColor {
+        NSColor(name: nil) { appearance in
+            var resolved = self
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = self.withAlphaComponent(alpha)
+            }
+            return resolved
+        }
     }
 }
 
@@ -630,7 +655,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
             idx = eff.upperBound
         }
         for run in runs {
-            storage.addAttribute(.foregroundColor, value: run.color.withAlphaComponent(run.startAlpha), range: run.range)
+            storage.addAttribute(.foregroundColor, value: run.color.faded(alpha: run.startAlpha), range: run.range)
         }
         pendingFadeRuns = runs.map { (range: $0.range, color: $0.color) }
         let steps = 6
@@ -654,7 +679,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
                     // left every faded-in run slightly DARKER than the text
                     // around it — reading as stray bold until a full re-render.
                     let alpha = run.startAlpha + (run.color.alphaComponent - run.startAlpha) * t
-                    storage.addAttribute(.foregroundColor, value: isLast ? run.color : run.color.withAlphaComponent(alpha), range: clipped)
+                    storage.addAttribute(.foregroundColor, value: isLast ? run.color : run.color.faded(alpha: alpha), range: clipped)
                 }
             }
         }
@@ -725,8 +750,8 @@ final class TextRowView: NSView, NSTextViewDelegate {
         let range = NSRange(location: storage.length - 1, length: 1)
         caretBright.toggle()
         let color: NSColor = caretBright
-            ? NSColor.systemBlue.withAlphaComponent(0.6)
-            : NSColor.systemBlue.withAlphaComponent(0.2)
+            ? NSColor.systemBlue.faded(alpha: 0.6)
+            : NSColor.systemBlue.faded(alpha: 0.2)
         storage.addAttribute(.foregroundColor, value: color, range: range)
     }
 

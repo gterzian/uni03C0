@@ -16,26 +16,54 @@ struct SessionTabsView: View {
 
     @State private var tabs: [SessionTab] = []
     @State private var activeID: SessionTab.ID?
+    /// The measured height of the floating top chrome (the tab nav on the left,
+    /// the session controls on the right): the transcript's top content inset,
+    /// so conversation content scrolls to the very top and bleeds under the
+    /// glass instead of stopping below it.
+    @State private var topChromeHeight: CGFloat = 0
 
     init(initialCwd: URL) {
         self.initialCwd = initialCwd
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            tabPanel
-            Divider()
-            if let active = activeTab {
-                SessionContent(tab: active)
+        // The whole top bar FLOATS over the session content: the native
+        // titlebar is transparent with no toolbar (see `MainWindowTag`), and
+        // every control carries its own Liquid Glass, so the content scrolls
+        // under it (no painted bar, per Apple's "reduce custom backgrounds in
+        // navigation"). The tab nav + page switch sit top-left; the app-level
+        // session controls (stop/reload, model, thinking, resume, appearance)
+        // sit top-right — the same functional split the old toolbar had.
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                if let active = activeTab {
+                    SessionContent(tab: active, topInset: topChromeHeight)
+                }
+                tabShortcuts
             }
-            tabShortcuts
+            // The floating chrome overlays the content: each control cluster
+            // carries its own AppKit Liquid Glass, so the pills blur whatever
+            // is behind THEM — there is no backdrop band, content stays sharp
+            // right up to the window's top edge.
+            topChrome
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(key: TopChromeHeightKey.self, value: proxy.size.height)
+                    }
+                }
         }
+        .onPreferenceChange(TopChromeHeightKey.self) { topChromeHeight = $0 }
+        // The titlebar is hidden (see `ClientApp` / `MainWindowTag`), but
+        // SwiftUI still reserves its height as a top safe area — that reserved
+        // strip is the empty band above the floating chrome. Draw from the
+        // window's very top edge instead; the chrome clears the traffic lights
+        // with its own leading padding, and the transcript/diff scroll under
+        // both. The chrome's measured height (including this padding) is what
+        // the content insets by, so nothing hides behind it.
+        .ignoresSafeArea(.container, edges: .top)
+        // The window title is hidden by the transparent titlebar, but kept for
+        // the Window menu / Mission Control.
         .navigationTitle(activeTab?.cwd.lastPathComponent ?? "uni03C0")
-        .toolbar {
-            if let active = activeTab {
-                SessionToolbar.content(tab: active)
-            }
-        }
         .task { await bootstrap() }
         .onDisappear { tearDownAll() }
     }
@@ -134,22 +162,48 @@ struct SessionTabsView: View {
         .accessibilityHidden(true)
     }
 
-    // MARK: - Tab panel
+    // MARK: - Top chrome
 
-    /// The whole tab chrome: the outer session tabs (one per folder) plus, for
-    /// the ACTIVE session only, its nested page tabs — Session / Changes. The
-    /// nested strip lives in the PANEL (not the session content) so it reads as
-    /// navigation within the active top-level tab: it hangs directly under the
-    /// active pill, shares the panel's background, and disappears when another
-    /// session tab is selected (each session keeps its own page choice).
-    private var tabPanel: some View {
-        VStack(spacing: 0) {
-            outerTabBar
+    /// The floating top chrome: the tab navigation on the left (outer session
+    /// tabs plus the active session's nested Session / Changes switch) and the
+    /// app-level session controls on the right. An in-session find bar, when
+    /// open, floats between them. Each cluster carries its own AppKit Liquid
+    /// Glass (see `GlassBackground`), never SwiftUI's `.glassEffect`: the
+    /// SwiftUI modifier renders through the hosting tree and re-renders the
+    /// whole sampled backdrop (the session window) whenever the streaming
+    /// content behind it changes.
+    ///
+    /// With the native titlebar transparent and no toolbar, the traffic lights
+    /// float at the window's top-left, so the leading padding clears them.
+    private var topChrome: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
+                outerTabBar
+                    .padding(.horizontal, 10)
+                if let active = activeTab {
+                    nestedPageTabs(active)
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 8)
+
+            if let active = activeTab, active.viewModel.isSearchVisible {
+                SessionSearchBar(vm: active.viewModel)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background { GlassBackground(shape: .capsule) }
+            }
+
+            Spacer(minLength: 8)
+
             if let active = activeTab {
-                nestedPageTabs(active)
+                SessionToolbarView(tab: active)
             }
         }
-        .background(.bar)
+        .padding(.leading, 78)
+        .padding(.trailing, 12)
+        .padding(.top, 6)
     }
 
     private var outerTabBar: some View {
@@ -167,95 +221,72 @@ struct SessionTabsView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .help("Start a new session in another folder")
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        // One liquid group: a capsule that gathers the small pills into a
+        // single, findable unit. It is sized to its content — never a
+        // full-width bar. The one glass surface for the whole tab row (the
+        // pills themselves are plain content on it): AppKit Liquid Glass, see
+        // `GlassBackground` — the SAME material as the nested page tabs, the
+        // composer, and every other glass surface.
+        .fixedSize()
+        .background { GlassBackground(shape: .capsule) }
     }
 
     /// Session / Changes — the page tabs of the ACTIVE session, nested under
-    /// its outer pill (see `tabPanel`). The Changes tab carries the
-    /// edited-file count so a session with uncommitted changes advertises them
-    /// at the tab level.
+    /// its outer pill (see `topChrome`). A real segmented control, so the Liquid
+    /// Glass segmented look and the platform's own semantics (selected state,
+    /// group traits, keyboard traversal) come for free — the old custom pills
+    /// had to stitch those together by hand. A segment has no native badge
+    /// slot, so the edited-file count rides in the Changes label.
     private func nestedPageTabs(_ tab: SessionTab) -> some View {
-        HStack(spacing: 3) {
-            pageTabButton(
-                title: "Session",
-                icon: "text.bubble",
-                isSelected: tab.page == .conversation,
-                help: "Show the conversation with the agent"
-            ) {
+        @Bindable var tab = tab
+        // A neutral glass segmented control: the native segmented picker
+        // paints its selection in the system accent (too loud here), so
+        // this keeps the same floating-pill language as the tabs and marks
+        // the selected segment with a quiet primary tint instead.
+        return HStack(spacing: 0) {
+            pageTab("Session", selected: tab.page == .conversation) {
                 tab.page = .conversation
             }
-            pageTabButton(
-                title: "Changes",
-                icon: "plus.forwardslash.minus",
-                isSelected: tab.page == .changes,
-                badge: tab.gitChangeCount,
-                help: "Review the uncommitted diff of this session's folder"
-            ) {
+            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
                 tab.page = .changes
             }
-            Spacer(minLength: 0)
         }
+        .padding(2)
+        .background { GlassBackground(shape: .capsule) }
+        .fixedSize()
+        // Content-sized: the nested switch hangs under the outer pills and
+        // must not stretch the leading cluster into the settings cluster.
         .padding(.horizontal, 10)
         .padding(.bottom, 6)
     }
 
-    /// One nested page tab: a compact pill in the outer pills' visual language
-    /// (accent-tinted when selected), with the edited-file count badge on the
-    /// Changes tab.
-    private func pageTabButton(
-        title: String,
-        icon: String,
-        isSelected: Bool,
-        badge: Int? = nil,
-        help: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        // The badge is visual-only; the selected state and the badge count go
-        // into the accessibility label + traits so VoiceOver announces
-        // "Changes, 3 edited files, selected" instead of a plain unselected
-        // button (the custom pills carry none of the segmented control's
-        // free semantics — selected state, group traits).
-        let accessibilityLabel: String
-        if let badge, badge > 0 {
-            accessibilityLabel = "\(title), \(badge) edited file\(badge == 1 ? "" : "s")"
-        } else {
-            accessibilityLabel = title
-        }
-        return Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 10))
-                Text(title)
-                    .font(.system(size: 11))
-                    .fontWeight(isSelected ? .semibold : .regular)
-                if let badge, badge > 0 {
-                    Text("\(badge)")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 0.5)
-                        .background(
-                            Color.accentColor.opacity(isSelected ? 0.3 : 0.18),
-                            in: Capsule()
-                        )
-                }
-            }
-            .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 3)
-            .background(
-                isSelected ? Color.accentColor.opacity(0.14) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 6)
-            )
-            .contentShape(Rectangle())
+    /// One segment of the Session/Changes switch. Neutral by design: a
+    /// primary-tint fill marks the selection instead of the accent colour.
+    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .accessibilityLabel(title)
+    }
+
+    /// The Changes segment's title, carrying the edited-file count when there
+    /// is one (the badge the custom pill used to draw).
+    private func changesTitle(_ count: Int?) -> String {
+        if let count, count > 0 {
+            return "Changes (\(count))"
+        }
+        return "Changes"
     }
 
     /// One tab: the session's folder name, its live status icon (spinner
@@ -271,9 +302,10 @@ struct SessionTabsView: View {
                     statusIcon(tab)
                     Image(systemName: "folder")
                         .font(.system(size: 11))
-                        .foregroundStyle(.blue)
+                        .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
                     Text(tab.cwd.lastPathComponent)
-                        .font(.system(size: 12))
+                        .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+                        .foregroundStyle(isActive ? Color.primary : Color.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
@@ -297,10 +329,16 @@ struct SessionTabsView: View {
         .padding(.leading, 10)
         .padding(.trailing, tabs.count > 1 ? 6 : 10)
         .padding(.vertical, 4)
-        .background(
-            isActive ? Color.accentColor.opacity(0.14) : Color.clear,
-            in: RoundedRectangle(cornerRadius: 7)
-        )
+        // The pills are plain content on the row's single AppKit glass capsule
+        // (see `outerTabBar`); the active one carries only a faint accent fill.
+        // A per-pill glass would nest glass shapes over the streaming content —
+        // another sampled backdrop — and Liquid Glass can't sample glass
+        // consistently.
+        .background {
+            if isActive {
+                Capsule().fill(Color.accentColor.opacity(0.12))
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { activeID = tab.id }
         .help(tab.cwd.path)
@@ -322,5 +360,17 @@ struct SessionTabsView: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 16)
         }
+    }
+}
+
+// MARK: - Top chrome height preference
+
+/// Reports the floating top chrome's height to `SessionTabsView`, which passes
+/// it to the transcript as a top content inset — the conversation scrolls
+/// under the chrome, never hidden behind it.
+private struct TopChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

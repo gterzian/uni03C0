@@ -24,6 +24,11 @@ struct ClientApp: App {
             ProjectRef(cwd: AppState.shared.projectsRoot == nil ? nil : AppState.shared.lastProject)
         }
         .defaultSize(width: 920, height: 720)
+        // The window's own chrome is the floating glass the content draws
+        // (see `SessionTabsView`): hide the title AND the titlebar backing so
+        // the only visible "top bar" is that glass, with the content running
+        // to the window's top edge beneath it. The traffic lights stay.
+        .windowStyle(.hiddenTitleBar)
         .commands {
             AppCommands()
         }

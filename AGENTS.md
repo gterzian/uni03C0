@@ -25,7 +25,8 @@ history.
   `reset`, `revert`, `rebase`, `merge`, `cherry-pick`, `stash` push/pop/drop,
   `tag`, `branch -m`, `clean`, `rm`, `mv`, config writes, `init`, `gc`,
   `filter-branch` — anything that writes.
-- When the user asks to "commit", **suggest a commit message**; never run it.
+- When the user asks to "commit", **suggest a commit message without a
+  `Signed-off-by` line** (it is added automatically); never run it.
 
 ## Three properties every change must preserve
 

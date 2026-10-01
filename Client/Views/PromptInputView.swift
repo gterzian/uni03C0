@@ -127,18 +127,24 @@ struct PromptInputView: NSViewRepresentable {
             onRestoreConsumed()
         }
     }
+
+    /// Fill the SwiftUI-assigned frame, never the AppKit container's own fitting
+    /// size. Pin the size explicitly so becoming first responder (which brings
+    /// the status pill and the glass into play) can never re-measure the
+    /// composer and shrink it.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PromptContainerView, context: Context) -> CGSize? {
+        func finite(_ value: CGFloat?) -> CGFloat {
+            guard let value, value.isFinite else { return 0 }
+            return value
+        }
+        return CGSize(width: finite(proposal.width), height: finite(proposal.height))
+    }
 }
 
 // MARK: - Container
 
 final class PromptContainerView: NSView {
     let textView = PromptTextView()
-    /// Very-light-gray status readout pinned to the bottom-right inside the
-    /// prompt bar: context %, model, thinking level. Purely decorative — it
-    /// never intercepts clicks or keys. The scroll view's bottom inset
-    /// reserves a strip taller than this label, so text can never scroll
-    /// underneath it.
-    let statusLabel = NSTextField(labelWithString: "")
     /// Small spinner shown while a windowed paste is active.
     let streamingIndicator = NSProgressIndicator()
     /// Dismisses a windowed paste (✕ next to the spinner): empties the input
@@ -174,9 +180,10 @@ final class PromptContainerView: NSView {
         scrollView.borderType = .noBorder
         scrollView.wantsLayer = true
         // Reserve the bottom strip for the status readout so typed text never
-        // scrolls under it. 26pt clears the label (top edge ~16pt up) by ~10pt
-        // even for descenders on the last line.
-        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 26, right: 0)
+        // scrolls under it. The readout now sits on its own glass pill, so the
+        // text can scroll right up to it and blur behind it instead of being
+        // clipped above it.
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         textView.isEditable = true
         textView.isRichText = false
@@ -213,20 +220,6 @@ final class PromptContainerView: NSView {
         textView.setAccessibilityLabel("Message")
         textView.setAccessibilityHelp("Enter a message for the agent. Tab completes file paths; Escape aborts the current operation. Control-C clears the input — Command-Z restores it.")
 
-        statusLabel.font = .systemFont(ofSize: 10)
-        // Very-light-gray readout normally; strengthened under Increase
-        // Contrast. Dynamic color (resolved per draw), so a toggle applies
-        // live.
-        statusLabel.textColor = NSColor(name: nil) { _ in
-            DisplayOptions.increaseContrast
-                ? .secondaryLabelColor
-                : .tertiaryLabelColor
-        }
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(250), for: .horizontal)
-        statusLabel.isHidden = true
-
         streamingIndicator.style = .spinning
         streamingIndicator.controlSize = .small
         streamingIndicator.isHidden = true
@@ -248,7 +241,6 @@ final class PromptContainerView: NSView {
         restoreHintLabel.setAccessibilityElement(false)
 
         addSubview(scrollView)
-        addSubview(statusLabel)
         addSubview(streamingIndicator)
         addSubview(pasteClearButton)
         addSubview(restoreHintLabel)
@@ -257,8 +249,6 @@ final class PromptContainerView: NSView {
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
             streamingIndicator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             streamingIndicator.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             pasteClearButton.trailingAnchor.constraint(equalTo: streamingIndicator.leadingAnchor, constant: -6),
@@ -269,20 +259,16 @@ final class PromptContainerView: NSView {
         applyInputAppearance()
     }
 
-    /// The window's corner radius, matched by the prompt input so the two
-    /// read as one surface instead of a square field poking into a rounded
-    /// window.
-    private static let cornerRadius: CGFloat = 10
-
     /// Rounds the input and paints its background/border. Layer colors don't
     /// follow the effective appearance automatically, so this re-runs on
     /// light/dark changes.
     private func applyInputAppearance() {
         guard let layer = scrollView.layer else { return }
-        layer.cornerRadius = Self.cornerRadius
-        layer.borderWidth = 1
-        layer.borderColor = NSColor.separatorColor.cgColor
-        layer.backgroundColor = NSColor.textBackgroundColor.cgColor
+        // Fully transparent: the SwiftUI Liquid Glass applied around this
+        // representable provides the blur — never a coloured fill or border.
+        layer.backgroundColor = NSColor.clear.cgColor
+        layer.borderWidth = 0
+        layer.cornerRadius = WindowChrome.cornerRadius
         layer.masksToBounds = true
     }
 
@@ -424,28 +410,9 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var onContentHeightChange: (CGFloat) -> Void
 
     /// The session whose live status readout (context %, model, thinking level)
-    /// the prompt bar shows. Setting it (re)wires `onStatusTextChanged`, so the
-    /// label updates IN PLACE — a 2s context poll never re-evaluates the
-    /// `SessionContent` body. Re-targeted on tab switch (the representable is
-    /// reused), so the previous session's callback is unregistered first.
-    var viewModel: SessionViewModel? {
-        didSet {
-            guard viewModel !== oldValue else { return }
-            oldValue?.onStatusTextChanged = nil
-            wireStatus(to: viewModel)
-        }
-    }
-
-    /// Wires the status readout to `vm`: registers the `onStatusTextChanged`
-    /// callback (which updates the label in place) and refreshes it now. Called
-    /// from `attach` (the `didSet` doesn't fire during `init` — Swift skips the
-    /// observers there) and from the `viewModel` didSet on a tab switch.
-    private func wireStatus(to vm: SessionViewModel?) {
-        vm?.onStatusTextChanged = { [weak self] in
-            self?.refreshStatusLabel()
-        }
-        refreshStatusLabel()
-    }
+    /// the prompt bar shows. Read by the SwiftUI status pill; a context poll
+    /// re-renders only that pill, never this coordinator's owner.
+    var viewModel: SessionViewModel?
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
@@ -502,47 +469,7 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         self.onContentHeightChange = onContentHeightChange
     }
 
-    /// The live status readout text: context %, model, thinking level. Composed
-    /// in the coordinator (not the SwiftUI body), so a context-usage change
-    /// updates only the label.
-    @MainActor private static func statusText(_ vm: SessionViewModel) -> String {
-        var parts: [String] = []
-        if let percent = vm.contextUsage?.percent {
-            parts.append("ctx \(Int(percent.rounded()))%")
-        }
-        if let name = vm.model?.name ?? vm.model?.id {
-            parts.append(name)
-        }
-        if let level = vm.thinkingLevel {
-            parts.append(level)
-        }
-        return parts.joined(separator: " · ")
-    }
-
-    /// Updates the bottom-right status label from the current view model. Only
-    /// the label changes — never the SwiftUI body.
-    private func refreshStatusLabel() {
-        guard let container else { return }
-        guard let vm = viewModel else {
-            container.statusLabel.stringValue = ""
-            container.statusLabel.isHidden = true
-            return
-        }
-        let text = Self.statusText(vm)
-        container.statusLabel.stringValue = text
-        container.statusLabel.isHidden = text.isEmpty
-    }
-
     deinit {
-        // `deinit` is always nonisolated, but `viewModel` is a MainActor-isolated
-        // `SessionViewModel`, so unregistering its status callback must run on the
-        // main actor. The coordinator (a SwiftUI representable) is torn down on
-        // the main thread, so `assumeIsolated` is safe here.
-        if let viewModel {
-            MainActor.assumeIsolated {
-                viewModel.onStatusTextChanged = nil
-            }
-        }
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }
@@ -563,10 +490,6 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         installEscapeMonitor()
         installPasteAbortMonitor()
         installCmdZMonitor()
-        // The view model is already set (from the init), but the `didSet` was
-        // skipped there (Swift doesn't run observers during init), so wire the
-        // status readout now that the container exists.
-        wireStatus(to: viewModel)
         container.pasteClearButton.target = self
         container.pasteClearButton.action = #selector(clearPasteButtonClicked)
         // The paste-window slides and the spinner track the scroll position.
@@ -1535,15 +1458,28 @@ final class CompletionWindowController: NSObject, NSTableViewDataSource, NSTable
         )
         super.init()
         window.level = .popUpMenu
-        window.backgroundColor = NSColor.windowBackgroundColor
+        // A popover by behavior (transient, contextual, dismissed on
+        // selection): back it with the popover material instead of a flat
+        // window fill, so it matches every system popover.
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.hasShadow = true
         window.isReleasedWhenClosed = false
         window.ignoresMouseEvents = true // keyboard-only completion for v1
+
+        let effect = NSVisualEffectView()
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = WindowChrome.pillCornerRadius
+        effect.layer?.masksToBounds = true
 
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         tableView.headerView = nil
         tableView.rowHeight = 22
@@ -1556,7 +1492,14 @@ final class CompletionWindowController: NSObject, NSTableViewDataSource, NSTable
         tableView.addTableColumn(column)
 
         scrollView.documentView = tableView
-        window.contentView = scrollView
+        effect.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: effect.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
+        ])
+        window.contentView = effect
     }
 
     var isVisible: Bool { window.isVisible }

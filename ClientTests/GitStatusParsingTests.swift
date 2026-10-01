@@ -138,6 +138,28 @@ final class GitStatusParsingTests: XCTestCase {
         XCTAssertEqual(GitStatus.totalStats(of: entries)?.total, 0)
     }
 
+    // MARK: - shouldRepinBaseline (branch-switch detection)
+
+    func testRepinWhenBranchChangesWithPinnedBaseline() {
+        // A checkout moves HEAD to another branch, so the old pinned commit
+        // would make the viewer show both branches' work at once.
+        XCTAssertTrue(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: "main", currentBranch: "feature"))
+    }
+
+    func testNoRepinWhenBranchIsUnchanged() {
+        // A commit on the same branch keeps the name, which is exactly the
+        // mid-turn commit the viewer must keep showing.
+        XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: "main", currentBranch: "main"))
+        XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: false, pinnedBranch: "main", currentBranch: "feature"))
+        XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: nil, currentBranch: "main"))
+    }
+
+    func testRepinOnDetachedHeadAwayFromANamedBranch() {
+        // Detaching to a commit is a switch like any other: the pinned commit
+        // no longer names where the working tree came from.
+        XCTAssertTrue(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: "main", currentBranch: nil))
+    }
+
     // MARK: - parseNameStatusZ (the `git diff -z --name-status` wire format)
 
     func testNameStatusRecordsParseStatusAndRawPath() {

@@ -35,6 +35,10 @@ final class ReadOnlyCodeTextView: NSTextView {
     private var sectionPaths: [(range: NSRange, absolutePath: String)] = []
     /// Clicks on links in the buffer (the diff viewer's expand controls).
     var onLinkClick: ((URL) -> Void)?
+    /// Fired at the start of every click in the buffer, before AppKit's own
+    /// selection handling. The diff viewer uses it to dismiss its floating
+    /// file list when the reader clicks back into the diff.
+    var onMouseDown: (() -> Void)?
     /// Start offset (UTF-16) of every line, ascending, built once per load.
     /// `lineStartOffsets[k]` is where line k+1 begins; the line's end is the
     /// next entry (or the text length for the last line). The final entry is
@@ -172,7 +176,6 @@ final class ReadOnlyCodeTextView: NSTextView {
     /// the fading fill (see `startReveal`).
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        drawHeaderBands(in: rect)
         if let anchorRect = revealAnchorRect {
             Self.revealColor.withAlphaComponent(0.6).setFill()
             NSRect(x: 0, y: anchorRect.minY, width: 3, height: max(anchorRect.height, 1)).fill()
@@ -348,53 +351,14 @@ final class ReadOnlyCodeTextView: NSTextView {
         sectionPaths = paths
     }
 
-    /// The 1-based display lines carrying a file header band. Drawn here as a
-    /// full-width fill UNDER the glyphs (a background color attribute would
-    /// only span the text's own width), so a scroll reads as clearly separated
-    /// per-file sections. Set with the document; empty clears the bands.
+    /// The 1-based display lines carrying a file header band. Kept as data (the
+    /// diff starts each file with a header line whose bold path already
+    /// separates sections), but no band is painted: Liquid Glass keeps the
+    /// surface flat rather than layering grey bars over the code.
     private(set) var headerLines: [Int] = []
 
     func setHeaderLines(_ lines: [Int]) {
         headerLines = lines
-        needsDisplay = true
-    }
-
-    /// Paints a subtle band and a hairline rule behind each visible header
-    /// line. Only lines intersecting the dirty rect are touched, and each band
-    /// spans the viewport (never just the header text's width), so the
-    /// separator reads even for a short path in a wide window.
-    private func drawHeaderBands(in rect: NSRect) {
-        guard !headerLines.isEmpty, let layoutManager, let textContainer else { return }
-        let length = (string as NSString).length
-        guard length > 0 else { return }
-        let inset = textContainerInset
-        // The characters intersecting the dirty rect. Restricting the layout
-        // queries to them keeps a changeset with hundreds of files from
-        // locating every header band on every repaint — only the headers the
-        // pass could actually paint are looked up.
-        let containerRect = NSRect(
-            x: rect.minX - inset.width,
-            y: rect.minY - inset.height,
-            width: max(rect.width, 1),
-            height: max(rect.height, 1)
-        )
-        let visibleGlyphs = layoutManager.glyphRange(forBoundingRect: containerRect, in: textContainer)
-        guard visibleGlyphs.length > 0 else { return }
-        let visibleChars = layoutManager.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
-        let bandWidth = max(bounds.width, enclosingScrollView?.contentSize.width ?? bounds.width)
-        for line in headerLines {
-            guard line >= 1, line - 1 < lineStartOffsets.count else { continue }
-            let charIndex = lineStartOffsets[line - 1]
-            guard charIndex < length, NSLocationInRange(charIndex, visibleChars) else { continue }
-            let glyphIndex = layoutManager.glyphIndexForCharacter(at: charIndex)
-            let fragment = layoutManager.lineFragmentUsedRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-            let y = fragment.minY + inset.height
-            guard y < rect.maxY, y + fragment.height > rect.minY else { continue }
-            NSColor.labelColor.withAlphaComponent(0.10).setFill()
-            NSRect(x: 0, y: y, width: bandWidth, height: fragment.height).fill()
-            NSColor.separatorColor.setFill()
-            NSRect(x: 0, y: y, width: bandWidth, height: 1).fill()
-        }
     }
 
     /// The file section owning a character index, with its diff-character
@@ -524,6 +488,11 @@ final class ReadOnlyCodeTextView: NSTextView {
             location = segmentEnd
         }
         return snippet
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
+        super.mouseDown(with: event)
     }
 
     // MARK: - Copy → frozen reference
@@ -727,6 +696,16 @@ final class CodeLineRulerView: NSRulerView {
 
     @objc private func gutterSourceChanged(_ notification: Notification) {
         needsDisplay = true
+    }
+
+    /// Draws only the numbers: skips `NSRulerView`'s default background and the
+    /// separator hairline at the content edge, which read as a grey line
+    /// against the flat diff surface. The ruler's own area is filled with the
+    /// code background so nothing ghosts between frames.
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.textBackgroundColor.setFill()
+        dirtyRect.fill()
+        drawHashMarksAndLabels(in: dirtyRect)
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {

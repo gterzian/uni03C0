@@ -156,4 +156,42 @@ final class StreamingFadeTests: XCTestCase {
         XCTAssertEqual(faded, body, accuracy: 0.001, "faded-in text ends at the color of the text around it")
         XCTAssertEqual(faded, NSColor.labelColor.alphaComponent, accuracy: 0.001, "never forced opaque")
     }
+
+    // MARK: - The dim color stays dynamic across appearances
+
+    /// Regression: the dim color must resolve in the appearance it is DRAWN
+    /// in, not the ambient one.
+    ///
+    /// `NSColor.withAlphaComponent` collapses a catalog color (`labelColor`)
+    /// into fixed components resolved in the appearance current at call time.
+    /// With the app's appearance forced darker than the system's (Appearance →
+    /// Dark on a light Mac) that ambient resolution is the LIGHT one, so the
+    /// fading run was `labelColor.withAlphaComponent(0.5)` = BLACK at half
+    /// alpha and the newest streaming text rendered black on the dark
+    /// background until the fade finished — the user-visible report. Resolving
+    /// the stored dim color in a dark appearance must yield a light tone.
+    func testDimColorResolvesForTheDrawingAppearance() {
+        guard let (_, storage) = streamingRow() else { return }
+        guard let color = storage.attribute(.foregroundColor, at: 6, effectiveRange: nil) as? NSColor else {
+            return XCTFail("the appended run carries a foreground color")
+        }
+        let dark = NSAppearance(named: .darkAqua)!
+        var resolved: NSColor?
+        dark.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB)
+        }
+        guard let inDark = resolved else { return XCTFail("the dim color must convert to sRGB") }
+        XCTAssertGreaterThan(inDark.redComponent, 0.5, "dimmed label text stays light on a dark background")
+        XCTAssertGreaterThan(inDark.greenComponent, 0.5, "dimmed label text stays light on a dark background")
+        XCTAssertGreaterThan(inDark.blueComponent, 0.5, "dimmed label text stays light on a dark background")
+        // ...while still being the FADED state (alpha below the settled color).
+        XCTAssertLessThan(inDark.alphaComponent, NSColor.labelColor.alphaComponent - 0.1)
+
+        let light = NSAppearance(named: .aqua)!
+        light.performAsCurrentDrawingAppearance {
+            resolved = color.usingColorSpace(.sRGB)
+        }
+        guard let inLight = resolved else { return XCTFail("the dim color must convert to sRGB") }
+        XCTAssertLessThan(inLight.redComponent, 0.5, "the same dynamic color is dark on a light background")
+    }
 }

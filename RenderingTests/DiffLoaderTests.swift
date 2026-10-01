@@ -120,6 +120,39 @@ final class DiffLoaderTests: XCTestCase {
     }
 
     @MainActor
+    func testFarApartEditsInALargeFileMatchGitStats() {
+        // Regression (the "diff shows changes that never happened" bug): a
+        // large file with two edits far apart must load just those edits, and
+        // its red/green must agree with the sidebar's git numstat. The old
+        // over-cap whole-block fallback reported the entire span between the
+        // edits as removed-then-added (+2162/−2162 for a three-line change).
+        let repo = Repo()
+        var lines = (0..<4_000).map { "line \($0)" }
+        repo.write(lines.joined(separator: "\n") + "\n")
+        repo.git(["add", "a.txt"])
+        repo.git(["commit", "-m", "init"])
+        lines[1_000] = "edited near the top"
+        lines[3_000] = "edited near the bottom"
+        repo.write(lines.joined(separator: "\n") + "\n")
+
+        guard let entries = classify(repo, base: "HEAD") else { return XCTFail("no classify") }
+        let stats = entries.first { $0.path == "a.txt" }?.stats
+        XCTAssertEqual(stats, GitStatus.DiffStats(added: 2, deleted: 2))
+
+        guard let diff = load(repo, entry("a.txt", .modified)) else { return XCTFail("no diff") }
+        XCTAssertNil(diff.message)
+        XCTAssertEqual(diff.added.count, stats?.added, "the loaded diff must match the sidebar's git stats")
+        XCTAssertEqual(diff.removed.count, stats?.deleted)
+        // Interleaved display index: each edit is a removed line immediately
+        // followed by its added replacement.
+        XCTAssertEqual(diff.added, [1_002, 3_003])
+        XCTAssertEqual(diff.removed, [1_001, 3_002])
+        XCTAssertEqual(diff.changeRange, 1_001...3_003)
+        // The 1999 unchanged lines between the edits stay context.
+        XCTAssertEqual(diff.lines.filter { $0.kind == .same }.count, 3_998)
+    }
+
+    @MainActor
     func testAddedFileIsAllAdditions() {
         let repo = Repo()
         repo.git(["init"])
