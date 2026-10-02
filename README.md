@@ -29,21 +29,3 @@ Then, build and run with:
 After that, pick a project and start prompting; the sandbox is applied uniformly to all sessions.
 
 A settings page is available to change the sandbox policy, taking effect on next launch.
-
-## Sandbox
-
-The agent runs inside a **Seatbelt sandbox** (default-deny): the policy
-defines everything it can touch, and everything else is off-limits — files,
-network, syscalls. Configuration lives in Settings (app menu → Settings…).
-
-### What you can configure (or use the default)
-
-- **Working folder** — the top-level folder containing all coding projects; every project inside it
-  is read+write. This is the agent's workspace.
-- **Additional read/write paths** — toolchain homes, caches, frameworks,
-  Xcode (prefilled with what macOS development needs). One path per line.
-- **Allowed internet domains** — the only hosts the agent can reach
-  (subdomains included); the model provider and the usual code sources
-  (GitHub, crates.io, npm, PyPI, …) are prefilled. One domain per line.
-- **Agent RPC endpoint** — the pi executable spawned as `pi --mode rpc`
-  (default: pi on PATH); point it at a different binary from Settings.
