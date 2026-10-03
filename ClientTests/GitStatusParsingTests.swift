@@ -148,7 +148,7 @@ final class GitStatusParsingTests: XCTestCase {
 
     func testNoRepinWhenBranchIsUnchanged() {
         // A commit on the same branch keeps the name, which is exactly the
-        // mid-turn commit the viewer must keep showing.
+        // commit made during the session the viewer must keep showing.
         XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: "main", currentBranch: "main"))
         XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: false, pinnedBranch: "main", currentBranch: "feature"))
         XCTAssertFalse(GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: nil, currentBranch: "main"))

@@ -181,7 +181,7 @@ struct SessionTabsView: View {
                 outerTabBar
                     .padding(.horizontal, 10)
                 if let active = activeTab {
-                    nestedPageTabs(active)
+                    NestedPageTabs(tab: active)
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -232,61 +232,6 @@ struct SessionTabsView: View {
         // composer, and every other glass surface.
         .fixedSize()
         .background { GlassBackground(shape: .capsule) }
-    }
-
-    /// Session / Changes — the page tabs of the ACTIVE session, nested under
-    /// its outer pill (see `topChrome`). A real segmented control, so the Liquid
-    /// Glass segmented look and the platform's own semantics (selected state,
-    /// group traits, keyboard traversal) come for free — the old custom pills
-    /// had to stitch those together by hand. A segment has no native badge
-    /// slot, so the edited-file count rides in the Changes label.
-    private func nestedPageTabs(_ tab: SessionTab) -> some View {
-        @Bindable var tab = tab
-        // A neutral glass segmented control: the native segmented picker
-        // paints its selection in the system accent (too loud here), so
-        // this keeps the same floating-pill language as the tabs and marks
-        // the selected segment with a quiet primary tint instead.
-        return HStack(spacing: 0) {
-            pageTab("Session", selected: tab.page == .conversation) {
-                tab.page = .conversation
-            }
-            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
-                tab.page = .changes
-            }
-        }
-        .padding(2)
-        .background { GlassBackground(shape: .capsule) }
-        .fixedSize()
-        // Content-sized: the nested switch hangs under the outer pills and
-        // must not stretch the leading cluster into the settings cluster.
-        .padding(.horizontal, 10)
-        .padding(.bottom, 6)
-    }
-
-    /// One segment of the Session/Changes switch. Neutral by design: a
-    /// primary-tint fill marks the selection instead of the accent colour.
-    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? Color.primary : Color.secondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
-        .accessibilityLabel(title)
-    }
-
-    /// The Changes segment's title, carrying the edited-file count when there
-    /// is one (the badge the custom pill used to draw).
-    private func changesTitle(_ count: Int?) -> String {
-        if let count, count > 0 {
-            return "Changes (\(count))"
-        }
-        return "Changes"
     }
 
     /// One tab: the session's folder name, its live status icon (spinner
@@ -360,6 +305,69 @@ struct SessionTabsView: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 16)
         }
+    }
+}
+
+// MARK: - Nested page tabs
+
+/// Session / Changes — the page tabs of the ACTIVE session, nested under its
+/// outer pill (see `topChrome`). A neutral glass switch: the native segmented
+/// picker paints its selection in the system accent (too loud here), so this
+/// keeps the floating-pill language of the tabs and marks the selected segment
+/// with a quiet primary tint instead. A segment has no native badge slot, so
+/// the edited-file count rides in the Changes label.
+///
+/// A standalone `View` on purpose: it reads the session-scoped observables
+/// `gitChangeCount` (refreshed on every file edit) and `page`. Inlined into
+/// `SessionTabsView.body` those reads made every count refresh re-render the
+/// whole floating top chrome — including its AppKit glass, which then
+/// re-rendered (the Quartz Debug flash across the top bar). Scoping the
+/// observation to this small switch keeps a count change to the badge alone.
+private struct NestedPageTabs: View {
+    @Bindable var tab: SessionTab
+
+    var body: some View {
+        HStack(spacing: 0) {
+            pageTab("Session", selected: tab.page == .conversation) {
+                tab.page = .conversation
+            }
+            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
+                tab.page = .changes
+            }
+        }
+        .padding(2)
+        .background { GlassBackground(shape: .capsule) }
+        .fixedSize()
+        // Content-sized: the nested switch hangs under the outer pills and
+        // must not stretch the leading cluster into the settings cluster.
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    /// One segment of the Session/Changes switch. Neutral by design: a
+    /// primary-tint fill marks the selection instead of the accent colour.
+    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .accessibilityLabel(title)
+    }
+
+    /// The Changes segment's title, carrying the edited-file count when there
+    /// is one (the badge the custom pill used to draw).
+    private func changesTitle(_ count: Int?) -> String {
+        if let count, count > 0 {
+            return "Changes (\(count))"
+        }
+        return "Changes"
     }
 }
 

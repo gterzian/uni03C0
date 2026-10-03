@@ -2,8 +2,9 @@ import AppKit
 import Core
 import SwiftUI
 
-/// The Changes page — the review surface for the session folder's uncommitted
-/// changes. A list of the changed files on the left (the navigation) and, on
+/// The Changes page — the review surface for the session folder's changes since
+/// the session opened (a commit made while it stays open does not clear it). A
+/// list of the changed files on the left (the navigation) and, on
 /// the right, ONE scrollable viewer holding every file's diff in path order.
 /// Scrolling the viewer walks the whole changeset; the list highlights
 /// whichever file's section owns the top of the viewport, and clicking a row

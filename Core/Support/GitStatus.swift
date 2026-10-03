@@ -94,18 +94,18 @@ public enum GitStatus {
     /// caring only about its own `cwd`.
     public static let didChangeNotification = Notification.Name("GitStatus.didChange")
 
-    // MARK: - Turn baseline
+    // MARK: - Session baseline
 
     /// Git's well-known empty-tree object id. Used as the diff baseline for a
-    /// repository with no commits yet, so a turn's first changes still diff
+    /// repository with no commits yet, so a session's first changes still diff
     /// from "nothing" instead of failing on an unborn `HEAD`.
     public static let emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-    /// The commit to diff a turn against: the live `HEAD`, or `emptyTree` when
-    /// the repository has no commits (a fresh `git init`). Captured once at the
-    /// start of a user turn and then kept — so a commit the agent makes
-    /// mid-turn moves `HEAD` without emptying the Changes viewer; only the next
-    /// turn re-baselines.
+    /// The commit the Changes viewer diffs against: the live `HEAD`, or
+    /// `emptyTree` when the repository has no commits (a fresh `git init`).
+    /// Captured when a session is opened or resumed and then kept — so a
+    /// commit made while the session stays open moves `HEAD` without emptying
+    /// the Changes viewer; only reopening/resuming re-baselines.
     public static func resolveHead(at cwd: URL) async -> String {
         guard let out = await gitOutput(["rev-parse", "--verify", "--quiet", "HEAD"], cwd: cwd) else {
             return emptyTree
@@ -117,8 +117,8 @@ public enum GitStatus {
     /// The short name of the branch `HEAD` is on, or nil when the repository is
     /// detached or not a git repository at all. Watched across refreshes to
     /// notice a branch switch: a commit keeps the branch name, so the pinned
-    /// turn baseline survives it, while a checkout/switch changes it and the
-    /// stale baseline must be re-pinned (see `shouldRepinBaseline`).
+    /// session baseline survives it, while a checkout/switch changes it and
+    /// the stale baseline must be re-pinned (see `shouldRepinBaseline`).
     public static func resolveBranch(at cwd: URL) async -> String? {
         guard let out = await gitOutput(
             ["-c", "core.quotepath=false", "symbolic-ref", "--short", "-q", "HEAD"],
@@ -128,21 +128,22 @@ public enum GitStatus {
         return name.isEmpty ? nil : name
     }
 
-    /// Whether a refresh must re-pin the turn baseline because `HEAD` has
+    /// Whether a refresh must re-pin the session baseline because `HEAD` has
     /// moved to a different branch. A commit on the same branch leaves the
-    /// branch name untouched — that is exactly the mid-turn commit the viewer
-    /// must keep showing — while a checkout/switch changes it, and diffing
-    /// against the old branch's commit would present the whole cross-branch
-    /// delta as uncommitted changes. Detached HEAD (a nil current branch)
-    /// counts as a switch away from any named branch. With no pinned baseline
-    /// there is nothing to re-pin: the base is already the live `HEAD`.
+    /// branch name untouched — that is exactly the commit made during the
+    /// session the viewer must keep showing — while a checkout/switch changes
+    /// it, and diffing against the old branch's commit would present the whole
+    /// cross-branch delta as uncommitted changes. Detached HEAD (a nil current
+    /// branch) counts as a switch away from any named branch. With no pinned
+    /// baseline there is nothing to re-pin: the base is already the live
+    /// `HEAD`.
     public static func shouldRepinBaseline(hasBaseline: Bool, pinnedBranch: String?, currentBranch: String?) -> Bool {
         guard hasBaseline, let pinnedBranch else { return false }
         return pinnedBranch != currentBranch
     }
 
     /// Resolves an explicit baseline, or falls back to the live `HEAD` when the
-    /// caller has not pinned one (before the first user turn).
+    /// caller has not pinned one (before the session's first listing).
     private static func resolvedBase(_ base: String?, at cwd: URL) async -> String {
         if let base, !base.isEmpty { return base }
         return await resolveHead(at: cwd)
@@ -328,8 +329,8 @@ public enum GitStatus {
     /// from one `git diff --name-status`; untracked files are added from a
     /// second listing (a diff never reports them). No file content is read, so
     /// it stays cheap even when hundreds of files changed. `base` should be the
-    /// same turn baseline the Changes viewer uses, so the badge and the viewer
-    /// never disagree.
+    /// same session baseline the Changes viewer uses, so the badge and the
+    /// viewer never disagree.
     public static func changedFileCount(at cwd: URL, base: String? = nil) async -> Int? {
         let reference = await resolvedBase(base, at: cwd)
         guard let out = await gitOutput(
@@ -363,9 +364,9 @@ public enum GitStatus {
     /// unioned in separately), then attaches per-path added/deleted line counts
     /// from one batched numstat (`diffStatsByPath`) — a handful of read-only
     /// git calls in total, NO subprocess per file and no per-file content
-    /// diffs. `base` is the turn baseline (`nil` means the live `HEAD`); a
-    /// commit the agent makes mid-turn therefore does not clear the view. The
-    /// tree's deletion-vs-addition fill comes from `FileEntry.stats`.
+    /// diffs. `base` is the session baseline (`nil` means the live `HEAD`); a
+    /// commit made while the session stays open therefore does not clear the
+    /// view. The tree's deletion-vs-addition fill comes from `FileEntry.stats`.
     public static func classify(at cwd: URL, base: String? = nil) async -> [FileEntry] {
         let reference = await resolvedBase(base, at: cwd)
         let listed = await trackedAndVisiblePaths(at: cwd)
@@ -430,8 +431,8 @@ public enum GitStatus {
 
     /// The file's content at `reference` (`git show <reference>:<path>`); nil
     /// for untracked files and paths outside the revision. The Changes viewer
-    /// passes the turn baseline, so a file committed mid-turn still diffs
-    /// against the content it had when the turn began.
+    /// passes the session baseline, so a file committed during the session
+    /// still diffs against the content it had when the session opened.
     public static func content(of path: String, at reference: String, cwd: URL) async -> String? {
         await gitOutput(["show", "\(reference):\(path)"], cwd: cwd)
     }
