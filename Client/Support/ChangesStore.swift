@@ -35,6 +35,10 @@ final class ChangesStore {
     /// kept in sync by the viewer's scroll spy). Clicking a sidebar row writes
     /// this and requests a scroll.
     var selectedPath: String?
+    /// Whether the floating changed-files list is open. Owned by the store (not
+    /// the page view) because the toggle lives in the nested Changes sub-nav,
+    /// shared with the app's floating chrome; the Changes page just reads it.
+    var isSidebarVisible = false
     /// One-shot "scroll the viewer to this path's section" request. Consumed by
     /// the viewer via `consumeReveal()`.
     var revealPath: String?
