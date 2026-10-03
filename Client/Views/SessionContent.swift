@@ -200,16 +200,12 @@ struct SessionContent: View {
             .background {
                 GlassBackground(shape: .roundedRectangle(cornerRadius: WindowChrome.cornerRadius))
             }
-            // The model / context / thinking readout, on the composer's own
-            // glass at the bottom-right — no glass of its own (a nested second
-            // glass would have to sample the composer's glass, which Liquid
-            // Glass cannot do consistently). A separate view so a context-usage
-            // poll re-renders only the pill, never the session body.
-            .overlay(alignment: .bottomTrailing) {
-                PromptStatusPill(vm: vm)
-                    .padding(.trailing, 8)
-                    .padding(.bottom, 5)
-            }
+            // The model / context / thinking readout now lives INSIDE the
+            // AppKit prompt input (`PromptContainerView.statusLabel`), updated
+            // in place via `onStatusTextChanged`. It used to be a SwiftUI
+            // `Text` overlaid here; a 2s context poll then re-rendered the
+            // composer's glass region (the Quartz Debug flash over the input),
+            // exactly the regression `b241312` had already fixed once.
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
@@ -217,40 +213,6 @@ struct SessionContent: View {
             GeometryReader { proxy in
                 Color.clear.preference(key: PromptBarHeightKey.self, value: proxy.size.height)
             }
-        }
-    }
-
-    /// The model / context / thinking readout at the composer's bottom-right,
-    /// drawn on the composer's own Liquid Glass (it deliberately carries no
-    /// glass of its own — see `floatingPromptBar`). A separate view so a
-    /// context-usage poll re-renders only this pill, never the whole session
-    /// body.
-    private struct PromptStatusPill: View {
-        let vm: SessionViewModel
-
-        var body: some View {
-            if !text.isEmpty {
-                Text(text)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .accessibilityLabel(text)
-            }
-        }
-
-        private var text: String {
-            var parts: [String] = []
-            if let percent = vm.contextUsage?.percent {
-                parts.append("ctx \(Int(percent.rounded()))%")
-            }
-            if let name = vm.model?.name ?? vm.model?.id {
-                parts.append(name)
-            }
-            if let level = vm.thinkingLevel {
-                parts.append(level)
-            }
-            return parts.joined(separator: " · ")
         }
     }
 
@@ -268,7 +230,7 @@ struct SessionContent: View {
             // `TranscriptView.makeScrollView`). A clear AppKit surface over a
             // SwiftUI fill made the compositor blend two surfaces across the
             // whole streaming area.
-            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight)
+            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight, sessionEpoch: vm.sessionEpoch)
             if vm.isReloading {
                 // In-app spinner while the store rebuilds the whole
                 // history off the main thread (no system beachball).
@@ -283,7 +245,12 @@ struct SessionContent: View {
                         .font(.system(size: 11))
                 }
                 .padding(12)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                // AppKit glass, not SwiftUI `.regularMaterial`: the material
+                // renders through the hosting tree and re-samples its backdrop
+                // whenever anything near it changes (the reload spinner), the
+                // same whole-region Quartz Debug flash the chrome already
+                // avoided (see `GlassBackground`).
+                .background { GlassBackground(shape: .roundedRectangle(cornerRadius: 8)) }
             }
             if vm.isFetchingOlder {
                 // Small spinner pinned to the top of the conversation
@@ -292,7 +259,9 @@ struct SessionContent: View {
                 VStack {
                     SpinnerView()
                         .padding(6)
-                        .background(.regularMaterial, in: Capsule())
+                        // AppKit glass, not SwiftUI `.regularMaterial` — see
+                        // the reloading overlay above.
+                        .background { GlassBackground(shape: .capsule) }
                     Spacer()
                 }
                 .padding(.top, 8)

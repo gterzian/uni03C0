@@ -45,7 +45,7 @@ final class DiffLoaderTests: XCTestCase {
             return String(data: data, encoding: .utf8)
         }
 
-        /// The current `HEAD` commit, for pinning a turn baseline.
+        /// The current `HEAD` commit, for pinning a session baseline.
         func head() -> String {
             (git(["rev-parse", "HEAD"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -167,10 +167,10 @@ final class DiffLoaderTests: XCTestCase {
         XCTAssertEqual(diff.lineNumbers, [1, 2])
     }
 
-    // MARK: - Turn baseline across a mid-turn commit
+    // MARK: - Session baseline across a commit
 
     @MainActor
-    func testPinnedBaseKeepsDiffAndListingAfterMidTurnCommit() {
+    func testPinnedBaseKeepsDiffAndListingAfterCommit() {
         let repo = Repo()
         repo.write("a\nb\nc\n")
         repo.git(["add", "a.txt"])
@@ -178,11 +178,11 @@ final class DiffLoaderTests: XCTestCase {
         let base = repo.head()
         XCTAssertFalse(base.isEmpty)
 
-        // The agent edits and commits mid-turn: HEAD moves, the pinned base
-        // does not — the turn's change stays reviewable.
+        // The agent edits and commits: HEAD moves, the pinned base does not
+        // — the session's change stays reviewable.
         repo.write("a\nB\nc\n")
         repo.git(["add", "a.txt"])
-        repo.git(["commit", "-m", "mid-turn"])
+        repo.git(["commit", "-m", "during-session"])
 
         guard let entries = classify(repo, base: base) else { return XCTFail("no classify") }
         let fileEntry = entries.first { $0.path == "a.txt" }
@@ -191,8 +191,8 @@ final class DiffLoaderTests: XCTestCase {
 
         guard let diff = load(repo, entry("a.txt", .modified), base: base) else { return XCTFail("no diff") }
         XCTAssertNil(diff.message)
-        // The net turn change relative to the pinned base, not the now-clean
-        // working tree.
+        // The net session change relative to the pinned base, not the
+        // now-clean working tree.
         XCTAssertEqual(diff.lines.map(\.text), ["a", "b", "B", "c"])
         XCTAssertEqual(diff.added, [3])
         XCTAssertEqual(diff.removed, [2])

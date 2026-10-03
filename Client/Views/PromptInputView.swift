@@ -156,6 +156,14 @@ final class PromptContainerView: NSView {
     /// edit or after a few seconds. In the same slot the paste spinner uses,
     /// so a paste can never be active while the hint is visible.
     let restoreHintLabel = ClickThroughLabel(labelWithString: "")
+    /// The live status readout (context %, model, thinking level), pinned to
+    /// the composer's bottom-right. AppKit, updated IN PLACE by the coordinator
+    /// on `onStatusTextChanged` — a SwiftUI `Text` here would re-render the
+    /// composer's glass region on every 2s context poll (the Quartz Debug
+    /// flash over the input; `b241312` fixed this once and `041f3f6` put the
+    /// SwiftUI pill back). Click-through, so it never eats a click on the
+    /// input underneath.
+    let statusLabel = ClickThroughLabel(labelWithString: "")
     let scrollView = NSScrollView()
 
     override init(frame frameRect: NSRect) {
@@ -179,10 +187,9 @@ final class PromptContainerView: NSView {
         // refreshed when the appearance changes.
         scrollView.borderType = .noBorder
         scrollView.wantsLayer = true
-        // Reserve the bottom strip for the status readout so typed text never
-        // scrolls under it. The readout now sits on its own glass pill, so the
-        // text can scroll right up to it and blur behind it instead of being
-        // clipped above it.
+        // No extra bottom strip: the status readout is a click-through AppKit
+        // label floating on the composer's glass (see `statusLabel`), so typed
+        // text scrolls right up to it instead of being clipped above it.
         scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
 
         textView.isEditable = true
@@ -240,10 +247,18 @@ final class PromptContainerView: NSView {
         restoreHintLabel.translatesAutoresizingMaskIntoConstraints = false
         restoreHintLabel.setAccessibilityElement(false)
 
+        statusLabel.font = .systemFont(ofSize: 10)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.isHidden = true
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.setAccessibilityElement(false)
+
         addSubview(scrollView)
         addSubview(streamingIndicator)
         addSubview(pasteClearButton)
         addSubview(restoreHintLabel)
+        addSubview(statusLabel)
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -255,6 +270,10 @@ final class PromptContainerView: NSView {
             pasteClearButton.centerYAnchor.constraint(equalTo: streamingIndicator.centerYAnchor),
             restoreHintLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             restoreHintLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            // Matches the SwiftUI pill it replaces: 8pt from the trailing
+            // edge, 5pt from the bottom, so the readout sits in the same spot.
+            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
         ])
         applyInputAppearance()
     }
@@ -410,9 +429,18 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     var onContentHeightChange: (CGFloat) -> Void
 
     /// The session whose live status readout (context %, model, thinking level)
-    /// the prompt bar shows. Read by the SwiftUI status pill; a context poll
-    /// re-renders only that pill, never this coordinator's owner.
-    var viewModel: SessionViewModel?
+    /// the prompt bar shows. Setting it (re)wires `onStatusTextChanged` so the
+    /// container's `statusLabel` updates IN PLACE — a 2s context poll never
+    /// re-renders a SwiftUI body (the Quartz Debug flash over the composer).
+    /// Re-targeted on tab switch (the representable is reused), so the
+    /// previous session's callback is unregistered first.
+    var viewModel: SessionViewModel? {
+        didSet {
+            guard viewModel !== oldValue else { return }
+            oldValue?.onStatusTextChanged = nil
+            wireStatus(to: viewModel)
+        }
+    }
 
     private weak var container: PromptContainerView?
     private var completionWindow: CompletionWindowController?
@@ -470,6 +498,11 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
     }
 
     deinit {
+        // The status callback is registered with `[weak self]`, so the view
+        // model never retains this coordinator — no unregister is needed here
+        // (and `deinit` is nonisolated, so it cannot touch the @MainActor
+        // `onStatusTextChanged` anyway). The `viewModel` didSet clears the
+        // previous session's callback on a tab switch.
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }
@@ -492,6 +525,10 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
         installCmdZMonitor()
         container.pasteClearButton.target = self
         container.pasteClearButton.action = #selector(clearPasteButtonClicked)
+        // The view model is already set (from the init), but the `didSet` was
+        // skipped there (Swift doesn't run observers during init), so wire the
+        // status readout now that the container exists.
+        wireStatus(to: viewModel)
         // The paste-window slides and the spinner track the scroll position.
         NotificationCenter.default.addObserver(
             self,
@@ -499,6 +536,49 @@ final class PromptCoordinator: NSObject, NSTextViewDelegate {
             name: NSView.boundsDidChangeNotification,
             object: container.scrollView.contentView
         )
+    }
+
+    /// Wires the status readout to `vm`: registers the `onStatusTextChanged`
+    /// callback (which updates the container's label in place) and refreshes it
+    /// now. Called from `attach` (the `didSet` doesn't fire during `init` —
+    /// Swift skips observers there) and from the `viewModel` didSet on a tab
+    /// switch.
+    private func wireStatus(to vm: SessionViewModel?) {
+        vm?.onStatusTextChanged = { [weak self] in
+            self?.refreshStatusLabel()
+        }
+        refreshStatusLabel()
+    }
+
+    /// The live status readout text: context %, model, thinking level. Composed
+    /// in the coordinator (not a SwiftUI body), so a context poll updates only
+    /// the label.
+    @MainActor private static func statusText(_ vm: SessionViewModel) -> String {
+        var parts: [String] = []
+        if let percent = vm.contextUsage?.percent {
+            parts.append("ctx \(Int(percent.rounded()))%")
+        }
+        if let name = vm.model?.name ?? vm.model?.id {
+            parts.append(name)
+        }
+        if let level = vm.thinkingLevel {
+            parts.append(level)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Updates the bottom-right status label from the current view model. Only
+    /// the label changes — never a SwiftUI body.
+    private func refreshStatusLabel() {
+        guard let container else { return }
+        guard let vm = viewModel else {
+            container.statusLabel.stringValue = ""
+            container.statusLabel.isHidden = true
+            return
+        }
+        let text = Self.statusText(vm)
+        container.statusLabel.stringValue = text
+        container.statusLabel.isHidden = text.isEmpty
     }
 
     @objc private func streamScrollDidChange() {

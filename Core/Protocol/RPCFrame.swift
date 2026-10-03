@@ -171,6 +171,40 @@ public struct AgentMessage: Codable, Sendable, Equatable {
     /// The failure text carried with `stopReason == "error"` (network failures,
     /// provider errors, …) or "aborted".
     public var errorMessage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case role, content, id, toolCallId, toolName, isError, usage, timestamp, stopReason, errorMessage
+    }
+}
+
+extension AgentMessage {
+    /// Decodes `content` tolerantly. Live events always carry an array of
+    /// blocks, but the session's `system` message returned by `get_messages`
+    /// (the whole-history rebuild on resume/reload) carries a bare string.
+    /// The synthesized decoder throws a type mismatch on it, which fails the
+    /// entire `MessagesPayload` decode — `loadMessages` then silently returns
+    /// and a resumed session's transcript stays blank. An extension (not the
+    /// main declaration) so the memberwise init is still synthesized for
+    /// tests and callers.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        role = try container.decode(String.self, forKey: .role)
+        id = try container.decodeIfPresent(String.self, forKey: .id)
+        toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError)
+        usage = try container.decodeIfPresent(TokenUsage.self, forKey: .usage)
+        timestamp = try container.decodeIfPresent(Int64.self, forKey: .timestamp)
+        stopReason = try container.decodeIfPresent(String.self, forKey: .stopReason)
+        errorMessage = try container.decodeIfPresent(String.self, forKey: .errorMessage)
+        if let blocks = try? container.decode([ContentBlock].self, forKey: .content) {
+            content = blocks
+        } else if let text = try? container.decode(String.self, forKey: .content) {
+            content = [ContentBlock(type: "text", text: text)]
+        } else {
+            content = nil
+        }
+    }
 }
 
 /// Token/cache usage attached to an assistant message by the provider adapter

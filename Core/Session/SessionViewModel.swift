@@ -40,6 +40,12 @@ public final class SessionViewModel {
     /// the main thread. SwiftUI shows an in-app spinner from this; the main
     /// thread is never blocked.
     public private(set) var isReloading = false
+    /// Bumped each time `loadMessages` rebuilds the transcript (a session
+    /// switch / resume / reload). The transcript view watches it so a rebuild
+    /// ALWAYS repopulates the table, even if the `onTranscriptChange`
+    /// notification is missed (the callback can be nil or a reconciliation can
+    /// be in flight during the rebuild).
+    public private(set) var sessionEpoch: UInt64 = 0
     /// True while the coordinator is fetching a block of older history at the
     /// top of the transcript (scrolling up). Drives the in-app spinner above
     /// the conversation. Set by the AppKit coordinator on the main actor.
@@ -396,12 +402,12 @@ public final class SessionViewModel {
     /// window (same shape as `onRestoreSteeringToInput` / `onAgentSettled`).
     public var onFilesChanged: ((String?) -> Void)?
 
-    /// Turn-start hook: called with the prompt about to be sent, before the
-    /// agent starts working. The Client layer uses it to pin the Changes
-    /// viewer's baseline to the commit `HEAD` points at right now, so the
-    /// turn's accumulated diff — including anything the agent commits mid-turn
-    /// — survives until the next prompt re-baselines it.
-    public var onTurnStarted: (() -> Void)?
+    /// Session-resume hook: called after the live process switched to another
+    /// session file (Resume menu / history sheet). The Client layer uses it to
+    /// re-pin the Changes viewer's baseline to the commit `HEAD` points at
+    /// now, so work committed while a previous session was open drops out of
+    /// the diff for the session just opened.
+    public var onSessionSwitched: (() -> Void)?
 
     private var eventTask: Task<Void, Never>?
     /// Periodic `get_session_stats` poller while the agent is streaming. pi has
@@ -581,7 +587,6 @@ public final class SessionViewModel {
         abortReturnsQueuedSteering = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        onTurnStarted?()
         do {
             let response = try await controller.send(.prompt(message: trimmed))
             if response.success == false {
@@ -680,9 +685,14 @@ public final class SessionViewModel {
 
     /// Resume = switch to another session file, then repopulate.
     public func switchSession(_ path: URL) async {
-        _ = try? await controller.send(.switchSession(path: path.path))
+        guard let response = try? await controller.send(.switchSession(path: path.path)) else { return }
+        // An extension can cancel the switch (`session_before_switch`): the live
+        // process stays on the old session, so repopulating would leave the
+        // transcript and the process disagreeing.
+        if response.dataPayload(SwitchSessionPayload.self)?.cancelled == true { return }
         await refreshState()
         await loadMessages()
+        onSessionSwitched?()
     }
 
     /// Refreshes the context-window usage percentage from `get_session_stats`.
@@ -807,6 +817,10 @@ public final class SessionViewModel {
             store.rebuild(from: messages)
         }.value
         isReloading = false
+        // A session switch replaced the history wholesale: bump the epoch so
+        // the transcript view repopulates even if the notification below is
+        // missed.
+        sessionEpoch &+= 1
         // The store was rebuilt — any live search matches reference the OLD
         // session's row ids and must not paint highlights on the new one.
         if isSearchVisible || !searchMatches.isEmpty {
