@@ -230,7 +230,7 @@ struct SessionContent: View {
             // `TranscriptView.makeScrollView`). A clear AppKit surface over a
             // SwiftUI fill made the compositor blend two surfaces across the
             // whole streaming area.
-            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight)
+            TranscriptView(viewModel: vm, isPageActive: tab.page == .conversation, topInset: topInset, bottomInset: promptBarHeight, sessionEpoch: vm.sessionEpoch)
             if vm.isReloading {
                 // In-app spinner while the store rebuilds the whole
                 // history off the main thread (no system beachball).
