@@ -2,10 +2,10 @@ import XCTest
 @testable import Core
 
 /// End-to-end checks against a real throwaway git repository. A branch switch
-/// is exactly what makes a pinned turn baseline stale — the viewer then diffs
+/// is exactly what makes a pinned session baseline stale — the viewer then diffs
 /// the working tree against a commit on ANOTHER branch and shows the whole
 /// cross-branch delta — and the branch name is the only signal that tells a
-/// switch apart from the mid-turn commit the viewer must survive.
+/// switch apart from the same-branch commit the viewer must survive.
 final class GitStatusBranchTests: XCTestCase {
     private var repo: URL!
 

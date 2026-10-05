@@ -180,8 +180,13 @@ struct SessionTabsView: View {
             VStack(alignment: .leading, spacing: 0) {
                 outerTabBar
                     .padding(.horizontal, 10)
+                    // Same 6pt gap as between the Session/Changes switch and
+                    // the diff sub-nav below it: the three nav levels are
+                    // evenly spaced, not bound.
+                    .padding(.bottom, 6)
                 if let active = activeTab {
-                    nestedPageTabs(active)
+                    NestedPageTabs(tab: active)
+                    ChangesSubNav(tab: active)
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -232,61 +237,6 @@ struct SessionTabsView: View {
         // composer, and every other glass surface.
         .fixedSize()
         .background { GlassBackground(shape: .capsule) }
-    }
-
-    /// Session / Changes — the page tabs of the ACTIVE session, nested under
-    /// its outer pill (see `topChrome`). A real segmented control, so the Liquid
-    /// Glass segmented look and the platform's own semantics (selected state,
-    /// group traits, keyboard traversal) come for free — the old custom pills
-    /// had to stitch those together by hand. A segment has no native badge
-    /// slot, so the edited-file count rides in the Changes label.
-    private func nestedPageTabs(_ tab: SessionTab) -> some View {
-        @Bindable var tab = tab
-        // A neutral glass segmented control: the native segmented picker
-        // paints its selection in the system accent (too loud here), so
-        // this keeps the same floating-pill language as the tabs and marks
-        // the selected segment with a quiet primary tint instead.
-        return HStack(spacing: 0) {
-            pageTab("Session", selected: tab.page == .conversation) {
-                tab.page = .conversation
-            }
-            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
-                tab.page = .changes
-            }
-        }
-        .padding(2)
-        .background { GlassBackground(shape: .capsule) }
-        .fixedSize()
-        // Content-sized: the nested switch hangs under the outer pills and
-        // must not stretch the leading cluster into the settings cluster.
-        .padding(.horizontal, 10)
-        .padding(.bottom, 6)
-    }
-
-    /// One segment of the Session/Changes switch. Neutral by design: a
-    /// primary-tint fill marks the selection instead of the accent colour.
-    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 11, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? Color.primary : Color.secondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
-        .accessibilityLabel(title)
-    }
-
-    /// The Changes segment's title, carrying the edited-file count when there
-    /// is one (the badge the custom pill used to draw).
-    private func changesTitle(_ count: Int?) -> String {
-        if let count, count > 0 {
-            return "Changes (\(count))"
-        }
-        return "Changes"
     }
 
     /// One tab: the session's folder name, its live status icon (spinner
@@ -359,6 +309,155 @@ struct SessionTabsView: View {
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(.tertiary)
                 .frame(width: 16)
+        }
+    }
+}
+
+// MARK: - Nested page tabs
+
+/// Session / Changes — the page tabs of the ACTIVE session, nested under its
+/// outer pill (see `topChrome`). A neutral glass switch: the native segmented
+/// picker paints its selection in the system accent (too loud here), so this
+/// keeps the floating-pill language of the tabs and marks the selected segment
+/// with a quiet primary tint instead. A segment has no native badge slot, so
+/// the edited-file count rides in the Changes label.
+///
+/// A standalone `View` on purpose: it reads the session-scoped observables
+/// `gitChangeCount` (refreshed on every file edit) and `page`. Inlined into
+/// `SessionTabsView.body` those reads made every count refresh re-render the
+/// whole floating top chrome — including its AppKit glass, which then
+/// re-rendered (the Quartz Debug flash across the top bar). Scoping the
+/// observation to this small switch keeps a count change to the badge alone.
+private struct NestedPageTabs: View {
+    @Bindable var tab: SessionTab
+
+    var body: some View {
+        HStack(spacing: 0) {
+            pageTab("Session", selected: tab.page == .conversation) {
+                tab.page = .conversation
+            }
+            pageTab(changesTitle(tab.gitChangeCount), selected: tab.page == .changes) {
+                tab.page = .changes
+            }
+        }
+        .padding(NestedTabMetrics.switchPadding)
+        .background { GlassBackground(shape: .capsule) }
+        .fixedSize()
+        // Content-sized: the nested switch hangs under the outer pills and
+        // must not stretch the leading cluster into the settings cluster.
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
+    /// One segment of the Session/Changes switch. Neutral by design: a
+    /// primary-tint fill marks the selection instead of the accent colour.
+    private func pageTab(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: NestedTabMetrics.fontSize, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .padding(.horizontal, NestedTabMetrics.labelPadding)
+                .padding(.vertical, 3)
+                .background(selected ? Color.accentColor.opacity(0.10) : Color.clear, in: Capsule())
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .accessibilityLabel(title)
+    }
+
+    /// The Changes segment's title, carrying the edited-file count when there
+    /// is one (the badge the custom pill used to draw).
+    private func changesTitle(_ count: Int?) -> String {
+        if let count, count > 0 {
+            return "Changes (\(count))"
+        }
+        return "Changes"
+    }
+}
+
+// MARK: - Nested Changes sub-nav
+
+/// Shared metrics for the Session/Changes switch, used by the switch and the
+/// nested Changes sub-nav row so the two rows stay in lockstep.
+private enum NestedTabMetrics {
+    static let fontSize: CGFloat = 11
+    static let labelPadding: CGFloat = 10
+    static let switchPadding: CGFloat = 2
+}
+
+/// The nested Changes sub-nav: the diff sidebar toggle and the selected file's
+/// title/position, a second row under the Session/Changes switch while the
+/// Changes page is up — a sub-sub nav that belongs to Changes, not Session.
+/// Hidden entirely when the changeset is empty: with no diff to navigate the
+/// toggle has nothing to open.
+///
+/// A standalone `View` like `NestedPageTabs`: it reads the store's `entries`
+/// and `selectedPath`, so scoping the observation here keeps a count refresh
+/// from re-rendering the whole floating top chrome (its AppKit glass included).
+private struct ChangesSubNav: View {
+    @Bindable var tab: SessionTab
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if tab.page == .changes, !tab.changes.entries.isEmpty {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                        tab.changes.isSidebarVisible.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 12, weight: .semibold))
+                        // Match the system glass button's label padding so
+                        // replacing `.buttonStyle(.glass)` with plain + AppKit
+                        // glass keeps the same pill size and hit area.
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .background { GlassBackground(shape: .capsule) }
+                .help(tab.changes.isSidebarVisible ? "Hide the file list" : "Show the file list")
+                .accessibilityLabel("Toggle the changed-files sidebar")
+
+                if let selected = tab.changes.selectedPath {
+                    // The title IS the open-in-default-app affordance: the
+                    // viewer shows a diff window, so the title hands the whole
+                    // file to an editor. Plain text for a deleted file (nothing
+                    // on disk).
+                    Group {
+                        if tab.changes.canOpenInDefaultApp(selected) {
+                            FileTitleLink(path: selected) { tab.changes.openInDefaultApp(selected) }
+                        } else {
+                            Text(selected)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    // Keep a long path from widening the leading chrome cluster
+                    // into the session controls; it middle-truncates instead.
+                    .frame(maxWidth: 360, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background { GlassBackground(shape: .capsule) }
+
+                    if let index = tab.changes.entries.firstIndex(where: { $0.path == selected }) {
+                        Text("\(index + 1) of \(tab.changes.entries.count)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background { GlassBackground(shape: .capsule) }
+                            .accessibilityLabel("File \(index + 1) of \(tab.changes.entries.count)")
+                    }
+                }
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 10)
+            .padding(.bottom, 6)
         }
     }
 }

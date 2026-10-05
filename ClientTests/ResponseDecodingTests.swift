@@ -88,6 +88,28 @@ final class ResponseDecodingTests: XCTestCase {
         XCTAssertEqual(assistant?.content?[1].name, "bash")
     }
 
+    func testGetMessagesDecodesStringContentSystemMessage() throws {
+        // pi's `get_messages` includes the session's `system` message, whose
+        // `content` is a bare STRING (with extra `sections`/`toolsAdded`
+        // fields), not the content-block array live events use. The
+        // synthesized decoder threw a type mismatch on it, failing the WHOLE
+        // payload — `loadMessages` then silently returned and a resumed
+        // session's transcript stayed blank. Either shape must decode.
+        let frame = response(command: "get_messages", dataJSON: """
+        {"messages":[
+          {"role":"system","content":"","sections":{"preamble":"x"},"timestamp":123,
+           "toolsAdded":[{"name":"read","description":"..."}]},
+          {"role":"user","id":"u1","content":[{"type":"text","text":"hello"}]},
+          {"role":"assistant","id":"a1","content":"plain string reply"}
+        ]}
+        """)
+        let payload = frame.dataPayload(MessagesPayload.self)
+        XCTAssertEqual(payload?.messages.count, 3, "the string-content system message must not fail the whole decode")
+        XCTAssertEqual(payload?.messages.first?.role, "system")
+        XCTAssertEqual(payload?.messages.first?.content?.first?.text, "")
+        XCTAssertEqual(payload?.messages.last?.content?.first?.text, "plain string reply")
+    }
+
     func testAgentMessageDecodesUsage() throws {
         // Documented usage shape on the finalized assistant message.
         let frame = response(command: "get_messages", dataJSON: """

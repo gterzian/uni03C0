@@ -2,8 +2,9 @@ import AppKit
 import Core
 import SwiftUI
 
-/// The Changes page — the review surface for the session folder's uncommitted
-/// changes. A list of the changed files on the left (the navigation) and, on
+/// The Changes page — the review surface for the session folder's changes since
+/// the session opened (a commit made while it stays open does not clear it). A
+/// list of the changed files on the left (the navigation) and, on
 /// the right, ONE scrollable viewer holding every file's diff in path order.
 /// Scrolling the viewer walks the whole changeset; the list highlights
 /// whichever file's section owns the top of the viewport, and clicking a row
@@ -21,19 +22,16 @@ struct ChangesView: View {
     /// syntax highlighting for an off-screen page).
     var pageActive = true
 
-    /// Height of the floating top chrome (the app's session tabs + the
-    /// Session/Changes switch) that this page scrolls under. The page itself
-    /// fills the window's top edge; the floating diff header and file list are
-    /// offset by this so they clear the chrome, and the diff document carries
-    /// it (plus the header) as its top content inset so the code bleeds under
-    /// both instead of stopping below a painted band.
+    /// Height of the floating top chrome (the app's session tabs, the
+    /// Session/Changes switch, and the nested Changes sub-nav) that this page
+    /// scrolls under. The page itself fills the window's top edge; the floating
+    /// file list and find bar are offset by this so they clear the chrome, and
+    /// the diff document carries it as its top content inset so the code bleeds
+    /// under the chrome instead of stopping below a painted band.
     var topInset: CGFloat = 0
 
     /// Find-in-diff state for the whole viewer (Cmd+F).
     @State private var search = CodeSearchModel()
-    /// Whether the floating file list is open. CLOSED by default: the diff is
-    /// the page, and the list floats over it only while navigating.
-    @State private var showSidebar = false
     /// The floating file list's minimum width: a comfortable reading width for
     /// the header and short paths before it grows to fit the longest one.
     private let minimumSidebarWidth: CGFloat = 220
@@ -70,7 +68,7 @@ struct ChangesView: View {
         // page and closing the list reveals the full width.
         ZStack(alignment: .topLeading) {
             diffArea
-            if showSidebar {
+            if store.isSidebarVisible && !store.entries.isEmpty {
                 GeometryReader { proxy in
                     changedList
                         .frame(width: sidebarWidth, height: max(0, proxy.size.height - 16 - topInset))
@@ -96,7 +94,7 @@ struct ChangesView: View {
             }
         }
         .onPreferenceChange(PageWidthKey.self) { pageWidth = $0 }
-        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showSidebar)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: store.isSidebarVisible)
         .onAppear {
             reconcileSelection()
             measureFileListContentWidth()
@@ -178,6 +176,9 @@ struct ChangesView: View {
         guard !store.entries.isEmpty else {
             store.selectedPath = nil
             listSelection = nil
+            // No diff to navigate: an open file list would only show its empty
+            // state, and the nested sub-nav's toggle disappears with it.
+            store.isSidebarVisible = false
             return
         }
         if let selected = store.selectedPath, store.entries.contains(where: { $0.path == selected }) {
@@ -306,8 +307,8 @@ struct ChangesView: View {
     /// diff. The list is navigation-only, so any click on the diff dismisses
     /// it; the outer ZStack's `.animation` drives the transition.
     private func dismissSidebar() {
-        guard showSidebar else { return }
-        showSidebar = false
+        guard store.isSidebarVisible else { return }
+        store.isSidebarVisible = false
     }
 
     // MARK: - Diff viewer
@@ -330,98 +331,48 @@ struct ChangesView: View {
                     onRevealConsumed: { store.consumeReveal() },
                     onTopSectionChanged: { store.setTopSection($0) },
                     pageActive: pageActive,
-                    topInset: headerHeight,
+                    // The document insets by the floating chrome always; the find
+                    // bar's measured height (which already includes the chrome)
+                    // when it is up.
+                    topInset: search.isVisible ? headerHeight : topInset,
                     bottomInset: bottomInset,
                     search: search,
                     onBackgroundClick: { dismissSidebar() }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            // Floating pills replace the old full-width header bar: the sidebar
-            // toggle and the file title float over the document like the tab
-            // pills do, with no painted band behind them. Shifted clear of the
-            // floating file list while it is open.
-            floatingDiffHeader
-                .padding(.leading, showSidebar ? sidebarWidth + 16 : 0)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear.preference(key: ViewerHeaderHeightKey.self, value: proxy.size.height)
+            // Find-in-diff floats over the document; the sidebar toggle and the
+            // selected file's title/position moved to the nested Changes
+            // sub-nav (`ChangesSubNav`), under the Session/Changes switch. Only
+            // rendered while the find bar is open, so an empty header never
+            // reserves a top inset.
+            if search.isVisible {
+                floatingSearchHeader
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: ViewerHeaderHeightKey.self, value: proxy.size.height)
+                        }
                     }
-                }
+            }
         }
         .onPreferenceChange(ViewerHeaderHeightKey.self) { headerHeight = $0 }
     }
 
-    /// The diff panel's floating chrome: the sidebar toggle plus the selected
-    /// file's title (and position in the changeset), each a glass pill over the
-    /// code — no full-width bar.
-    private var floatingDiffHeader: some View {
-        HStack(spacing: 6) {
-            Button {
-                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
-                    showSidebar.toggle()
-                }
-            } label: {
-                Image(systemName: "sidebar.left")
-                    .font(.system(size: 12, weight: .semibold))
-                    // Match the system glass button's label padding so replacing
-                    // `.buttonStyle(.glass)` with plain + AppKit glass keeps the
-                    // same pill size and hit area.
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
+    /// Find-in-diff, floating over the code as its own glass capsule (the
+    /// window toolbar is gone). The sidebar toggle and the selected file's
+    /// title/position live in the nested Changes sub-nav instead.
+    private var floatingSearchHeader: some View {
+        CodeSearchBar(model: search, placeholder: "Find in diffs…")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background { GlassBackground(shape: .capsule) }
-            .help(showSidebar ? "Hide the file list" : "Show the file list")
-            .accessibilityLabel("Toggle the changed-files sidebar")
-
-            if let selected = store.selectedPath {
-                // The title IS the open-in-default-app affordance: the viewer
-                // shows a diff window, so the title hands the whole file to an
-                // editor. Plain text for a deleted file (nothing on disk).
-                Group {
-                    if store.canOpenInDefaultApp(selected) {
-                        FileTitleLink(path: selected) { store.openInDefaultApp(selected) }
-                    } else {
-                        Text(selected)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background { GlassBackground(shape: .capsule) }
-
-                if let index = store.entries.firstIndex(where: { $0.path == selected }) {
-                    Text("\(index + 1) of \(store.entries.count)")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background { GlassBackground(shape: .capsule) }
-                        .accessibilityLabel("File \(index + 1) of \(store.entries.count)")
-                }
-            }
-
-            // Find-in-diff lives in the floating header (the window toolbar is
-            // gone), as its own glass capsule beside the file title.
-            if search.isVisible {
-                CodeSearchBar(model: search, placeholder: "Find in diffs…")
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background { GlassBackground(shape: .capsule) }
-            }
-        }
-        .padding(.horizontal, 10)
-        // The header floats directly under the app's tab chrome; `topInset` is
-        // its height, so the pill lands below the chrome. The measured header
-        // height includes it, which is why the document's own top inset is just
-        // `headerHeight` (see `diffArea`).
-        .padding(.top, 8 + topInset)
-        .padding(.bottom, 6)
+            .padding(.horizontal, 10)
+            // The bar floats directly under the app's tab chrome; `topInset` is
+            // its height, so the capsule lands below the chrome. The measured
+            // height includes it, so `diffArea` insets the document by it while
+            // the find bar is up (and by `topInset` alone otherwise).
+            .padding(.top, 8 + topInset)
+            .padding(.bottom, 6)
     }
 
     // MARK: - Shared bits
@@ -474,7 +425,7 @@ struct ChangesView: View {
 /// file), underlines and shows the pointing-hand cursor on hover, and carries a
 /// tooltip. A plain `Button` keeps the keyboard/`Space` activation SwiftUI
 /// already gives controls.
-private struct FileTitleLink: View {
+struct FileTitleLink: View {
     let path: String
     let action: () -> Void
 

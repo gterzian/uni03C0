@@ -43,10 +43,10 @@ nonisolated struct LoadedFileDiff: Equatable, Sendable {
 /// for the old side, and `TextDiff` all run on the caller's executor so the
 /// only main-thread work is handing the finished value to the store.
 nonisolated enum DiffLoader {
-    /// Loads one file's diff against `base` — the turn baseline captured when
-    /// the user's prompt was sent. Keeping the base fixed (rather than reading
-    /// the live `HEAD`) is what lets a file the agent commits mid-turn keep
-    /// showing the accumulated diff instead of blanking out.
+    /// Loads one file's diff against `base` — the session baseline pinned when
+    /// the session was opened or resumed. Keeping the base fixed (rather than
+    /// reading the live `HEAD`) is what lets a file committed during the
+    /// session keep showing the accumulated diff instead of blanking out.
     static func load(cwd: URL, entry: GitStatus.FileEntry, base: String = "HEAD") async -> LoadedFileDiff {
         let name = (entry.path as NSString).lastPathComponent
         switch entry.kind {

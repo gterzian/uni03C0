@@ -51,6 +51,11 @@ struct TranscriptView: NSViewRepresentable {
     /// adds scroll margin while the clip view still spans the pane.
     var topInset: CGFloat = 0
     var bottomInset: CGFloat = 0
+    /// The view model's session epoch (bumped on every transcript rebuild).
+    /// `updateNSView` forwards it to the coordinator, which reconciles the
+    /// table to the rebuilt store — a belt-and-braces path for a session
+    /// switch whose `onTranscriptChange` notification was missed.
+    var sessionEpoch: UInt64 = 0
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -64,6 +69,7 @@ struct TranscriptView: NSViewRepresentable {
         context.coordinator.setViewModel(viewModel)
         context.coordinator.setPageActive(isPageActive)
         context.coordinator.setContentInsets(top: topInset, bottom: bottomInset)
+        context.coordinator.reconcileSessionEpoch(sessionEpoch)
     }
 }
 
@@ -155,6 +161,9 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// is pending. AppKit, so no SwiftUI graph invalidates per frame.
     private var switchingIndicator: NSProgressIndicator?
     private var isApplying = false
+    /// The session epoch the table was last reconciled to (see
+    /// `reconcileSessionEpoch`).
+    private var lastSessionEpoch: UInt64 = 0
     /// Streaming batching: the tail row is refreshed at most every
     /// `batchInterval` seconds (a few words for a typical stream), and the new
     /// chunk crossfades in. The interval is a HARD cap — a per-delta word gate
@@ -683,6 +692,21 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         lastVisibleMaxY = scrollView?.documentVisibleRect.maxY ?? 0
         // Keep the tail pinned above the (now taller) bottom chrome.
         if isFollowing { scheduleScrollToBottom() }
+    }
+
+    /// Reconciles the table to a rebuilt transcript. `onTranscriptChange` is
+    /// the primary path, but it can be missed (the callback unset during a tab
+    /// switch, a reconciliation in flight). `updateNSView` forwards the view
+    /// model's `sessionEpoch`, bumped by `loadMessages`; a change schedules one
+    /// `applyModelChanges` for the next run-loop turn — after the SwiftUI
+    /// update transaction, never mutating the table inside it (the same
+    /// deferral the tab-switch rebind uses).
+    func reconcileSessionEpoch(_ epoch: UInt64) {
+        guard epoch != lastSessionEpoch else { return }
+        lastSessionEpoch = epoch
+        DispatchQueue.main.async { [weak self] in
+            self?.applyModelChanges()
+        }
     }
 
     /// Reconciles the representable's incoming session with the coordinator's.

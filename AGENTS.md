@@ -265,9 +265,10 @@ Rules:
   transcript has **no `.id`** and is rebound; Changes is `.id`-keyed per tab.
 - The inactive page does zero work, gated by `pageActive` — no file IO, no diff
   loading, no highlighting.
-- Changed files + stats via `GitStatus.classify`/`DiffLoader` against the turn
-  baseline (`beginTurn` pins `HEAD` when a prompt is sent), so a mid-turn
-  `git commit` never clears the viewer; only a new turn re-baselines. The store
+- Changed files + stats via `GitStatus.classify`/`DiffLoader` against the
+  session baseline (`beginSession` pins `HEAD` when a session opens or is
+  resumed), so a `git commit` while the session stays open never clears the
+  viewer; resuming/re-opening re-pins it (committed work drops out). The store
   advances only on `GitStatus.didChangeNotification` — a commit emits none.
 - The viewer is ONE `CodePaneContainer` (scroll view + code view + ruler +
   edit-map scroller) over every file's diff in path order, each opened by a

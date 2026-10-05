@@ -3,7 +3,7 @@ import Core
 import Foundation
 import Observation
 
-/// The uncommitted-changes store behind the Changes page, and the model for its
+/// The session-changes store behind the Changes page, and the model for its
 /// one scrollable diff viewer. It owns the changed-file list (for the sidebar),
 /// the loaded per-file diffs, and the per-file top/bottom expansion state, and
 /// it does all the git + file work off the main thread.
@@ -35,6 +35,10 @@ final class ChangesStore {
     /// kept in sync by the viewer's scroll spy). Clicking a sidebar row writes
     /// this and requests a scroll.
     var selectedPath: String?
+    /// Whether the floating changed-files list is open. Owned by the store (not
+    /// the page view) because the toggle lives in the nested Changes sub-nav,
+    /// shared with the app's floating chrome; the Changes page just reads it.
+    var isSidebarVisible = false
     /// One-shot "scroll the viewer to this path's section" request. Consumed by
     /// the viewer via `consumeReveal()`.
     var revealPath: String?
@@ -42,11 +46,11 @@ final class ChangesStore {
     /// `#L…` of an agent's `pi-file` link), nil for a whole-file reveal.
     var revealLine: Int?
 
-    /// The commit this turn diffs against, pinned when the user's prompt is
-    /// sent (`beginTurn`). `nil` until the first turn — then every refresh uses
-    /// the live `HEAD`. Pinning it is what keeps a commit the agent makes
-    /// mid-turn from clearing the viewer: the changed set and diffs are net
-    /// changes since the turn began, and only the next turn re-baselines.
+    /// The commit the viewer diffs against, pinned on the first listing after
+    /// a session is opened or resumed (`beginSession`). It stays put while the
+    /// session remains open, so a commit made during the session (same branch)
+    /// does not clear the viewer; re-opening/resuming re-pins it to the
+    /// then-current `HEAD`, dropping work that has since been committed.
     @ObservationIgnored private(set) var baseline: String?
     /// The branch `baseline` was pinned on, or nil when detached / not a git
     /// repository. A refresh that finds a different branch name re-pins the
@@ -54,9 +58,9 @@ final class ChangesStore {
     /// diffing against the previous branch's commit (which would show both
     /// branches' work at once — the two same-project tabs disagreeing bug).
     @ObservationIgnored private var baselineBranch: String?
-    /// Called when `baseline` moves to a new commit — a new turn or a branch
-    /// switch — so the changed-file count re-checks against the same commit
-    /// the viewer uses and the badge can never disagree with the list.
+    /// Called when `baseline` moves to a new commit — a session open/resume or
+    /// a branch switch — so the changed-file count re-checks against the same
+    /// commit the viewer uses and the badge can never disagree with the list.
     @ObservationIgnored var onBaselineChanged: (() -> Void)?
 
     /// The assembled document for `documentVersion`, from the viewer's off-main
@@ -125,15 +129,16 @@ final class ChangesStore {
         }
     }
 
-    /// Re-baselines the viewer for a new user turn: pins the current `HEAD` as
-    /// the commit this turn diffs against (a mid-turn commit by the agent then
-    /// no longer moves the baseline) and drops the previous turn's expansion
-    /// state. Called when a prompt is sent, never on a git commit.
-    func beginTurn() async {
-        baseline = await GitStatus.resolveHead(at: cwd)
-        baselineBranch = await GitStatus.resolveBranch(at: cwd)
+    /// Re-scopes the viewer to a session open or resume: drops the pinned
+    /// baseline (and the previous session's expansion state), so the next
+    /// listing re-pins it to the current `HEAD`. A commit made while the
+    /// session stays open does not move that baseline, so its diff survives
+    /// for review; resuming or re-opening re-pins, dropping work committed
+    /// before the reopen. Never called on a git commit.
+    func beginSession() async {
+        baseline = nil
+        baselineBranch = nil
         gapExpansion = [:]
-        onBaselineChanged?()
         await refresh()
     }
 
@@ -152,15 +157,23 @@ final class ChangesStore {
             guard !Task.isCancelled else { return }
             let cwd = self.cwd
             // A branch switch moves HEAD to a commit on another branch, so the
-            // pinned turn baseline no longer describes "this branch's
+            // pinned session baseline no longer describes "this branch's
             // uncommitted work": diffing against it would merge both
             // branches' changes into the viewer. Re-pin to the current HEAD
             // when the branch NAME changed; a commit on the same branch
-            // leaves the name alone, so a mid-turn commit still keeps the
-            // accumulated diff. Detached HEAD (nil) is a switch like any
-            // other.
+            // leaves the name alone, so a commit during the session still
+            // keeps the accumulated diff. Detached HEAD (nil) is a switch like
+            // any other.
             let branch = await GitStatus.resolveBranch(at: cwd)
-            if GitStatus.shouldRepinBaseline(hasBaseline: baseline != nil, pinnedBranch: baselineBranch, currentBranch: branch) {
+            if baseline == nil {
+                // First listing of a session (an open, or a resume that
+                // cleared it): pin the commit the viewer diffs against, so a
+                // commit made while this session stays open does not clear it.
+                baseline = await GitStatus.resolveHead(at: cwd)
+                baselineBranch = branch
+                gapExpansion = [:]
+                onBaselineChanged?()
+            } else if GitStatus.shouldRepinBaseline(hasBaseline: true, pinnedBranch: baselineBranch, currentBranch: branch) {
                 baseline = await GitStatus.resolveHead(at: cwd)
                 baselineBranch = branch
                 gapExpansion = [:]
@@ -168,9 +181,9 @@ final class ChangesStore {
             } else {
                 baselineBranch = branch
             }
-            // Read the baseline each iteration: `beginTurn` may pin a new one
-            // while a refresh is already in flight (the queued repeat picks it
-            // up instead of the old base).
+            // Read the baseline each iteration: `beginSession` may clear it
+            // while a refresh is already in flight (the queued repeat re-pins
+            // to the new session's `HEAD` instead of the stale base).
             let base: String
             if let baseline {
                 base = baseline

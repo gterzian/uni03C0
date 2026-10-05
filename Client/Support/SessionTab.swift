@@ -13,7 +13,8 @@ struct RestoreRequest: Equatable {
 }
 
 /// The nested page a session tab shows — the conversation or the Changes
-/// review surface (the uncommitted diff of the session folder). A "tab within
+/// review surface (the session folder's changes since the session opened; a
+/// commit made while it stays open does not clear it). A "tab within
 /// the tab": switching swaps the transcript area for the diff, while the
 /// prompt bar and the chrome below stay put — so tagging a reference and
 /// pasting it into the prompt happens in the same window.
@@ -72,13 +73,13 @@ final class SessionTab: Identifiable {
     /// Changes viewer to that file when the file is part of the changeset.
     @ObservationIgnored private var openReferenceObserver: NSObjectProtocol?
 
-    /// Number of files with uncommitted changes in this session's folder
-    /// (`git status --porcelain` line count), nil when the folder isn't a git
-    /// repo or the first check hasn't completed. Drives the count badge on
-    /// the nested Changes page tab (the old "N edited" review gate). Refreshed
-    /// once at init (a project that already had uncommitted changes before
-    /// the app opened shows the badge immediately) and debounced after every
-    /// agent file change (§2.2).
+    /// Number of files changed since the session's pinned baseline in this
+    /// folder (`git status --porcelain` line count), nil when the folder isn't
+    /// a git repo or the first check hasn't completed. Drives the count badge
+    /// on the nested Changes page tab (the old "N edited" review gate).
+    /// Refreshed once at init (a project that already had changes before the
+    /// app opened shows the badge immediately) and debounced after every agent
+    /// file change (§2.2).
     var gitChangeCount: Int?
     private var gitCountTask: Task<Void, Never>?
 
@@ -120,13 +121,15 @@ final class SessionTab: Identifiable {
             guard let self else { return }
             self.fileStateMayHaveChanged(path: path)
         }
-        // A user turn begins: pin the Changes viewer's baseline to the commit
-        // `HEAD` names right now, so a commit the agent makes mid-turn does not
-        // clear the diff. Fired before the prompt is sent, and the git work is
-        // deferred off the send path (a main-actor Task), so it never delays
-        // the prompt reaching pi.
-        viewModel.onTurnStarted = { [weak self] in
-            Task { [weak self] in await self?.changes.beginTurn() }
+        // A session is resumed: re-pin the Changes viewer's baseline to the
+        // commit `HEAD` names right now, so work committed while a previous
+        // session was open drops out of the diff for the session just opened.
+        // While a session stays open, nothing re-pins it — a commit made
+        // during the session is deliberately ignored so its diff stays
+        // reviewable. The git work is deferred off the switch path (a
+        // main-actor Task).
+        viewModel.onSessionSwitched = { [weak self] in
+            Task { [weak self] in await self?.changes.beginSession() }
         }
         // A click on an agent-emitted file reference in the transcript (posted
         // by the transcript coordinator, which has no SessionTab): switch to the
@@ -244,8 +247,9 @@ final class SessionTab: Identifiable {
                 try? await Task.sleep(for: .milliseconds(350))
             }
             guard !Task.isCancelled else { return }
-            // Same turn baseline as the viewer, so the badge and the changed
-            // list can never disagree (a mid-turn commit keeps counting).
+            // Same session baseline as the viewer, so the badge and the
+            // changed list can never disagree (a commit during the session
+            // keeps counting).
             let base = self?.changes.baseline
             let count = await GitStatus.changedFileCount(at: cwd, base: base)
             self?.gitChangeCount = count
