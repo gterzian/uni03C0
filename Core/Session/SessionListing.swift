@@ -10,7 +10,7 @@ public enum SessionListing {
         let home = FileManager.default.homeDirectoryForCurrentUser
         var path = cwd.path
         // Strip the leading "/" so it doesn't become an extra "-" in the
-        // encoded name (real dirs are --Users-Gregory-Projects-x--, not
+        // encoded name (real dirs are --Users-tester-Projects-x--, not
         // ---Users-...--).
         if path.hasPrefix("/") { path.removeFirst() }
         let encoded = path.replacingOccurrences(of: "/", with: "-")

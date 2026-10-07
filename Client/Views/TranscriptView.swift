@@ -993,12 +993,12 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if let cached = heights.heightIfPresent(for: entry.id, width: width) {
                 return cached
             }
-            let height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+            let height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize, displayRoot: viewModel?.cwd)
             heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
             return height
         }
         return heights.height(for: entry.id, width: width, tag: Self.contentTag(for: entry)) {
-            entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+            entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize, displayRoot: viewModel?.cwd)
         }
     }
 
@@ -1678,7 +1678,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             // content-aware (cached once per content — re-measured only on
             // genuine change, never per table query).
             let measured = heights.height(for: entry.id, width: width, tag: tag) {
-                entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+                entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize, displayRoot: viewModel?.cwd)
             }
 
             // A reused cell can still hold a stale (wider) frame after a
@@ -2043,7 +2043,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .toolCall(let card):
             let v = tableView.makeView(withIdentifier: .toolRow, owner: nil) as? ToolCallHostView ?? ToolCallHostView()
             v.identifier = .toolRow
-            v.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent) { [weak self] in
+            v.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, displayRoot: viewModel?.cwd) { [weak self] in
                 self?.toggleToolCard(card.id)
             }
             view = v
@@ -2080,7 +2080,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 height = textRow.contentHeight + 2
                 heights.store(entry.id, width: width, height: height, tag: Self.contentTag(for: entry))
             } else {
-                height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+                height = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize, displayRoot: viewModel?.cwd)
             }
         } else {
             height = rowHeight(for: entry, width: width)
@@ -2122,7 +2122,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         case .abortedMessage(let text):
             (cell as? TextRowView)?.configure(text: text, thinking: nil, role: .aborted, isStreaming: false, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, onOpenFileReference: openReferenceHandler)
         case .toolCall(let card):
-            (cell as? ToolCallHostView)?.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent) { [weak self] in
+            (cell as? ToolCallHostView)?.configure(card: card, searchQuery: query, searchCaseSensitive: caseSensitive, isCurrentSearchMatch: isCurrent, displayRoot: viewModel?.cwd) { [weak self] in
                 self?.toggleToolCard(card.id)
             }
         }

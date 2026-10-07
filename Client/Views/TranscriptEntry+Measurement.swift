@@ -22,7 +22,7 @@ extension TranscriptEntry {
     /// layout (`NSHostingController.sizeThatFits`), which must run on the main
     /// thread, so the coordinator's background pre-measurer skips them and
     /// they always fall back to this main-thread path.
-    nonisolated func measuredHeight(forWidth width: CGFloat, bodySize: CGFloat) -> CGFloat {
+    nonisolated func measuredHeight(forWidth width: CGFloat, bodySize: CGFloat, displayRoot: URL? = nil) -> CGFloat {
         switch kind {
         case .userMessage(let text):
             return TranscriptText.measuredHeight(text: text, thinking: nil, role: .user, isStreaming: false, width: width, bodySize: bodySize)
@@ -42,7 +42,7 @@ extension TranscriptEntry {
             // pre-measurer never schedules tool cards (`isPremeasurable`
             // filters them), so this branch only ever runs on the main
             // thread — the assumeIsolated asserts exactly that contract.
-            return MainActor.assumeIsolated { Self.toolCallHeight(card, width: width) }
+            return MainActor.assumeIsolated { Self.toolCallHeight(card, width: width, displayRoot: displayRoot) }
         }
     }
 
@@ -58,9 +58,9 @@ extension TranscriptEntry {
     /// each 0.25s streaming batch into a fresh graph construction on the main
     /// thread. One long-lived controller whose `rootView` is swapped per
     /// measurement keeps the cost down to the actual SwiftUI layout pass.
-    private static func toolCallHeight(_ card: ToolCallCard, width: CGFloat) -> CGFloat {
+    private static func toolCallHeight(_ card: ToolCallCard, width: CGFloat, displayRoot: URL?) -> CGFloat {
         let measurer = ToolCardMeasurer.shared
-        return measurer.height(of: card, width: width)
+        return measurer.height(of: card, width: width, displayRoot: displayRoot)
     }
 }
 
@@ -74,10 +74,11 @@ private final class ToolCardMeasurer {
     /// the SwiftUI graph is built once for the life of the app.
     private let controller = NSHostingController(rootView: AnyView(EmptyView()))
 
-    func height(of card: ToolCallCard, width: CGFloat) -> CGFloat {
+    func height(of card: ToolCallCard, width: CGFloat, displayRoot: URL?) -> CGFloat {
         controller.rootView = AnyView(ToolCallCardView(
             card: card,
-            isInitiallyExpanded: ToolCardExpansion.shared.isExpanded(card.id)
+            isInitiallyExpanded: ToolCardExpansion.shared.isExpanded(card.id),
+            displayRoot: displayRoot
         ))
         let size = controller.sizeThatFits(in: NSSize(width: max(width, 320), height: .greatestFiniteMagnitude))
         // Round up so the table never clips the last line, plus 2pt slack: the
