@@ -2,6 +2,111 @@ import AppKit
 import Core
 import SwiftUI
 
+/// Display-only shortening of filesystem paths shown inside tool cards.
+///
+/// The session's working directory is stripped (so a path reads
+/// `Client/Views/ToolCallCardView.swift` rather than the full absolute path)
+/// and the home directory is abbreviated to `~`. This is purely cosmetic: it
+/// exists so screenshots and live presentations do not leak the account name
+/// or machine layout. Nothing here is ever sent to pi, stored in the
+/// transcript, or fed back into search — the full path stays in the card
+/// model; only the rendered text changes.
+nonisolated enum DisplayPath {
+    /// The display form of one path: relative to `root` when it lives under
+    /// it, `~`-relative under the home directory, otherwise unchanged. Paths
+    /// that are already relative (no leading `/`) are returned as-is.
+    static func shorten(_ path: String, root: URL?) -> String {
+        guard path.hasPrefix("/") else { return path }
+        if let root = root.map(standardized), root != "/",
+           let relative = strip(prefix: root, from: path) {
+            return relative.isEmpty ? "." : relative
+        }
+        let home = standardized(URL(fileURLWithPath: NSHomeDirectory()))
+        if home != "/", let relative = strip(prefix: home, from: path) {
+            return relative.isEmpty ? "~" : "~/" + relative
+        }
+        return path
+    }
+
+    /// Applies `shorten` to every root/home prefix occurring inside freeform
+    /// text (a bash command, a tool's output), so an absolute path buried in a
+    /// line can not leak either. Only exact prefix occurrences are replaced.
+    static func shortenAll(in text: String, root: URL?) -> String {
+        guard text.contains("/") else { return text }
+        var result = text
+        let home = standardized(URL(fileURLWithPath: NSHomeDirectory()))
+        let root = root.map(standardized)
+        // Root first (it normally nests under home), so a project path becomes
+        // its short relative form rather than `~/Projects/…`. Each prefix is
+        // tried in both its plain and JSON-escaped form: a pretty-printed
+        // arguments blob escapes every `/` as `\/`, so a plain-only match
+        // would miss the path the bash card shows.
+        if let root, root != "/", root != home {
+            result = replacingPrefix(root, in: result, separator: "/", descendant: "", exact: ".")
+            result = replacingPrefix(escaped(root), in: result, separator: "\\/", descendant: "", exact: ".")
+        }
+        if home != "/" {
+            result = replacingPrefix(home, in: result, separator: "/", descendant: "~/", exact: "~")
+            result = replacingPrefix(escaped(home), in: result, separator: "\\/", descendant: "~\\/", exact: "~")
+        }
+        return result
+    }
+
+    /// The JSON-escaped spelling of a path: every `/` becomes `\/`.
+    private static func escaped(_ path: String) -> String {
+        path.replacingOccurrences(of: "/", with: "\\/")
+    }
+
+    /// Replaces every occurrence of `prefix` that sits on a path-component
+    /// boundary: `<prefix><separator>x` becomes `<descendant>x`, and a bare
+    /// `<prefix>` (end of string or followed by a non-path character) becomes
+    /// `exact`. `separator` is `/` for plain text and `\/` for JSON-escaped
+    /// text. A longer sibling whose name merely begins with `prefix` is left
+    /// alone (`/a/bc` is not rewritten for a `/a/b` prefix).
+    private static func replacingPrefix(_ prefix: String, in text: String, separator: String, descendant: String, exact: String) -> String {
+        guard !prefix.isEmpty, text.contains(prefix) else { return text }
+        var result = ""
+        result.reserveCapacity(text.count)
+        var searchStart = text.startIndex
+        while let range = text.range(of: prefix, range: searchStart..<text.endIndex) {
+            result += text[searchStart..<range.lowerBound]
+            let after = range.upperBound
+            if text[after...].hasPrefix(separator) {
+                result += descendant
+                searchStart = text.index(after, offsetBy: separator.count) // consume the separator
+            } else if after == text.endIndex || !isPathCharacter(text[after]) {
+                result += exact
+                searchStart = after
+            } else {
+                result += prefix
+                searchStart = after
+            }
+        }
+        result += text[searchStart...]
+        return result
+    }
+
+    /// A character that can continue a path component, so a `prefix` match
+    /// followed by one is NOT a component boundary.
+    private static func isPathCharacter(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber || character == "_" || character == "-" || character == "."
+    }
+
+    private static func standardized(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        return path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
+
+    /// The part of `path` after `root` when `path` is `root` itself or a
+    /// descendant (`root + "/"`), else nil. A sibling whose name merely starts
+    /// with the root (`/a/bc` is not under `/a/b`) never matches.
+    private static func strip(prefix root: String, from path: String) -> String? {
+        if path == root { return "" }
+        guard path.hasPrefix(root + "/") else { return nil }
+        return String(path.dropFirst(root.count + 1))
+    }
+}
+
 /// A table cell that hosts a SwiftUI tool-call card. Structured cards for
 /// edit/write/bash/read events — typed before/after data from tool events,
 /// not scraped terminal output.
@@ -23,6 +128,7 @@ final class ToolCallHostView: NSView {
     private var lastConfiguredCaseSensitive = false
     private var lastConfiguredIsCurrent = false
     private var lastConfiguredExpanded = false
+    private var lastConfiguredRoot: URL?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -37,7 +143,7 @@ final class ToolCallHostView: NSView {
         wantsLayer = true
     }
 
-    func configure(card: ToolCallCard, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, onToggleExpand: @escaping () -> Void) {
+    func configure(card: ToolCallCard, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, displayRoot: URL? = nil, onToggleExpand: @escaping () -> Void) {
         renderedCardID = card.id
         renderedCardState = card.state
         // Identical inputs (a scroll re-entry rendering the same card): the
@@ -53,7 +159,8 @@ final class ToolCallHostView: NSView {
            searchQuery == lastConfiguredQuery,
            searchCaseSensitive == lastConfiguredCaseSensitive,
            isCurrentSearchMatch == lastConfiguredIsCurrent,
-           expanded == lastConfiguredExpanded {
+           expanded == lastConfiguredExpanded,
+           displayRoot == lastConfiguredRoot {
             return
         }
         lastConfiguredCard = card
@@ -61,6 +168,7 @@ final class ToolCallHostView: NSView {
         lastConfiguredCaseSensitive = searchCaseSensitive
         lastConfiguredIsCurrent = isCurrentSearchMatch
         lastConfiguredExpanded = expanded
+        lastConfiguredRoot = displayRoot
         // `.id(card.id)` keeps the card's own expansion state alive across
         // output updates for the same call, but resets it when a recycled cell
         // is reused for a different call.
@@ -71,7 +179,8 @@ final class ToolCallHostView: NSView {
                 isInitiallyExpanded: expanded,
                 searchQuery: searchQuery,
                 searchCaseSensitive: searchCaseSensitive,
-                isCurrentSearchMatch: isCurrentSearchMatch
+                isCurrentSearchMatch: isCurrentSearchMatch,
+                displayRoot: displayRoot
             )
             .id(card.id)
         )
@@ -115,15 +224,19 @@ struct ToolCallCardView: View {
     var searchQuery: String?
     var searchCaseSensitive = false
     var isCurrentSearchMatch = false
+    /// The session's working directory, used only to shorten displayed paths
+    /// (see `DisplayPath`). Nil leaves paths untouched.
+    var displayRoot: URL?
 
     @State private var isExpanded: Bool
 
-    init(card: ToolCallCard, onToggleExpand: @escaping () -> Void = {}, isInitiallyExpanded: Bool = false, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false) {
+    init(card: ToolCallCard, onToggleExpand: @escaping () -> Void = {}, isInitiallyExpanded: Bool = false, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, displayRoot: URL? = nil) {
         self.card = card
         self.onToggleExpand = onToggleExpand
         self.searchQuery = searchQuery
         self.searchCaseSensitive = searchCaseSensitive
         self.isCurrentSearchMatch = isCurrentSearchMatch
+        self.displayRoot = displayRoot
         _isExpanded = State(initialValue: isInitiallyExpanded)
     }
 
@@ -176,10 +289,11 @@ struct ToolCallCardView: View {
                     isExpanded: isExpanded,
                     searchQuery: searchQuery,
                     searchCaseSensitive: searchCaseSensitive,
-                    isCurrentSearchMatch: isCurrentSearchMatch
+                    isCurrentSearchMatch: isCurrentSearchMatch,
+                    displayRoot: displayRoot
                 )
             } else if !card.arguments.isEmpty {
-                Text(highlighted(card.arguments))
+                Text(highlighted(DisplayPath.shortenAll(in: card.arguments, root: displayRoot)))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(isExpanded ? nil : 2)
@@ -190,7 +304,7 @@ struct ToolCallCardView: View {
             // the diff/patch text, redundant next to the pretty diff, so it is
             // omitted for cards that render one.
             if !card.output.isEmpty, card.state == .failed || ops == nil {
-                Text(highlighted(card.output))
+                Text(highlighted(DisplayPath.shortenAll(in: card.output, root: displayRoot)))
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(card.state == .failed ? Color.red : .primary)
                     .lineLimit(isExpanded ? nil : 30)
@@ -261,8 +375,9 @@ struct ToolCallCardView: View {
     /// so a card says "read /path/to/file" instead of just "read". Nil for
     /// tools that don't act on a single path (bash, glob, …).
     private var titlePath: String? {
-        guard card.toolName == "read" || card.toolName == "write" else { return nil }
-        return card.pathArgument
+        guard card.toolName == "read" || card.toolName == "write",
+              let path = card.pathArgument else { return nil }
+        return DisplayPath.shorten(path, root: displayRoot)
     }
 
     /// Accessibility label: "Tool bash, done" — the state word matches the
@@ -385,16 +500,21 @@ struct EditDiffView: View {
     let searchQuery: String?
     let searchCaseSensitive: Bool
     let isCurrentSearchMatch: Bool
+    /// The session's working directory, used only to shorten the displayed
+    /// path headers (see `DisplayPath`). The copy button still emits the full
+    /// diff. Nil leaves paths untouched.
+    let displayRoot: URL?
 
     /// Line budget (headers + diff lines) for the collapsed preview.
     private static let collapsedLineBudget = 14
 
-    init(operations: [EditOperation], isExpanded: Bool, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false) {
+    init(operations: [EditOperation], isExpanded: Bool, searchQuery: String? = nil, searchCaseSensitive: Bool = false, isCurrentSearchMatch: Bool = false, displayRoot: URL? = nil) {
         self.operations = operations
         self.isExpanded = isExpanded
         self.searchQuery = searchQuery
         self.searchCaseSensitive = searchCaseSensitive
         self.isCurrentSearchMatch = isCurrentSearchMatch
+        self.displayRoot = displayRoot
     }
 
     /// The full diff as plain text — what the corner copy button delivers. One
@@ -475,7 +595,7 @@ struct EditDiffView: View {
     private func buildSegments() -> [Segment] {
         var segments: [Segment] = []
         for op in operations {
-            segments.append((op.path, .path))
+            segments.append((DisplayPath.shorten(op.path, root: displayRoot), .path))
             for line in TextDiff.diff(old: op.oldText, new: op.newText) {
                 switch line.kind {
                 case .removed: segments.append(("-" + (line.text.isEmpty ? " " : line.text), .removed))

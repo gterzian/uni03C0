@@ -291,7 +291,9 @@ struct SessionTabsView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { activeID = tab.id }
-        .help(tab.cwd.path)
+        // Only the folder name — a tooltip (and any screenshot of it) must not
+        // reveal the full account path.
+        .help(tab.cwd.lastPathComponent)
     }
 
     /// The same status icons as the toolbar's Stop button: a spinner while the

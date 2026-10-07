@@ -7,12 +7,12 @@ import XCTest
 final class SessionListingTests: XCTestCase {
 
     func testSessionDirectoryEncoding() {
-        let cwd = URL(fileURLWithPath: "/Users/Gregory/Projects/pi_native")
+        let cwd = URL(fileURLWithPath: "/Users/tester/Projects/pi_native")
         let dir = SessionListing.sessionsDirectory(for: cwd)
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         XCTAssertEqual(
             dir.path,
-            home + "/.pi/agent/sessions/--Users-Gregory-Projects-pi_native--"
+            home + "/.pi/agent/sessions/--Users-tester-Projects-pi_native--"
         )
     }
 
