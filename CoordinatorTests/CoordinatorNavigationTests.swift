@@ -719,12 +719,15 @@ final class CoordinatorNavigationTests: XCTestCase {
 
     // MARK: - Off-main height pre-measurement
 
-    /// A settled row appended to the store must be scheduled for background
-    /// measurement and the result must land in the session's height cache
-    /// (so `heightOfRow` serves it instead of typesetting on the main
-    /// thread). The seeded height must equal the authoritative measure — the
-    /// "one measurement function" invariant.
-    func testAppendSchedulesAndSeedsOffMainPremeasure() {
+    /// An appended settled row must land in the session's height cache with
+    /// the authoritative measure, so `heightOfRow` serves it instead of
+    /// typesetting it afresh. AppKit caches row spans for inserted rows
+    /// synchronously — `NSTableRowHeightData._cacheRowSpansInRange` calls this
+    /// delegate's `heightOfRow` — so the append's off-main pre-measure is
+    /// normally preempted; this asserts the outcome the table actually
+    /// consumes: the cached height equals what `TranscriptText.measuredHeight`
+    /// produces (the "one measurement function" invariant).
+    func testAppendSeedsTheSettledRowHeightCache() {
         let vm = SessionViewModel()
         let coordinator = Coordinator()
         let sv = coordinator.makeScrollView(viewModel: vm)
@@ -732,30 +735,58 @@ final class CoordinatorNavigationTests: XCTestCase {
         sv.layoutSubtreeIfNeeded()
         spinRunLoop() // let makeScrollView's deferred tail-scroll land
 
-        // Fold ONE settled user message (no assistant reply): the only row is
-        // a settled text row, so it is pre-measurable.
+        // Fold ONE settled user message. The store also appends the streaming
+        // turn-start placeholder; only the user row is a settled text row.
+        let userID = "u0"
         _ = vm.store.apply(frame(type: "message_start",
-            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"u0\",\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}]}}"))
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"id\":\"\(userID)\",\"content\":[{\"type\":\"text\",\"text\":\"hello world\"}]}}"))
         vm.onTranscriptChange?()
+        spinRunLoop()
 
-        // The pump drains the queue into the in-flight task synchronously, so
-        // the observable signal is `premeasureInFlight`, not a non-empty queue.
+        let width = coordinator.tableView.tableColumns.first!.width
+        let cache = coordinator.heightCacheForTesting(vm)
+        let cached = cache?.heightIfPresent(for: userID, width: width)
+        XCTAssertNotNil(cached, "the appended settled row's height is in the session cache")
+        guard let cached,
+              let index = (0..<vm.store.count).first(where: { vm.store.entry(at: $0)?.id == userID }),
+              let entry = vm.store.entry(at: index) else {
+            XCTFail("the appended row is in the store")
+            return
+        }
+        let direct = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+        XCTAssertEqual(cached, direct, accuracy: 0.01,
+            "the cached height is the same value the main-thread measure produces")
+    }
+
+    /// Materializing a window taller than the visible span must pre-measure
+    /// the rows AppKit has not cached during the reload: the off-main pass
+    /// seeds them before they are ever scrolled to. (For a small window that
+    /// fits AppKit's row-span cache the pass has nothing to do and stays
+    /// idle — see the append test above.)
+    func testWindowMaterializationPremeasuresOffscreenRows() {
+        let (coordinator, _, vm) = makeStreamingCoordinator(turns: 200)
         XCTAssertTrue(coordinator.premeasureInFlight,
-            "an appended settled row starts the background pre-measure")
+            "a window larger than the visible span starts the off-main pre-measure")
 
         spinRunLoop() // let the detached measure task drain + store
 
         XCTAssertFalse(coordinator.premeasureInFlight, "the pre-measure task completed")
-        XCTAssertTrue(coordinator.pendingPremeasure.isEmpty,
-            "the pre-measure queue drains")
+        XCTAssertTrue(coordinator.pendingPremeasure.isEmpty, "the pre-measure queue drains")
+
+        // The top of the materialized window is far above the followed tail:
+        // it was never rendered, so only the pre-measure can have cached it.
         let width = coordinator.tableView.tableColumns.first!.width
         let cache = coordinator.heightCacheForTesting(vm)
-        let cached = cache?.heightIfPresent(for: "u0", width: width)
-        XCTAssertNotNil(cached, "the pre-measured height landed in the session cache")
+        guard let entry = vm.store.entry(at: coordinator.windowStart) else {
+            XCTFail("the window's first row is in the store")
+            return
+        }
+        let cached = cache?.heightIfPresent(for: entry.id, width: width)
+        XCTAssertNotNil(cached, "the off-screen window row's height was pre-measured")
         guard let cached else { return }
-        let direct = vm.store.entry(at: 0)!.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
+        let direct = entry.measuredHeight(forWidth: width, bodySize: FontSettings.shared.bodySize)
         XCTAssertEqual(cached, direct, accuracy: 0.01,
-            "the background-seeded height is the same value the main-thread measure produces")
+            "the pre-measured height is the same value the main-thread measure produces")
     }
 
     /// A row appended in the STREAMING state must never be pre-measured — its

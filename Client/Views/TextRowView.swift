@@ -12,12 +12,10 @@ enum TranscriptText {
     nonisolated static let verticalInset: CGFloat = 12
 
     /// The readable width of the body text column for a row of `width` points:
-    /// the full width minus the line-fragment padding, capped at
-    /// `MarkdownStyle.maxContentWidth` (about 80 characters) and left-aligned.
-    /// The renderer and the measurer both go through this, so the cap can
-    /// never make the two disagree.
+    /// the full width minus the line-fragment padding. The renderer and the
+    /// measurer both go through this, so the two can never disagree.
     nonisolated static func textColumnWidth(forRowWidth width: CGFloat) -> CGFloat {
-        min(max(width - horizontalPadding, 60), MarkdownStyle.maxContentWidth)
+        max(width - horizontalPadding, 60)
     }
 
     /// The text container width that yields `textColumnWidth` after the
@@ -298,12 +296,31 @@ final class TextRowView: NSView, NSTextViewDelegate {
             : NSColor(calibratedRed: 0.87, green: 0.93, blue: 1.0, alpha: 1.0)
     }
 
+    /// A neutral, slightly lighter surface behind assistant answers so they
+    /// read as a distinct block from the page (the user rows carry the blue
+    /// accent). A white wash in dark mode, a soft gray in light mode;
+    /// strengthened with Increase Contrast. Resolved per draw.
+    fileprivate static let assistantHighlight = NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if DisplayOptions.increaseContrast {
+            return dark
+                ? NSColor(calibratedWhite: 1.0, alpha: 0.12)
+                : NSColor(calibratedWhite: 0.0, alpha: 0.08)
+        }
+        return dark
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.06)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.035)
+    }
+
     private let textView = MarkdownTextView()
-    /// Full-bleed light-blue backdrop for user rows. Drawn as a separate
-    /// view (not `textView.backgroundColor`) so code cards can layer above it
-    /// and below the text — and to avoid toggling `drawsBackground` per
-    /// configure, which forced an eager text re-layout.
-    private let highlightView = UserHighlightView()
+    /// Full-bleed role backdrops (user blue / assistant neutral) behind the
+    /// text. Drawn as separate views (not `textView.backgroundColor`) so code
+    /// cards can layer above them and below the text — and to avoid toggling
+    /// `drawsBackground` per configure, which forced an eager text re-layout.
+    /// Two immutable-color views rather than one mutable one: `draw` runs on a
+    /// background thread (`canDrawConcurrently`), so it must read `let` state.
+    private let userHighlightView = RowHighlightView(color: TextRowView.userHighlight)
+    private let assistantHighlightView = RowHighlightView(color: TextRowView.assistantHighlight)
     /// The fenced code blocks in the current string (full-string ranges).
     private var codeBlocks: [TranscriptText.CodeBlockInfo] = []
     /// One full-width card per code block, behind the text.
@@ -377,9 +394,10 @@ final class TextRowView: NSView, NSTextViewDelegate {
         textView.textContainerInset = NSSize(width: 0, height: 6)
         textView.autoresizingMask = [.width]
         addSubview(textView)
-        // The user-message backdrop sits behind the text (code cards layer
-        // between it and the text view).
-        addSubview(highlightView, positioned: .below, relativeTo: textView)
+        // The role backdrops sit behind the text (code cards layer between
+        // them and the text view).
+        addSubview(userHighlightView, positioned: .below, relativeTo: textView)
+        addSubview(assistantHighlightView, positioned: .below, relativeTo: textView)
         // VoiceOver: the row is a labelled text area; the label distinguishes
         // the speaker/kind, the value is the message text.
         textView.setAccessibilityElement(true)
@@ -428,9 +446,14 @@ final class TextRowView: NSView, NSTextViewDelegate {
         if isStreaming, role == .assistant, !oldString.isEmpty, !DisplayOptions.reduceMotion {
             fadeInNewlyAppendedText(over: oldString)
         }
-        // User rows get the light-blue backdrop (resolved per draw, so a
-        // mid-session appearance/contrast change applies without reconfigure).
-        highlightView.isHidden = role != .user
+        // Role backdrops (resolved per draw, so a mid-session
+        // appearance/contrast change applies without reconfigure). The
+        // assistant surface marks an ANSWER: a thinking-only row (or the empty
+        // turn-start placeholder) stays on the page, so reasoning traces never
+        // paint a stray lighter band — including a thinking block that arrives
+        // after a tool call.
+        userHighlightView.isHidden = role != .user
+        assistantHighlightView.isHidden = !(role == .assistant && !text.isEmpty)
         // Search term highlight: only the matched term (every occurrence in
         // the rendered text) gets the yellow background — never the whole row.
         applySearchHighlight(query: searchQuery, caseSensitive: searchCaseSensitive, isCurrent: isCurrentSearchMatch)
@@ -858,6 +881,12 @@ final class TextRowView: NSView, NSTextViewDelegate {
     /// stopped showing its caret even when not following.
     var isStreamingRowForTesting: Bool { isStreamingRow }
 
+    /// Whether the lighter assistant answer surface is currently shown.
+    /// Internal for RenderingTests — a thinking-only row (and the empty
+    /// turn-start placeholder) must stay on the page; only answer text gets
+    /// the surface.
+    var isAssistantSurfaceVisibleForTesting: Bool { !assistantHighlightView.isHidden }
+
     /// The plain text currently rendered in this row. Internal for
     /// CoordinatorTests — the session-switch test asserts the table shows the
     /// ACTIVE session's content after a rebind, not the previous one's.
@@ -873,8 +902,9 @@ final class TextRowView: NSView, NSTextViewDelegate {
         let height = used + textView.textContainerInset.height * 2
         textView.frame = NSRect(x: 0, y: 0, width: width, height: max(height, bounds.height))
 
-        // User rows: the light-blue backdrop fills the whole row.
-        highlightView.frame = bounds
+        // The role backdrop spans the whole row.
+        userHighlightView.frame = bounds
+        assistantHighlightView.frame = bounds
 
         // Position each code card behind the text and its corner button above
         // it. The layout manager reports block rects in the text view's
@@ -923,12 +953,15 @@ final class TextRowView: NSView, NSTextViewDelegate {
     }
 }
 
-/// The full-bleed light-blue backdrop behind user messages. Fills with the
-/// dynamic `TextRowView.userHighlight` color, so dark/light mode and Increase
-/// Contrast resolve at draw time.
-private final class UserHighlightView: NSView {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+/// The full-bleed role backdrop behind a message: the light-blue user accent
+/// or the neutral lighter assistant surface. The color is an immutable `let`,
+/// so drawing can run concurrently without racing a reconfigure.
+private final class RowHighlightView: NSView {
+    private let color: NSColor
+
+    init(color: NSColor) {
+        self.color = color
+        super.init(frame: .zero)
         // A flat fill is trivially thread-safe to rasterize; letting AppKit
         // draw it on a background thread takes the fill out of the main
         // thread's display pass.
@@ -936,12 +969,11 @@ private final class UserHighlightView: NSView {
     }
 
     required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        canDrawConcurrently = true
+        fatalError("init(coder:) has not been implemented")
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        TextRowView.userHighlight.setFill()
+        color.setFill()
         dirtyRect.fill()
     }
 }

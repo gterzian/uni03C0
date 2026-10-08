@@ -54,6 +54,31 @@ final class TextRowViewTests: XCTestCase {
         XCTAssertEqual(row.renderedCopyButtonCount, 0)
     }
 
+    // MARK: - Assistant surface
+
+    /// The lighter answer surface marks real answer text only: a thinking-only
+    /// row (the store flattens thinking blocks into text-empty rows) and the
+    /// empty turn-start placeholder stay on the page, and user rows never get
+    /// the assistant surface.
+    func testAssistantSurfaceOnlyOnAnswerText() {
+        let answer = makeRow(text: "the **answer**", role: .assistant)
+        XCTAssertTrue(answer.isAssistantSurfaceVisibleForTesting)
+
+        let thinking = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        thinking.configure(text: "", thinking: "let me reason about this", role: .assistant, isStreaming: false)
+        thinking.layoutSubtreeIfNeeded()
+        XCTAssertFalse(thinking.isAssistantSurfaceVisibleForTesting,
+            "a thinking block must not paint the answer surface")
+
+        let placeholder = makeRow(text: "", role: .assistant, isStreaming: true)
+        XCTAssertFalse(placeholder.isAssistantSurfaceVisibleForTesting,
+            "the empty turn-start placeholder stays on the page")
+
+        let user = makeRow(text: "hi", role: .user)
+        XCTAssertFalse(user.isAssistantSurfaceVisibleForTesting,
+            "the answer surface is assistant-only")
+    }
+
     // MARK: - Search-term highlight
 
     func testSearchTermIsHighlightedNotTheRow() {

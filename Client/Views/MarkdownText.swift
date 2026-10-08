@@ -1,8 +1,8 @@
 import AppKit
 
 /// One place for every markdown typography decision in the transcript: the
-/// type scale, line height, block spacing, inline-code chip geometry, the
-/// content-column cap, and the dark/light text palette.
+/// type scale, line height, block spacing, inline-code chip geometry, and the
+/// dark/light text palette.
 ///
 /// Every size is a multiple of the base body point size (`FontSettings.bodySize`,
 /// 14 by default), so changing View → Font Size scales the whole hierarchy
@@ -50,13 +50,6 @@ nonisolated enum MarkdownStyle {
     /// rounded chip. A dedicated key (instead of AppKit's `.backgroundColor`,
     /// which fills the bare glyph box) is what buys the padding and radius.
     static let inlineCodeAttribute = NSAttributedString.Key("uni03C0.markdownInlineCode")
-
-    // MARK: Column
-
-    /// Cap on the readable text column, in points — roughly 80 characters at
-    /// the default 14pt body size. The text column stays left-aligned; fenced
-    /// code and tables wrap inside it.
-    static let maxContentWidth: CGFloat = 680
 
     // MARK: Fonts
 
