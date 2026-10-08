@@ -1,5 +1,174 @@
 import AppKit
 
+/// One place for every markdown typography decision in the transcript: the
+/// type scale, line height, block spacing, inline-code chip geometry, the
+/// content-column cap, and the dark/light text palette.
+///
+/// Every size is a multiple of the base body point size (`FontSettings.bodySize`,
+/// 14 by default), so changing View → Font Size scales the whole hierarchy
+/// together. `MarkdownText` builds the attributed string from these values and
+/// `TranscriptText` measures it with the same ones — that is what keeps the
+/// measured row height equal to the rendered height.
+///
+/// `nonisolated`: the coordinator's background height pre-measurer builds
+/// strings off the main actor.
+nonisolated enum MarkdownStyle {
+    // MARK: Type scale
+
+    static let bodyWeight: NSFont.Weight = .regular
+    static let headingWeight: NSFont.Weight = .semibold
+    static let boldWeight: NSFont.Weight = .semibold
+
+    /// H1…H6, as a multiple of the body point size.
+    static let headingSteps: [CGFloat] = [1.35, 1.2, 1.05, 1.0, 1.0, 1.0]
+
+    /// Mono size for inline code and fenced blocks. 0.92 matches the mono
+    /// x-height to the body font's across the system faces.
+    static let codeScale: CGFloat = 0.92
+
+    // MARK: Line height (multiple of the run's font size)
+
+    static let bodyLineHeight: CGFloat = 1.5
+    static let headingLineHeight: CGFloat = 1.3
+    static let codeLineHeight: CGFloat = 1.35
+
+    // MARK: Block spacing (multiple of the body point size)
+
+    static let paragraphGap: CGFloat = 0.6
+    static let headingGapAbove: CGFloat = 1.2
+    static let headingGapBelow: CGFloat = 0.4
+    static let listItemGap: CGFloat = 0.25
+    static let codeBlockGap: CGFloat = 0.5
+    static let thematicBreakGap: CGFloat = 0.8
+
+    // MARK: Inline-code chip
+
+    static let inlineCodeHorizontalPadding: CGFloat = 2.5
+    static let inlineCodeCornerRadius: CGFloat = 3.5
+    static let inlineCodeOpacity: CGFloat = 0.07
+    /// Marks a run as inline code so `MarkdownTextView` can paint the padded,
+    /// rounded chip. A dedicated key (instead of AppKit's `.backgroundColor`,
+    /// which fills the bare glyph box) is what buys the padding and radius.
+    static let inlineCodeAttribute = NSAttributedString.Key("uni03C0.markdownInlineCode")
+
+    // MARK: Column
+
+    /// Cap on the readable text column, in points — roughly 80 characters at
+    /// the default 14pt body size. The text column stays left-aligned; fenced
+    /// code and tables wrap inside it.
+    static let maxContentWidth: CGFloat = 680
+
+    // MARK: Fonts
+
+    static func bodyFont(size: CGFloat) -> NSFont {
+        NSFont.systemFont(ofSize: size, weight: bodyWeight)
+    }
+
+    static func headingFont(level: Int, bodySize: CGFloat) -> NSFont {
+        NSFont.systemFont(ofSize: bodySize * headingScale(for: level), weight: headingWeight)
+    }
+
+    static func codeFont(bodySize: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: bodySize * codeScale, weight: .regular)
+    }
+
+    static func headingScale(for level: Int) -> CGFloat {
+        guard headingSteps.indices.contains(level - 1) else { return 1 }
+        return headingSteps[level - 1]
+    }
+
+    /// The semibold face at `font`'s size, preserving monospace and italic —
+    /// inline `**bold**` is semibold, not full bold, so emphasis reads without
+    /// breaking the body's texture.
+    static func semibold(_ font: NSFont) -> NSFont {
+        let traits = font.fontDescriptor.symbolicTraits
+        let base = traits.contains(.monoSpace)
+            ? NSFont.monospacedSystemFont(ofSize: font.pointSize, weight: boldWeight)
+            : NSFont.systemFont(ofSize: font.pointSize, weight: boldWeight)
+        return traits.contains(.italic) ? withItalic(base) : base
+    }
+
+    /// Adds italic without `NSFontManager` (its shared instance is not
+    /// thread-safe, and this runs on the background pre-measurer).
+    static func withItalic(_ font: NSFont) -> NSFont {
+        let merged = font.fontDescriptor.symbolicTraits.union(.italic)
+        let descriptor = font.fontDescriptor.withSymbolicTraits(merged)
+        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+    }
+
+    /// The line height AppKit actually uses for `font` with zero paragraph
+    /// spacing: it rounds the ascender/descender up/down to whole points
+    /// (verified on this SDK), not the raw `ascender - descender + leading`.
+    static func baseLineHeight(of font: NSFont) -> CGFloat {
+        ceil(font.ascender) - floor(font.descender) + ceil(font.leading)
+    }
+
+    /// The `lineSpacing` that lifts `font`'s natural line height to
+    /// `lineHeight * pointSize`. `lineSpacing` is the extra space added on top
+    /// of `baseLineHeight(of:)`, which is why the target is expressed relative
+    /// to the point size.
+    static func lineSpacing(for font: NSFont, lineHeight: CGFloat) -> CGFloat {
+        max(lineHeight * font.pointSize - baseLineHeight(of: font), 0)
+    }
+
+    // MARK: Colors
+
+    /// Body text: a soft off-white (~86% luminance) in dark mode, near-black
+    /// in light mode.
+    static let bodyColor = NSColor(name: nil) { appearance in
+        isDark(appearance)
+            ? NSColor(calibratedWhite: 0.86, alpha: 1)
+            : NSColor(calibratedWhite: 0.12, alpha: 1)
+    }
+
+    /// Headings: a touch brighter than the body so the hierarchy reads without
+    /// shouting.
+    static let headingColor = NSColor(name: nil) { appearance in
+        isDark(appearance)
+            ? NSColor(calibratedWhite: 0.94, alpha: 1)
+            : NSColor(calibratedWhite: 0.04, alpha: 1)
+    }
+
+    /// Inline-code glyphs stay in the body's color family.
+    static let inlineCodeTextColor = bodyColor
+
+    /// The inline chip: ~7% white on dark, ~7% black on light; stronger with
+    /// Increase Contrast.
+    static let inlineCodeBackground = NSColor(name: nil) { appearance in
+        let dark = isDark(appearance)
+        let alpha = DisplayOptions.increaseContrast ? 0.16 : inlineCodeOpacity
+        return dark
+            ? NSColor(calibratedWhite: 1, alpha: alpha)
+            : NSColor(calibratedWhite: 0, alpha: alpha)
+    }
+
+    /// The fenced-code card behind a whole code block — stronger than the
+    /// inline chip so a block reads as a surface.
+    static let codeBlockBackground = NSColor(name: nil) { appearance in
+        let dark = isDark(appearance)
+        if DisplayOptions.increaseContrast {
+            return dark
+                ? NSColor(calibratedWhite: 0.24, alpha: 1)
+                : NSColor(calibratedWhite: 0.88, alpha: 1)
+        }
+        return dark
+            ? NSColor(calibratedWhite: 0.15, alpha: 1)
+            : NSColor(calibratedWhite: 0.93, alpha: 1)
+    }
+
+    /// Tint behind a table's header row; dynamic so it adapts to dark/light
+    /// mode and is resolved per draw.
+    static let tableHeaderBackground = NSColor(name: nil) { appearance in
+        isDark(appearance)
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.09)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.05)
+    }
+
+    private static func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+}
+
 /// Renders the markdown body of transcript rows — assistant responses (final
 /// and streaming) and user messages. Everything else (errors, aborts, thinking
 /// traces) stays plain in `TranscriptText`.
@@ -114,12 +283,12 @@ enum MarkdownText {
     /// carrying the previous run's attributes, then an empty line whose font
     /// height equals the gap.
     nonisolated private static func appendSegmentGap(to result: NSMutableAttributedString, bodySize: CGFloat) {
-        let bodyFont = NSFont.systemFont(ofSize: bodySize)
-        let bodyLineRatio = (bodyFont.ascender - bodyFont.descender + bodyFont.leading) / bodyFont.pointSize
+        let bodyFont = MarkdownStyle.bodyFont(size: bodySize)
+        let bodyLineRatio = MarkdownStyle.baseLineHeight(of: bodyFont) / bodyFont.pointSize
         let gapFont = NSFont.systemFont(ofSize: max(6 / bodyLineRatio, 1))
         let lastAttrs = result.length > 0
             ? result.attributes(at: result.length - 1, effectiveRange: nil)
-            : [.font: bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: plainParagraph()]
+            : [.font: bodyFont, .foregroundColor: MarkdownStyle.bodyColor, .paragraphStyle: plainParagraph(bodySize: bodySize)]
         result.append(NSAttributedString(string: "\n", attributes: lastAttrs))
         result.append(NSAttributedString(string: "\n", attributes: [.font: gapFont]))
     }
@@ -130,33 +299,33 @@ enum MarkdownText {
             // render the source verbatim (identical to the old plain path).
             return MarkdownBody(
                 string: NSAttributedString(string: text, attributes: [
-                    .font: NSFont.systemFont(ofSize: bodySize),
-                    .foregroundColor: NSColor.labelColor,
-                    .paragraphStyle: plainParagraph(),
+                    .font: MarkdownStyle.bodyFont(size: bodySize),
+                    .foregroundColor: MarkdownStyle.bodyColor,
+                    .paragraphStyle: plainParagraph(bodySize: bodySize),
                 ]),
                 codeBlocks: []
             )
         }
 
-        let bodyFont = NSFont.systemFont(ofSize: bodySize)
-        let monoFont = NSFont.monospacedSystemFont(ofSize: max(bodySize - 1, 9), weight: .regular)
+        let bodyFont = MarkdownStyle.bodyFont(size: bodySize)
+        let monoFont = MarkdownStyle.codeFont(bodySize: bodySize)
         // Line-height-to-point-size ratio of the body font — used to size the
         // spacer lines between blocks so their height matches the target gap.
-        let bodyLineRatio = (bodyFont.ascender - bodyFont.descender + bodyFont.leading) / bodyFont.pointSize
-        let label = NSColor.labelColor
+        let bodyLineRatio = MarkdownStyle.baseLineHeight(of: bodyFont) / bodyFont.pointSize
 
         let result = NSMutableAttributedString()
         var codeBlocks: [(range: NSRange, code: String)] = []
         // The paragraph separator "\n" between blocks inherits the previous
         // run's attributes, so it terminates the previous paragraph with the
-        // previous block's style (spacing between blocks comes from the new
-        // block's `paragraphSpacingBefore`).
+        // previous block's style (spacing between blocks comes from the spacer
+        // line inserted below).
         var lastRunAttrs: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
-            .foregroundColor: label,
-            .paragraphStyle: plainParagraph(),
+            .foregroundColor: MarkdownStyle.bodyColor,
+            .paragraphStyle: plainParagraph(bodySize: bodySize),
         ]
         var lastBlock: [PresentationIntent.IntentType]?
+        var lastLayout: BlockLayout?
 
         for run in parsed.runs {
             let block = run.presentationIntent?.components ?? []
@@ -199,27 +368,35 @@ enum MarkdownText {
                 // inflate EVERY line fragment of a multi-line paragraph (a
                 // 16pt line becomes 30pt with 8/6 spacing — verified), not
                 // just the paragraph boundary.
-                let gap = blockGap(layout)
+                let gap = blockGap(from: lastLayout, to: layout, bodySize: bodySize)
                 let gapFont = NSFont.systemFont(ofSize: max(gap / bodyLineRatio, 1))
                 result.append(NSAttributedString(string: "\n", attributes: lastRunAttrs))
                 result.append(NSAttributedString(string: "\n", attributes: [.font: gapFont]))
             }
 
-            // Font: code wins, then header size, then inline bold/italic.
-            var font = bodyFont
-            if layout.headerLevel > 0 {
-                font = NSFont.boldSystemFont(ofSize: bodySize + headerBoost(layout.headerLevel))
+            let isInlineCode = run.inlinePresentationIntent?.contains(.code) == true
+            // The block's own font governs line height and the marker; inline
+            // emphasis only restyles the glyphs.
+            let blockFont: NSFont
+            let lineHeight: CGFloat
+            if layout.isCodeBlock {
+                blockFont = monoFont
+                lineHeight = MarkdownStyle.codeLineHeight
+            } else if layout.headerLevel > 0 {
+                blockFont = MarkdownStyle.headingFont(level: layout.headerLevel, bodySize: bodySize)
+                lineHeight = MarkdownStyle.headingLineHeight
+            } else {
+                blockFont = bodyFont
+                lineHeight = MarkdownStyle.bodyLineHeight
             }
-            if layout.isCodeBlock || run.inlinePresentationIntent?.contains(.code) == true {
-                font = monoFont
-            }
+            var font = isInlineCode ? monoFont : blockFont
             if let inline = run.inlinePresentationIntent {
-                if inline.contains(.stronglyEmphasized) { font = withTrait([.bold], font) }
-                if inline.contains(.emphasized) { font = withTrait([.italic], font) }
+                if inline.contains(.stronglyEmphasized) { font = MarkdownStyle.semibold(font) }
+                if inline.contains(.emphasized) { font = MarkdownStyle.withItalic(font) }
             }
 
             let paragraph = NSMutableParagraphStyle()
-            paragraph.lineSpacing = layout.isCodeBlock ? 1 : 2
+            paragraph.lineSpacing = MarkdownStyle.lineSpacing(for: blockFont, lineHeight: lineHeight)
             paragraph.lineBreakMode = layout.isCodeBlock ? .byCharWrapping : .byWordWrapping
             paragraph.firstLineHeadIndent = layout.firstLineIndent
             paragraph.headIndent = layout.contentIndent
@@ -231,20 +408,25 @@ enum MarkdownText {
             if isNewBlock, !layout.marker.isEmpty {
                 result.append(NSAttributedString(string: layout.marker, attributes: [
                     .font: bodyFont,
-                    .foregroundColor: label,
+                    .foregroundColor: MarkdownStyle.bodyColor,
                     .paragraphStyle: paragraph,
                 ]))
             }
 
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
-                .foregroundColor: layout.isThematicBreak ? NSColor.secondaryLabelColor : label,
+                .foregroundColor: layout.isThematicBreak
+                    ? NSColor.secondaryLabelColor
+                    : (layout.headerLevel > 0
+                        ? MarkdownStyle.headingColor
+                        : (isInlineCode ? MarkdownStyle.inlineCodeTextColor : MarkdownStyle.bodyColor)),
                 .paragraphStyle: paragraph,
             ]
-            if run.inlinePresentationIntent?.contains(.code) == true {
-                // Inline code keeps a per-glyph pill; fenced blocks get their
-                // full-width card from the row overlay instead.
-                attrs[.backgroundColor] = codeBackground
+            if isInlineCode {
+                // The chip's padded, rounded background is painted by
+                // `MarkdownTextView`; this key marks the run. Fenced blocks get
+                // their full-width card from the row overlay instead.
+                attrs[MarkdownStyle.inlineCodeAttribute] = true
             }
             if let inline = run.inlinePresentationIntent, inline.contains(.strikethrough) {
                 attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
@@ -261,6 +443,7 @@ enum MarkdownText {
             }
             lastRunAttrs = attrs
             lastBlock = block
+            lastLayout = layout
         }
         return MarkdownBody(string: result, codeBlocks: codeBlocks)
     }
@@ -400,7 +583,7 @@ enum MarkdownText {
     /// `(text, bodySize)` and measured/laid out at any width). Cells are inline
     /// markdown, so `**bold**`, `` `code` `` and links work inside a cell.
     nonisolated private static func renderTable(_ table: MarkdownTable, bodySize: CGFloat) -> NSAttributedString {
-        let bodyFont = NSFont.systemFont(ofSize: bodySize)
+        let bodyFont = MarkdownStyle.bodyFont(size: bodySize)
         let columnCount = table.headers.count
         // The gap between columns, added as padding on each block's inner edge.
         let columnGap: CGFloat = 12
@@ -445,7 +628,7 @@ enum MarkdownText {
                 block.setWidth(columnGap / 2, type: .absolute, for: .padding, edge: .maxX)
                 block.setContentWidth(natural[column] / totalNatural * 100, type: .percentage)
                 if isHeader {
-                    block.backgroundColor = tableHeaderBackground
+                    block.backgroundColor = MarkdownStyle.tableHeaderBackground
                     // A hairline under the header stands in for the markdown
                     // delimiter row; the block draws it, so it spans the cell
                     // even when the cell's text wraps.
@@ -454,7 +637,7 @@ enum MarkdownText {
                 }
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.textBlocks = [block]
-                paragraph.lineSpacing = 2
+                paragraph.lineSpacing = MarkdownStyle.lineSpacing(for: bodyFont, lineHeight: MarkdownStyle.bodyLineHeight)
                 paragraph.lineBreakMode = .byWordWrapping
                 paragraph.alignment = switch table.alignments[column] {
                 case .left: .left
@@ -484,28 +667,31 @@ enum MarkdownText {
     /// inline code/links) at the cell's font. Cells carry no block structure,
     /// so this is the inline half of `buildMarkdown` without block handling.
     nonisolated private static func renderInlineCell(_ source: String, bodySize: CGFloat, isHeader: Bool) -> NSAttributedString {
-        let baseFont = isHeader ? NSFont.boldSystemFont(ofSize: bodySize) : NSFont.systemFont(ofSize: bodySize)
-        let monoFont = NSFont.monospacedSystemFont(ofSize: max(bodySize - 1, 9), weight: .regular)
+        let baseFont = isHeader
+            ? MarkdownStyle.semibold(MarkdownStyle.bodyFont(size: bodySize))
+            : MarkdownStyle.bodyFont(size: bodySize)
+        let monoFont = MarkdownStyle.codeFont(bodySize: bodySize)
+        let baseColor = isHeader ? MarkdownStyle.headingColor : MarkdownStyle.bodyColor
         let trimmed = source.trimmingCharacters(in: .whitespaces)
         let out = NSMutableAttributedString()
         guard !trimmed.isEmpty else {
             // A single space keeps alignment and gives the column a real width.
-            return NSAttributedString(string: " ", attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+            return NSAttributedString(string: " ", attributes: [.font: baseFont, .foregroundColor: baseColor])
         }
         guard let parsed = try? AttributedString(markdown: trimmed) else {
-            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: baseColor])
         }
         for run in parsed.runs {
             let text = String(parsed.characters[run.range]).replacingOccurrences(of: "\n", with: " ")
             guard !text.isEmpty else { continue }
-            var font = baseFont
-            if run.inlinePresentationIntent?.contains(.code) == true { font = monoFont }
+            let isInlineCode = run.inlinePresentationIntent?.contains(.code) == true
+            var font = isInlineCode ? monoFont : baseFont
             if let inline = run.inlinePresentationIntent {
-                if inline.contains(.stronglyEmphasized) { font = withTrait([.bold], font) }
-                if inline.contains(.emphasized) { font = withTrait([.italic], font) }
+                if inline.contains(.stronglyEmphasized) { font = MarkdownStyle.semibold(font) }
+                if inline.contains(.emphasized) { font = MarkdownStyle.withItalic(font) }
             }
-            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
-            if run.inlinePresentationIntent?.contains(.code) == true { attrs[.backgroundColor] = codeBackground }
+            var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: baseColor]
+            if isInlineCode { attrs[MarkdownStyle.inlineCodeAttribute] = true }
             if let inline = run.inlinePresentationIntent, inline.contains(.strikethrough) {
                 attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
             }
@@ -517,31 +703,9 @@ enum MarkdownText {
             out.append(NSAttributedString(string: text, attributes: attrs))
         }
         if out.length == 0 {
-            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: NSColor.labelColor])
+            return NSAttributedString(string: trimmed, attributes: [.font: baseFont, .foregroundColor: baseColor])
         }
         return out
-    }
-
-    /// Tint behind a table's header row; dynamic so it adapts to dark/light
-    /// mode and is resolved per draw.
-    nonisolated private static let tableHeaderBackground = NSColor(name: nil) { appearance in
-        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        return dark
-            ? NSColor(calibratedWhite: 1.0, alpha: 0.09)
-            : NSColor(calibratedWhite: 0.0, alpha: 0.05)
-    }
-
-    /// Applies a font trait (bold/italic) without `NSFontManager` — the
-    /// shared instance is not thread-safe, and this runs on the background
-    /// pre-measurer. The descriptor route (`withSymbolicTraits`) synthesizes
-    /// the same faces as `NSFontManager.convert(_:toHaveTrait:)` (verified on
-    /// this SDK: same font names, same symbolic traits) and merges into the
-    /// font's EXISTING traits, so a bold font gaining italic stays bold+italic
-    /// exactly like the old sequential `convert` calls.
-    nonisolated private static func withTrait(_ trait: NSFontDescriptor.SymbolicTraits, _ font: NSFont) -> NSFont {
-        let merged = font.fontDescriptor.symbolicTraits.union(trait)
-        let descriptor = font.fontDescriptor.withSymbolicTraits(merged)
-        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
     }
 
     /// The layout the current block imposes on its runs: header size, code
@@ -616,46 +780,92 @@ enum MarkdownText {
         }
     }
 
-    /// The vertical gap inserted between markdown blocks (as an empty spacer
-    /// line whose font height equals the gap).
-    nonisolated private static func blockGap(_ layout: BlockLayout) -> CGFloat {
-        if layout.headerLevel > 0 { return 10 }
-        if layout.isCodeBlock { return 8 }
-        if layout.isThematicBreak { return 8 }
-        if !layout.indents.isEmpty { return 4 } // list item
-        return 6
-    }
-
-    /// h1…h6 scale the body font by this much (all bold).
-    nonisolated private static func headerBoost(_ level: Int) -> CGFloat {
-        switch level {
-        case 1: 6
-        case 2: 4
-        case 3: 2
-        default: 0
+    /// The vertical gap inserted between markdown blocks, as an empty spacer
+    /// line whose font height equals the gap. The incoming block sets the gap
+    /// (a heading pulls 1.2em above itself, list items sit 0.25em apart); a
+    /// heading also caps the space below itself at 0.4em. All values scale
+    /// with the body point size.
+    nonisolated private static func blockGap(from previous: BlockLayout?, to next: BlockLayout, bodySize: CGFloat) -> CGFloat {
+        if let previous, previous.headerLevel > 0 {
+            return MarkdownStyle.headingGapBelow * bodySize
         }
-    }
-
-    /// Subtle gray behind code (inline pill and the full-width card the row
-    /// draws over fenced blocks), a touch stronger with Increase Contrast.
-    /// Dynamic so it adapts to dark/light mode; resolved per draw, so a
-    /// mid-session appearance change applies without re-rendering rows.
-    nonisolated static let codeBackground = NSColor(name: nil) { appearance in
-        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        if DisplayOptions.increaseContrast {
-            return dark
-                ? NSColor(calibratedWhite: 0.24, alpha: 1.0)
-                : NSColor(calibratedWhite: 0.88, alpha: 1.0)
+        if next.headerLevel > 0 {
+            return MarkdownStyle.headingGapAbove * bodySize
         }
-        return dark
-            ? NSColor(calibratedWhite: 0.15, alpha: 1.0)
-            : NSColor(calibratedWhite: 0.93, alpha: 1.0)
+        if next.isCodeBlock {
+            return MarkdownStyle.codeBlockGap * bodySize
+        }
+        if next.isThematicBreak {
+            return MarkdownStyle.thematicBreakGap * bodySize
+        }
+        if !next.indents.isEmpty {
+            // A list starting after non-list content gets a paragraph gap;
+            // consecutive items sit tight.
+            return (previous?.indents.isEmpty == false ? MarkdownStyle.listItemGap : MarkdownStyle.paragraphGap) * bodySize
+        }
+        return MarkdownStyle.paragraphGap * bodySize
     }
 
-    nonisolated private static func plainParagraph() -> NSParagraphStyle {
+    nonisolated private static func plainParagraph(bodySize: CGFloat) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
-        p.lineSpacing = 2
+        p.lineSpacing = MarkdownStyle.lineSpacing(
+            for: MarkdownStyle.bodyFont(size: bodySize),
+            lineHeight: MarkdownStyle.bodyLineHeight
+        )
         p.lineBreakMode = .byWordWrapping
         return p
+    }
+}
+
+/// The transcript's text view. It extends `NSTextView` only to paint
+/// inline-code chips: `MarkdownText` tags inline-code runs with
+/// `MarkdownStyle.inlineCodeAttribute` (instead of AppKit's `.backgroundColor`,
+/// which fills the bare glyph box), and this view draws a padded, rounded chip
+/// behind each such run — 2.5pt of horizontal padding and a 3.5pt radius at
+/// ~7% opacity, on a single line height so the chip never changes its
+/// paragraph's line spacing.
+///
+/// Drawing happens in `drawBackground` BEFORE `super`: the chip sits under the
+/// text, and a search-match `.backgroundColor` painted later by `super` still
+/// wins over a chip, so find-in-page stays visible on code.
+final class MarkdownTextView: NSTextView {
+    override func drawBackground(in rect: NSRect) {
+        drawInlineCodeChips(in: rect)
+        super.drawBackground(in: rect)
+    }
+
+    private func drawInlineCodeChips(in dirtyRect: NSRect) {
+        guard let storage = textStorage,
+              let layoutManager,
+              let container = textContainer,
+              storage.length > 0 else { return }
+        let origin = textContainerOrigin
+        // Restrict the scan to the dirty glyphs: a long row can hold many code
+        // spans and only the visible chips need painting.
+        var containerDirty = dirtyRect
+        containerDirty.origin.x -= origin.x
+        containerDirty.origin.y -= origin.y
+        let dirtyGlyphs = layoutManager.glyphRange(forBoundingRect: containerDirty, in: container)
+        let dirtyChars = layoutManager.characterRange(forGlyphRange: dirtyGlyphs, actualGlyphRange: nil)
+        guard dirtyChars.length > 0 else { return }
+        let padding = MarkdownStyle.inlineCodeHorizontalPadding
+        let radius = MarkdownStyle.inlineCodeCornerRadius
+        MarkdownStyle.inlineCodeBackground.setFill()
+        storage.enumerateAttribute(MarkdownStyle.inlineCodeAttribute, in: dirtyChars) { value, range, _ in
+            guard value != nil else { return }
+            let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, lineGlyphs, _ in
+                let clipped = NSIntersectionRange(lineGlyphs, glyphs)
+                guard clipped.length > 0 else { return }
+                var chip = layoutManager.boundingRect(forGlyphRange: clipped, in: container)
+                chip.origin.x += origin.x
+                chip.origin.y += origin.y
+                // Horizontal padding only: the chip fills one line height, so
+                // it never affects line spacing.
+                chip = chip.insetBy(dx: -padding, dy: 0)
+                guard chip.intersects(dirtyRect) else { return }
+                NSBezierPath(roundedRect: chip, xRadius: radius, yRadius: radius).fill()
+            }
+        }
     }
 }

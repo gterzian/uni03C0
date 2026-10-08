@@ -42,8 +42,15 @@ MODS="$BUILD"
 SHIM_INC="$(find .build -name _SubprocessCShims -type d | head -1)/include"
 CORE_OBJECTS="$(find "$BUILD" -name '*.o' ! -path '*ClientTests*')"
 
+# SwiftUI's `@State`/`@Binding` in ToolCallCardView are external macros, and
+# swiftc only finds their implementation through the platform host-plugins
+# directory. Without this path the plugin server answers malformed and the
+# whole build fails — do not remove it.
+PLUGIN_PATH="$(xcrun --show-sdk-platform-path)/Developer/usr/lib/swift/host/plugins"
+
 swiftc -swift-version 6 -default-isolation MainActor \
   -target arm64-apple-macosx26.0 -sdk "$(xcrun --show-sdk-path)" \
+  -plugin-path "$PLUGIN_PATH" \
   -o "$OUT/coordtests" \
   CoordinatorTests/Harness/main.swift \
   CoordinatorTests/Harness/FontSettingsStub.swift \

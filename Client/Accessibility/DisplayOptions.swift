@@ -10,7 +10,7 @@ import AppKit
 /// lands in exactly one place.
 ///
 /// `nonisolated`: the dynamic colors that adapt to contrast/ appearance
-/// (`MarkdownText.codeBackground`, `SearchMatchHighlight`, …) capture these
+/// (`MarkdownStyle.inlineCodeBackground`, `SearchMatchHighlight`, …) capture these
 /// inside their `NSColor(name:dynamicProvider:)` closures, and those colors
 /// are created on the background pre-measurer as well as the main thread.
 /// Reading `NSWorkspace`'s accessibility display options is a thread-safe

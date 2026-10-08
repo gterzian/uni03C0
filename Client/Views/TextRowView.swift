@@ -11,6 +11,21 @@ enum TranscriptText {
     /// textContainerInset 6 top + 6 bottom.
     nonisolated static let verticalInset: CGFloat = 12
 
+    /// The readable width of the body text column for a row of `width` points:
+    /// the full width minus the line-fragment padding, capped at
+    /// `MarkdownStyle.maxContentWidth` (about 80 characters) and left-aligned.
+    /// The renderer and the measurer both go through this, so the cap can
+    /// never make the two disagree.
+    nonisolated static func textColumnWidth(forRowWidth width: CGFloat) -> CGFloat {
+        min(max(width - horizontalPadding, 60), MarkdownStyle.maxContentWidth)
+    }
+
+    /// The text container width that yields `textColumnWidth` after the
+    /// 8pt-per-side line fragment padding.
+    nonisolated static func containerWidth(forRowWidth width: CGFloat) -> CGFloat {
+        textColumnWidth(forRowWidth: width) + horizontalPadding
+    }
+
     /// A fenced code block within the row's full attributed string.
     struct CodeBlockInfo {
         var range: NSRange
@@ -53,16 +68,16 @@ enum TranscriptText {
         cacheMiss: Bool = false,
         bodySize: CGFloat
     ) -> AttributedResult {
+        let bodyFont = MarkdownStyle.bodyFont(size: bodySize)
         let body = NSMutableParagraphStyle()
-        body.lineSpacing = 2
+        body.lineSpacing = MarkdownStyle.lineSpacing(for: bodyFont, lineHeight: MarkdownStyle.bodyLineHeight)
         body.lineBreakMode = .byWordWrapping
-        let bodyFont = NSFont.systemFont(ofSize: bodySize)
         // Notice/error rows (stream failures, aborts): hard failures render
         // red; user-initiated aborts render secondary (weaker).
         let bodyColor: NSColor = switch role {
         case .error: .systemRed
         case .aborted: .secondaryLabelColor
-        case .user, .assistant: .labelColor
+        case .user, .assistant: MarkdownStyle.bodyColor
         }
 
         let result = NSMutableAttributedString()
@@ -165,7 +180,7 @@ enum TranscriptText {
     ) -> CGFloat {
         let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize)
         guard attributed.length > 0 else { return 30 }
-        let usableWidth = max(width - horizontalPadding, 60)
+        let usableWidth = textColumnWidth(forRowWidth: width)
         let bounds = attributed.boundingRect(
             with: NSSize(width: usableWidth, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading]
@@ -283,7 +298,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
             : NSColor(calibratedRed: 0.87, green: 0.93, blue: 1.0, alpha: 1.0)
     }
 
-    private let textView = NSTextView()
+    private let textView = MarkdownTextView()
     /// Full-bleed light-blue backdrop for user rows. Drawn as a separate
     /// view (not `textView.backgroundColor`) so code cards can layer above it
     /// and below the text — and to avoid toggling `drawsBackground` per
@@ -694,7 +709,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
         // Drop the previous query's backdrops first. The incremental storage
         // path keeps the prefix's attributes, so without this a stale query's
         // highlights would persist on text that no longer matches (inline-code
-        // backgrounds use a different color and are left untouched).
+        // chips are drawn, not a `.backgroundColor`, and are left untouched).
         dropSearchHighlights(in: storage)
         guard let query else { return }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -713,7 +728,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
     }
 
     /// Removes every search-match backdrop from the storage (the search
-    /// highlight colors only — inline-code backgrounds are a different color).
+    /// highlight colors only — inline-code chips are drawn, not attributes).
     private func dropSearchHighlights(in storage: NSTextStorage) {
         let full = NSRange(location: 0, length: storage.length)
         var ranges: [NSRange] = []
@@ -796,7 +811,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
         guard let container = textView.textContainer, let layoutManager = textView.layoutManager else {
             return bounds.height
         }
-        container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        container.containerSize = NSSize(width: TranscriptText.containerWidth(forRowWidth: width), height: .greatestFiniteMagnitude)
         layoutManager.ensureLayout(for: container)
         return layoutManager.usedRect(for: container).height + textView.textContainerInset.height * 2
     }
@@ -851,7 +866,7 @@ final class TextRowView: NSView, NSTextViewDelegate {
     override func layout() {
         super.layout()
         guard let container = textView.textContainer, let layoutManager = textView.layoutManager else { return }
-        let width = max(bounds.width, 320)
+        let width = TranscriptText.containerWidth(forRowWidth: max(bounds.width, 320))
         container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         layoutManager.ensureLayout(for: container)
         let used = layoutManager.usedRect(for: container).height
@@ -932,7 +947,7 @@ private final class UserHighlightView: NSView {
 }
 
 /// One full-width card behind a fenced code block. Rounded, filled with the
-/// dynamic `MarkdownText.codeBackground` color; the row positions it over the
+/// dynamic `MarkdownStyle.codeBlockBackground` color; the row positions it over the
 /// block's line rects (below the text, so glyphs stay crisp on top).
 private final class CodeBlockCardView: NSView {
     override init(frame frameRect: NSRect) {
@@ -946,7 +961,7 @@ private final class CodeBlockCardView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        MarkdownText.codeBackground.setFill()
+        MarkdownStyle.codeBlockBackground.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
     }
 }

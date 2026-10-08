@@ -93,6 +93,27 @@ final class TranscriptTextTests: XCTestCase {
         XCTAssertTrue(result("answer", role: .assistant, cacheHitRate: 0.9).string.string.contains("⚡"))
     }
 
+    // MARK: - Column cap
+
+    func testTextColumnIsCappedAndLeftAligned() {
+        XCTAssertEqual(
+            TranscriptText.textColumnWidth(forRowWidth: 400),
+            400 - TranscriptText.horizontalPadding,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TranscriptText.textColumnWidth(forRowWidth: 2000),
+            MarkdownStyle.maxContentWidth,
+            accuracy: 0.001,
+            "a wide row is capped to the readable column"
+        )
+        XCTAssertEqual(
+            TranscriptText.containerWidth(forRowWidth: 2000),
+            MarkdownStyle.maxContentWidth + TranscriptText.horizontalPadding,
+            accuracy: 0.001
+        )
+    }
+
     // MARK: - Row height invariant
 
     func testMeasuredHeightMatchesCellContentHeight() {

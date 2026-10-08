@@ -120,7 +120,8 @@ final class TextRowViewTests: XCTestCase {
             let card = row.renderedCodeCardFrame(at: index)
             XCTAssertEqual(card.minY, codeRect.minY, accuracy: 1.5, "card top at first code line")
             XCTAssertEqual(card.maxY, codeRect.maxY, accuracy: 1.5, "card bottom at last code line")
-            XCTAssertEqual(card.width, row.bounds.width, "card spans the full row width")
+            XCTAssertEqual(card.width, tv.bounds.width, "card spans the capped text column")
+            XCTAssertEqual(card.width, TranscriptText.containerWidth(forRowWidth: row.bounds.width), "card width is the measure/render width")
         }
     }
 

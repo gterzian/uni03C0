@@ -32,7 +32,10 @@ final class MarkdownTextTests: XCTestCase {
 
         let codeLoc = RenderTestHelper.range(of: "code", in: b.string).location
         XCTAssertTrue(RenderTestHelper.font(b.string, at: codeLoc, hasTrait: .monoSpace))
-        XCTAssertNotNil(b.string.attribute(.backgroundColor, at: codeLoc, effectiveRange: nil))
+        // Inline code is marked for the padded, rounded chip `MarkdownTextView`
+        // draws — not AppKit's `.backgroundColor`, which cannot carry padding.
+        XCTAssertNotNil(b.string.attribute(MarkdownStyle.inlineCodeAttribute, at: codeLoc, effectiveRange: nil))
+        XCTAssertNil(b.string.attribute(.backgroundColor, at: codeLoc, effectiveRange: nil))
     }
 
     func testMarkdownMarkersAreStripped() {
@@ -41,16 +44,40 @@ final class MarkdownTextTests: XCTestCase {
         XCTAssertNil(RenderTestHelper.range(of: "**", in: b.string).location != NSNotFound ? "found" : nil)
     }
 
+    // MARK: - Line height
+
+    func testBodyLineHeightMatchesTheStyleConstant() {
+        let b = body("line one\nline two")
+        let (_, view) = RenderTestHelper.layout(b.string, width: 800)
+        let glyphs = view.layoutManager!.glyphRange(
+            forCharacterRange: NSRange(location: 0, length: b.string.length),
+            actualCharacterRange: nil
+        )
+        let pitch = RenderTestHelper.linePitches(view, glyphRange: glyphs).first ?? 0
+        XCTAssertEqual(pitch, size * MarkdownStyle.bodyLineHeight, accuracy: 0.5, "body lines sit at the styled line height")
+    }
+
+    // MARK: - Inline code chip
+
+    func testInlineCodeRunsAreMarkedForTheChip() {
+        let b = body("use `let x = 1` now")
+        let loc = RenderTestHelper.range(of: "let x = 1", in: b.string).location
+        XCTAssertNotNil(b.string.attribute(MarkdownStyle.inlineCodeAttribute, at: loc, effectiveRange: nil))
+        XCTAssertNil(b.string.attribute(.backgroundColor, at: loc, effectiveRange: nil), "the chip is drawn, not an AppKit glyph box")
+        // The mono run is sized to match the body x-height.
+        XCTAssertEqual(RenderTestHelper.font(b.string, at: loc)?.pointSize ?? 0, size * MarkdownStyle.codeScale, accuracy: 0.01)
+    }
+
     // MARK: - Headers
 
     func testHeadersScaleTheBodyFontAndAreBold() {
         let b = body("# h1\n## h2\n### h3\n#### h4")
         XCTAssertTrue(RenderTestHelper.font(b.string, at: 0, hasTrait: .bold))
-        XCTAssertEqual(RenderTestHelper.font(b.string, at: 0)?.pointSize, size + 6, "h1")
+        XCTAssertEqual(RenderTestHelper.font(b.string, at: 0)?.pointSize ?? 0, size * MarkdownStyle.headingSteps[0], accuracy: 0.01, "h1")
         let h2 = RenderTestHelper.range(of: "h2", in: b.string).location
-        XCTAssertEqual(RenderTestHelper.font(b.string, at: h2)?.pointSize, size + 4, "h2")
+        XCTAssertEqual(RenderTestHelper.font(b.string, at: h2)?.pointSize ?? 0, size * MarkdownStyle.headingSteps[1], accuracy: 0.01, "h2")
         let h3 = RenderTestHelper.range(of: "h3", in: b.string).location
-        XCTAssertEqual(RenderTestHelper.font(b.string, at: h3)?.pointSize, size + 2, "h3")
+        XCTAssertEqual(RenderTestHelper.font(b.string, at: h3)?.pointSize ?? 0, size * MarkdownStyle.headingSteps[2], accuracy: 0.01, "h3")
         let h4 = RenderTestHelper.range(of: "h4", in: b.string).location
         XCTAssertEqual(RenderTestHelper.font(b.string, at: h4)?.pointSize, size, "h4")
     }
@@ -92,7 +119,7 @@ final class MarkdownTextTests: XCTestCase {
         let glyphs = view.layoutManager!.glyphRange(forCharacterRange: b.codeBlocks[0].range, actualCharacterRange: nil)
         let pitches = RenderTestHelper.linePitches(view, glyphRange: glyphs)
         XCTAssertGreaterThan(pitches.count, 1)
-        XCTAssertLessThanOrEqual(pitches.max() ?? .greatestFiniteMagnitude, 17, "code lines must not be inflated")
+        XCTAssertLessThanOrEqual(pitches.max() ?? .greatestFiniteMagnitude, 17.5, "code lines must not be inflated")
     }
 
     func testUnclosedFenceRendersStreamingTailAsCodeBlock() {

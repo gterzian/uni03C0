@@ -121,7 +121,7 @@ final class StreamingFadeTests: XCTestCase {
         // color.
         let lastBatch = (storage.string as NSString).range(of: " chunk11")
         let caret = NSRange(location: storage.length - 1, length: 1)
-        let final = NSColor.labelColor.alphaComponent
+        let final = MarkdownStyle.bodyColor.alphaComponent
         var unsettled: [NSRange] = []
         storage.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
             guard let color = value as? NSColor else { return }
@@ -154,7 +154,7 @@ final class StreamingFadeTests: XCTestCase {
         let body = alpha(storage, at: 0)
         let faded = alpha(storage, at: 6)
         XCTAssertEqual(faded, body, accuracy: 0.001, "faded-in text ends at the color of the text around it")
-        XCTAssertEqual(faded, NSColor.labelColor.alphaComponent, accuracy: 0.001, "never forced opaque")
+        XCTAssertEqual(faded, MarkdownStyle.bodyColor.alphaComponent, accuracy: 0.001, "lands on the body color, never a forced alpha")
     }
 
     // MARK: - The dim color stays dynamic across appearances

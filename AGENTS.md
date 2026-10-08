@@ -2,15 +2,11 @@
 
 ## What belongs in this file (read before editing it)
 
-This file carries only guidance an agent **cannot derive from the code**: hard
-rules, sandbox constraints, commands, and paid-for gotchas — not a design doc.
-
-- Keep: an instruction, a constraint, a command, a non-obvious failure mode.
-- Cut: type-by-type descriptions, architecture narration, feature inventories,
-  "how it works" prose, design rationale — the code and commits are the source.
-- Prefer one imperative line; record history only when it prevents a regression.
-- **Budget: under 300 lines.** Adding a section means deleting as much stale
-  text; if a change only makes the file longer, it belongs in a code comment.
+This file carries only what an agent **cannot derive from the code**: hard rules,
+sandbox constraints, commands, paid-for gotchas — not a design doc. Keep one
+imperative line per rule; cut type/architecture narration (the code is the
+source). Record history only to prevent a regression. **Budget: under 300 lines**
+— adding a section means deleting as much stale text.
 
 ---
 
@@ -90,39 +86,40 @@ Ask before a feature: does it change what pi records or sends? If yes, find anot
 
 ## Naming
 
-No blanket prefixes; short concrete names. Targets are `Core`, `Client`,
-`ClientTests` (not `PiCore`/`PiMacApp`); types are concrete (`ProcessController`,
-`SandboxSettings`), not prefixed to sound generic. `pi` appears only where code
-talks to the binary or its RPC (`pi --mode rpc`, `PiExecutable.resolve()`,
-`~/.pi`, `get_messages`). Wire types keep pi's protocol names (`AgentMessage`,
-`ContentBlock`, …). User-visible framing is "agent"/"session"/"transcript"; the
-app is titled "uni03C0".
+No blanket prefixes; short concrete names. Targets `Core`, `Client`,
+`ClientTests`; types `ProcessController`, `SandboxSettings` (no `Pi` prefix).
+`pi` appears only at the binary/RPC boundary (`pi --mode rpc`,
+`PiExecutable.resolve()`, `~/.pi`, `get_messages`); wire types keep pi's protocol
+names. User-visible framing is "agent"/"session"/"transcript"; the app is
+"uni03C0".
 
 ## Working in this repo
 
 - `project.yml` drives `xcodegen`; regenerate after adding/removing files:
   `xcodegen generate`.
-- Build/launch: `./run.sh`.
 - **Core stays AppKit-free**; height measurement and all rendering live in
   Client.
 - Concurrency defaults in `project.yml`: `Core = nonisolated`,
   `Client = MainActor`, Swift 6 strict concurrency.
 
-## Running tests (inside the sandbox)
+## Building and testing (inside the sandbox)
 
-- **Core/ClientTests:** `swift test --disable-sandbox` from the repo root. The
-  committed `Package.swift` is a test harness (ignored by xcodegen/xcodebuild).
-  `--filter <SuiteName>` runs one suite; `rm -rf .build` if a build looks stale.
-- **RenderingTests:** `scripts/run-rendering-tests.sh` (`TEST_FILTER=<substr>`
-  for a subset). **Do not "fix" this stub route** — under Swift 6
-  `-default-isolation MainActor`, the real XCTest target cannot compile the
-  renderer sources' `XCTestCase` overrides; the script uses a stub `XCTest`
-  module plus `swiftc`.
-- **CoordinatorTests:** `scripts/run-coordinator-tests.sh`
-  (`TEST_FILTER=<substr>` for a subset).
-- `--disable-sandbox` is required (SPM's manifest `sandbox-exec` is denied).
-  xcodebuild works only from a terminal; if package resolution fails in the
-  sandbox, run `./run.sh` once in the terminal.
+**Never run `xcodebuild`** (or `./run.sh`): its package resolution shells out to
+SPM's manifest sandbox and dies with `sandbox-exec: sandbox_apply: Operation not
+permitted`, even with `-disableAutomaticPackageResolution`. App build/launch and
+scheme tests are terminal-only operator actions — ask.
+
+`--disable-sandbox` is required (SPM's manifest `sandbox-exec` is denied). The
+only entry points that work here:
+
+- `swift test --disable-sandbox` — Core/ClientTests (`--filter <Suite>`); the
+  committed `Package.swift` harness is ignored by xcodegen/xcodebuild.
+- `scripts/run-rendering-tests.sh`, `scripts/run-coordinator-tests.sh` — the
+  AppKit tests (`TEST_FILTER=<substr>`). Stub `XCTest` + `swiftc` is deliberate
+  (Swift 6 `-default-isolation MainActor` blocks real XCTest overrides — do not
+  "fix" it). The coordinator script's `-plugin-path` (SDK platform
+  `.../host/plugins`) expands ToolCallCardView's SwiftUI `@State` macros; without
+  it the plugin server answers malformed. Keep it.
 
 Writing tests: use `RenderTestHelper` in `RenderingTests/TestHelpers.swift`; keep
 `TranscriptText.measuredHeight` equal to the cell's layout-manager height (pass
@@ -170,8 +167,6 @@ real `pi` or hit a live model.
   "Unable to locate a Java Runtime" is Spotlight catalog discovery
   (`JavaLaunching.framework`) with indexing disabled; set `JAVA_HOME` to the
   JDK's `Contents/Home`.
-- **xcodebuild package resolution also needs the git-config reads** — SPM shells
-  out to git, so a denied `~/.gitconfig` fails the whole build.
 - **Python `multiprocessing` needs POSIX IPC** (`ipc-posix-sem`/`ipc-posix-shm`),
   or `Lock()`/`SharedMemory` raise `Operation not permitted`.
 

@@ -17,13 +17,14 @@ final class FontSettings {
 
     /// Presets offered in the View menu.
     static let presets: [(name: String, size: CGFloat)] = [
-        ("Small", 11),
-        ("Regular", 13),
+        ("Small", 12),
+        ("Regular", 14),
         ("Large", 16),
         ("Extra Large", 19),
     ]
 
-    static let defaultSize: CGFloat = 13
+    /// The readable default body size (see `MarkdownStyle`).
+    static let defaultSize: CGFloat = 14
 
     var bodySize: CGFloat {
         didSet {
