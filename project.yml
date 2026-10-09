@@ -53,13 +53,19 @@ targets:
     type: application
     platform: macOS
     sources:
-      - Client
-    resources:
-      # The agent skills this app bundles (the `file-reference-links` skill).
-      # Copied into the bundle as Resources/Skills/… and registered with pi's
-      # GLOBAL settings at app launch — the skill content lives in the app
-      # bundle, never written into the pi folder.
-      - Client/Resources/Skills
+      # The agent skills this app bundles (the `file-reference-links` skill)
+      # live under Resources/Skills. Copy them as a FOLDER REFERENCE so the
+      # bundle keeps the `Skills/<name>/SKILL.md` layout the installer reads
+      # (a plain source entry would flatten SKILL.md to the Resources root).
+      # At launch the app installs them into `~/.pi/agent/skills` — see
+      # `BundledSkill` for why that path (and not settings.json) keeps the
+      # provider prompt cache stable.
+      - path: Client
+        excludes:
+          - "Resources/Skills/**"
+      - path: Client/Resources/Skills
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: Core
         embed: true

@@ -34,19 +34,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // mode onto NSApplication.appearance; the toolbar/menu reuse it.
         _ = AppearanceSettings.shared
 
-        // Register the bundled skills directory in pi's GLOBAL settings, so
-        // every session the app spawns can load the app-bundled skills (the
-        // `file-reference-links` skill the agent is taught to use). The skill
-        // files live in the app bundle (Resources/Skills) — this only writes
-        // the pointer to ~/.pi/agent/settings.json and never touches any pi
-        // file otherwise. Off the main thread: a once-at-launch file read.
+        // Install the app-bundled agent skills into pi's user skills
+        // directory (`~/.pi/agent/skills`), which pi scans by default, so
+        // every session the app spawns can load them (the
+        // `file-reference-links` skill the agent is taught to use). This
+        // deliberately does NOT edit pi's global settings.json: installing at
+        // a fixed path keeps the skill's `<location>` — and therefore the
+        // system-prompt prefix the provider caches — stable across launches
+        // and builds. Runs BEFORE the first session can spawn so the skill is
+        // present from its very first request; it is one small file copy.
         if let resources = Bundle.main.resourceURL {
             let skills = resources.appendingPathComponent("Skills", isDirectory: true)
             let bundledSkill = skills.appendingPathComponent("file-reference-links/SKILL.md")
             if FileManager.default.fileExists(atPath: bundledSkill.path) {
-                Task.detached(priority: .utility) {
-                    PiAgentSettings.registerSkillsDirectory(skills)
-                }
+                BundledSkill.install(from: skills)
             }
         }
         // Single-window app: if a second main window ever appears (e.g. via

@@ -3,8 +3,10 @@ import Foundation
 /// Local-filesystem session discovery for the Resume menu (§7 of the design).
 ///
 /// pi owns session storage: `~/.pi/agent/sessions/--<cwd with / → ->--/`.
-/// The client only *reads* this directory (never writes into `~/.pi`); to
-/// actually open a session it sends `switch_session` over RPC.
+/// The client only *reads* this directory; to actually open a session it
+/// sends `switch_session` over RPC. (The one write anywhere in `~/.pi` is
+/// installing the app's bundled skill into `~/.pi/agent/skills` at launch —
+/// see `BundledSkill`.)
 public enum SessionListing {
     public static func sessionsDirectory(for cwd: URL) -> URL {
         let home = FileManager.default.homeDirectoryForCurrentUser

@@ -11,7 +11,13 @@ Status: pre-alpha; already what yours truly uses for pi on a daily basis.
 
 On Mac OS, follow the Pi [Quickstart](https://pi.dev/docs/latest/quickstart). 
 
-This project does not configure Pi or your authentication with an LLM provider.
+This project does not configure Pi's providers or your authentication with an
+LLM provider. On launch it does install its one bundled agent skill
+(`file-reference-links`) into `~/.pi/agent/skills/`, pi's user skills
+directory, so the agent can emit clickable file references. It is a plain
+directory install (no `settings.json` edit) at a fixed path, which keeps the
+skill's location — and the provider's cached system-prompt prefix — stable
+across launches and builds.
 
 Then, build and run with:
 

@@ -632,8 +632,11 @@ public final class SessionViewModel {
     }
 
     /// Sends all queued steering messages as one combined prompt. On failure
-    /// the combined text is kept so the next settle retries instead of losing
-    /// the user's steering.
+    /// the combined text is returned to the prompt input for editing — never
+    /// retried automatically: the prompt may already have reached pi before
+    /// the failure (a lost/timed-out response), and an automatic retry would
+    /// record it twice, diverging the session and breaking the provider
+    /// prompt cache.
     private func flushQueuedSteering() async {
         guard !queuedSteering.isEmpty else { return }
         let combined = queuedSteeringText
@@ -641,7 +644,7 @@ public final class SessionViewModel {
         do {
             try await sendPrompt(combined)
         } catch {
-            queuedSteering = [combined]
+            onRestoreSteeringToInput?(combined)
         }
     }
 

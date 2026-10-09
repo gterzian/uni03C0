@@ -68,9 +68,10 @@ The provider caches the session's prompt prefix, so request bytes must stay
 identical whether driven from the app or the TUI. pi owns the data; the app is a
 read-only mirror. **Never alter what pi records or sends for the same actions.**
 
-- The app never writes session data; it reads only through pi's read-only RPCs
+- The app never writes *session* data; it reads only through pi's read-only RPCs
   (`get_state`, `get_messages`, `get_session_stats`, `get_available_models`,
-  `get_available_thinking_levels`).
+  `get_available_thinking_levels`). Its one `~/.pi` write is the bundled-skill
+  install at a fixed `~/.pi/agent/skills/<name>/SKILL.md`, never `settings.json`.
 - Send only the commands pi's TUI sends, for the same user actions. Session
   defaults are pi's: never force or auto-change the model or thinking level, and
   offer exactly what `get_available_thinking_levels` reports.
@@ -81,6 +82,7 @@ read-only mirror. **Never alter what pi records or sends for the same actions.**
   and nothing derived from them may feed back into what pi records.
 - One deliberate deviation: queued steering flushes as ONE combined prompt,
   appended in order — never re-sent, split, or reordered.
+- Accepted app-vs-TUI byte differences: `scratchpad/tui-vs-app-differences.md`.
 
 Ask before a feature: does it change what pi records or sends? If yes, find another way.
 
@@ -167,8 +169,6 @@ real `pi` or hit a live model.
   "Unable to locate a Java Runtime" is Spotlight catalog discovery
   (`JavaLaunching.framework`) with indexing disabled; set `JAVA_HOME` to the
   JDK's `Contents/Home`.
-- **Python `multiprocessing` needs POSIX IPC** (`ipc-posix-sem`/`ipc-posix-shm`),
-  or `Lock()`/`SharedMemory` raise `Operation not permitted`.
 
 ---
 
