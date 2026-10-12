@@ -436,6 +436,52 @@ final class CoordinatorNavigationTests: XCTestCase {
             "a narrower column wraps the settled reply more; its height must be re-queried, not kept at the old width's")
     }
 
+    /// The resize FREEZE regression: a column-width change invalidates EVERY
+    /// materialized row's (id, width)-keyed cache entry, so the old blanket
+    /// `noteHeightOfRows(0..<numberOfRows)` made the table re-typeset the whole
+    /// window on the main thread — hundreds of full markdown parses + CoreText
+    /// measures per resize frame. The fix re-queries only the visible window
+    /// plus its render-ahead buffer; the rest is seeded off the main thread.
+    /// This asserts the synchronous query count is bounded by the viewport, not
+    /// the materialized window size.
+    func testWindowResizeReQueriesOnlyTheVisibleWindow() {
+        let vm = SessionViewModel()
+        let coordinator = Coordinator()
+        let sv = coordinator.makeScrollView(viewModel: vm)
+        sv.frame = NSRect(x: 0, y: 0, width: 900, height: 300)
+        // Enough turns that the materialized window holds far more rows than
+        // the viewport can show; each reply wraps to several lines.
+        let reply = (0..<80).map { "word\($0)" }.joined(separator: " ")
+        for t in 0..<120 {
+            foldTurn(vm.store, user: "question \(t)", reply: reply)
+        }
+        // Materialize before the window exists, then give it a real window so
+        // `setFrame` drives the live window → scroll view → clip view → table →
+        // column chain exactly like the app.
+        vm.onTranscriptChange?()
+        sv.layoutSubtreeIfNeeded()
+        let (window, _) = makeWindow(sv)
+        sv.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        let tableView = coordinator.tableView!
+        let windowRows = tableView.numberOfRows
+        XCTAssertGreaterThan(windowRows, 30,
+            "precondition: the materialized window is larger than the viewport (got \(windowRows) rows)")
+
+        coordinator.heightOfRowQueryCountForTesting = 0
+        window.setFrame(NSRect(x: 0, y: 0, width: 520, height: 300), display: true)
+        sv.layoutSubtreeIfNeeded()
+        tableView.layoutSubtreeIfNeeded()
+        spinRunLoop()
+
+        let queried = coordinator.heightOfRowQueryCountForTesting
+        XCTAssertGreaterThan(queried, 0,
+            "the visible rows must still be re-measured at the new width")
+        XCTAssertLessThan(queried, windowRows,
+            "a resize must re-query only the visible window + buffer, never all \(windowRows) materialized rows synchronously (queried \(queried))")
+    }
+
     // MARK: - Row height vs. rendered content (the top-clip regressions)
 
     /// The clipping invariant, on every materialized row that has a live cell:

@@ -256,6 +256,20 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     /// whose width actually changed).
     private var lastRowWidth: CGFloat = 0
 
+    /// A pending debounced off-main pre-measure at the current render width.
+    /// A live resize changes the width every frame; scheduling a full-window
+    /// pre-measure per frame would rebuild the whole spec list on the main
+    /// thread and repeatedly re-typeset the window off-main at widths that are
+    /// already stale. The debounce collapses a resize into ONE pre-measure at
+    /// the settled width — the rows the reader can see are re-queried
+    /// synchronously each frame instead (see `reconcileRowWidthIfChanged`).
+    private var widthPremeasureWorkItem: DispatchWorkItem?
+
+    /// Test hook: how many times the table asked `heightOfRow`. CoordinatorTests
+    /// assert that a column-width change re-queries only the visible window
+    /// (plus its render-ahead buffer), never the whole materialized transcript.
+    var heightOfRowQueryCountForTesting = 0
+
     /// Store indices whose row height the TABLE may no longer agree with. The
     /// cell is authoritative: a cell is rendered from the store's CURRENT
     /// content (`makeCell`), while the table's row rect can still hold a
@@ -971,6 +985,7 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        heightOfRowQueryCountForTesting += 1
         guard let store = viewModel?.store else { return 24 }
         let storeIndex = windowStart + row
         guard storeIndex >= 0, storeIndex < store.count, let entry = store.entry(at: storeIndex) else { return 24 }
@@ -1268,17 +1283,57 @@ final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         reconcileRowWidthIfChanged()
     }
 
-    /// Re-queries every materialized row's height when the render width
-    /// changed. The cache is (id, width)-keyed, so only the width-changed
-    /// rows actually re-measure. `noteHeightOfRows` merely marks the cached
-    /// heights dirty; the table re-queries `heightOfRow` on its next layout.
+    /// Re-queries the visible rows' heights when the render width changed. The
+    /// cache is (id, width)-keyed, so only the width-changed rows actually
+    /// re-measure. `noteHeightOfRows` merely marks the cached heights dirty;
+    /// the table re-queries `heightOfRow` on its next layout.
+    ///
+    /// CRITICAL: only the visible window (plus a render-ahead buffer) is
+    /// re-queried synchronously. A row cache-miss here is a full markdown
+    /// parse + CoreText `boundingRect` on the MAIN thread, and a width change
+    /// invalidates EVERY materialized row at once — so noting the whole window
+    /// (the old behavior) made a resize re-typeset hundreds of rows per frame,
+    /// beachballing the main thread. Bounded by the viewport instead, the
+    /// remaining rows are seeded off the main thread (`scheduleWidthPremeasure`)
+    /// and any row the table still holds at the old width self-heals through
+    /// `makeCell`'s height re-query when it scrolls into view.
     private func reconcileRowWidthIfChanged() {
         guard let tableView else { return }
         let width = rowWidth(in: tableView)
-        if abs(width - lastRowWidth) > 0.5 {
-            lastRowWidth = width
-            tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<tableView.numberOfRows))
+        guard abs(width - lastRowWidth) > 0.5 else { return }
+        lastRowWidth = width
+        noteRowsLaidOutAtNewWidth()
+        scheduleWidthPremeasure()
+    }
+
+    /// Marks the rows the table may have laid out (and the reader can reach)
+    /// for a synchronous re-measure at the new width: the visible rows plus one
+    /// viewport of render-ahead on either side. Anything beyond is served from
+    /// the off-main pre-measure or re-queries itself on scroll.
+    private func noteRowsLaidOutAtNewWidth() {
+        guard let tableView else { return }
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.length > 0 else { return }
+        let buffer = viewportRows()
+        let start = max(0, visible.location - buffer)
+        let end = min(tableView.numberOfRows, visible.location + visible.length + buffer)
+        guard end > start else { return }
+        tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: start..<end))
+    }
+
+    /// Debounced off-main pre-measure of the whole materialized window at the
+    /// settled render width. Cancelled and rescheduled on every width change
+    /// (a live resize fires many), so only the final width is measured — the
+    /// rows stay height-cached for whoever scrolls to them (the render-ahead
+    /// invariant), without the main-thread cost scaling with window size.
+    private func scheduleWidthPremeasure() {
+        widthPremeasureWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let store = self.viewModel?.store else { return }
+            self.schedulePremeasure(entries: (self.windowStart..<self.windowEnd).compactMap { store.entry(at: $0) })
         }
+        widthPremeasureWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: item)
     }
 
     private func reconcileOnScroll() {
