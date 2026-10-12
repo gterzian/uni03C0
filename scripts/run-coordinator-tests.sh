@@ -44,6 +44,7 @@ CORE_OBJECTS="$(find "$BUILD" -name '*.o' ! -path '*ClientTests*')"
 
 swiftc -swift-version 6 -default-isolation MainActor \
   -target arm64-apple-macosx26.0 -sdk "$(xcrun --show-sdk-path)" \
+  -plugin-path "$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins" \
   -o "$OUT/coordtests" \
   CoordinatorTests/Harness/main.swift \
   CoordinatorTests/Harness/FontSettingsStub.swift \
