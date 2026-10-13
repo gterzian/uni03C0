@@ -114,4 +114,36 @@ final class TranscriptTextTests: XCTestCase {
             0
         )
     }
+
+    /// The invariant must hold for a LARGE row, not just a short one — a
+    /// multi-hundred-KB sent prompt is exactly the case that regressed.
+    func testMeasuredHeightMatchesCellForLargeText() {
+        let text = String(repeating: "abcdefghij klmnopqrst uvwxyz 0123456789\n", count: 4_000) // ~185k chars
+        let row = TextRowView(frame: NSRect(x: 0, y: 0, width: 800, height: 100))
+        row.configure(text: text, thinking: nil, role: .user, isStreaming: false)
+        row.layoutSubtreeIfNeeded()
+        let measured = TranscriptText.measuredHeight(
+            text: text, thinking: nil, role: .user, isStreaming: false, width: 800,
+            bodySize: FontSettings.shared.bodySize
+        )
+        XCTAssertEqual(measured, row.contentHeight, accuracy: 3)
+    }
+
+    /// Regression guard: `measuredHeight` must not fall back to
+    /// `NSAttributedString.boundingRect`, which is super-linear on large
+    /// strings — a sent large prompt echoed back into the transcript took tens
+    /// of seconds and beachballed the main thread. The layout-manager measure
+    /// is linear (~10x faster at this size). The bound is deliberately
+    /// generous so a slow machine cannot make this flaky; `boundingRect`
+    /// blows well past it.
+    func testLargeRowMeasurementIsLinearTime() {
+        let text = String(repeating: "abcdefghij klmnopqrst uvwxyz 0123456789\n", count: 4_000) // ~185k chars
+        let start = ProcessInfo.processInfo.systemUptime
+        _ = TranscriptText.measuredHeight(
+            text: text, thinking: nil, role: .user, isStreaming: false, width: 800,
+            bodySize: FontSettings.shared.bodySize
+        )
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        XCTAssertLessThan(elapsed, 2.0, "large-row measurement must stay linear")
+    }
 }

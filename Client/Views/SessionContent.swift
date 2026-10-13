@@ -252,6 +252,20 @@ struct SessionContent: View {
                 // avoided (see `GlassBackground`).
                 .background { GlassBackground(shape: .roundedRectangle(cornerRadius: 8)) }
             }
+            if vm.isPreparingPrompt {
+                // Large prompt just sent: pi is echoing it back and the
+                // transcript is laying it out. Show the in-app spinner so the
+                // app reads as busy while that happens — the row height now
+                // lays out in linear time (see `TranscriptText.layoutHeight`),
+                // so the main thread never shows the system beachball.
+                HStack(spacing: 6) {
+                    SpinnerView()
+                    Text("Sending…")
+                        .font(.system(size: 11))
+                }
+                .padding(12)
+                .background { GlassBackground(shape: .roundedRectangle(cornerRadius: 8)) }
+            }
             if vm.isFetchingOlder {
                 // Small spinner pinned to the top of the conversation
                 // while the coordinator fetches a block of older

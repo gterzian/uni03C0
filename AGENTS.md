@@ -198,9 +198,14 @@ real `pi` or hit a live model.
   `tableView.bounds.width` (which includes the ~32pt scroller gutter) over-reports,
   rendering the row short. Measure at the table column width (`rowWidth(in:)`) and
   convert layout-manager rects with `textView.convert(rect, to: row)`.
-- **Load-bearing invariant:** `TranscriptText.measuredHeight` (`boundingRect`,
-  `.usesFontLeading`) must equal the cell's layout-manager height; same usable
-  width (container − 2×8 padding) and same insets. Keep tests asserting it.
+- **Load-bearing invariant:** `TranscriptText.measuredHeight` must equal the
+  cell's layout-manager height; same usable width (container − 2×8 padding) and
+  same insets. Keep tests asserting it.
+- **Never measure a row with `NSAttributedString.boundingRect`** — it is
+  super-linear (a 435 KB message took ~29 s, a 1 MB one ~127 s) and beachballed
+  the main thread when a large sent prompt echoed back. `TranscriptText.layoutHeight`
+  uses a private `NSTextStorage`/`NSLayoutManager`/`NSTextContainer` stack
+  (linear, same height, safe off-main for the pre-measurer).
 - **`NSTextAttachmentViewProvider` is not exposed in Swift on this SDK.**
   Interactive elements use `NSTextAttachmentCell` (sized from `cellSize`); the
   chrome is overlay views positioned per code-block range.
