@@ -166,13 +166,35 @@ enum TranscriptText {
         let attributed = attributedString(text: text, thinking: thinking, role: role, isStreaming: isStreaming, cacheHitRate: cacheHitRate, cacheMiss: cacheMiss, bodySize: bodySize)
         guard attributed.length > 0 else { return 30 }
         let usableWidth = max(width - horizontalPadding, 60)
-        let bounds = attributed.boundingRect(
-            with: NSSize(width: usableWidth, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        )
         // +2px slack so the text view's layout-manager height never exceeds the
         // measured height (which would clip the last line).
-        return ceil(bounds.height) + verticalInset + 2
+        return ceil(layoutHeight(attributed, usableWidth: usableWidth)) + verticalInset + 2
+    }
+
+    /// The laid-out height of `attributed` at `usableWidth`, measured with a
+    /// private TextKit layout stack (the SAME engine the row's `NSTextView`
+    /// uses).
+    ///
+    /// `NSAttributedString.boundingRect` is super-linear on large strings — a
+    /// multi-hundred-KB message took tens of seconds and beachballed the app
+    /// when a sent prompt echoed back into the transcript (the main-thread
+    /// `heightOfRow` cache miss). The layout manager lays the same text out in
+    /// linear time (measured ~30x faster at 500KB), producing a byte-identical
+    /// height, so the row-height invariant is preserved. A fresh stack per call
+    /// keeps it safe on the background pre-measure worker too (TextKit layout
+    /// is thread-safe when the stack is not shared).
+    nonisolated static func layoutHeight(_ attributed: NSAttributedString, usableWidth: CGFloat) -> CGFloat {
+        let storage = NSTextStorage(attributedString: attributed)
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: usableWidth, height: CGFloat.greatestFiniteMagnitude))
+        // `usableWidth` already excludes the padding the row's text container
+        // applies (see `horizontalPadding`), so the measuring container carries
+        // none of its own.
+        container.lineFragmentPadding = 0
+        layoutManager.addTextContainer(container)
+        storage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: container)
+        return layoutManager.usedRect(for: container).height
     }
 }
 

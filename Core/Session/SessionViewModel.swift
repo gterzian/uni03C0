@@ -40,6 +40,16 @@ public final class SessionViewModel {
     /// the main thread. SwiftUI shows an in-app spinner from this; the main
     /// thread is never blocked.
     public private(set) var isReloading = false
+    /// True while a LARGE prompt is being submitted and the turn is starting —
+    /// pi has to echo the prompt back and the transcript has to lay it out.
+    /// Drives an in-app spinner (never the system beachball) so the app reads
+    /// as busy, not frozen. Cleared as soon as the turn starts streaming (or
+    /// settles / fails). Ordinary prompts do not set it.
+    public private(set) var isPreparingPrompt = false
+    /// A sent prompt longer than this shows `isPreparingPrompt`. Matches the
+    /// prompt input's windowed-paste budget: anything that gets windowed while
+    /// being pasted is large enough to notice when it echoes back.
+    private static let largePromptThreshold = 65_536
     /// Bumped each time `loadMessages` rebuilds the transcript (a session
     /// switch / resume / reload). The transcript view watches it so a rebuild
     /// ALWAYS repopulates the table, even if the `onTranscriptChange`
@@ -473,6 +483,7 @@ public final class SessionViewModel {
     public func stop() async {
         eventTask?.cancel()
         eventTask = nil
+        isPreparingPrompt = false
         stopContextPolling()
         stopToolTimeout()
         await controller.terminate()
@@ -500,12 +511,14 @@ public final class SessionViewModel {
         switch frame.type {
         case "agent_start", "turn_start":
             isStreaming = true
+            isPreparingPrompt = false
             startContextPolling()
         case "agent_end", "turn_end":
             // turn_end also fires BETWEEN tool rounds inside one agent run —
             // that is not the end of the work, so nothing is flushed here
             // (flushing here raced pi and collapsed the queue).
             isStreaming = false
+            isPreparingPrompt = false
 
         case "tool_execution_start":
             // A tool begins executing. Start the per-tool timeout: the
@@ -525,6 +538,7 @@ public final class SessionViewModel {
             // combined prompt (never one turn per message like the TUI) — or,
             // after an abort, return it to the input for editing instead.
             isStreaming = false
+            isPreparingPrompt = false
             isToolRunning = false
             stopToolTimeout()
             stopContextPolling()
@@ -587,6 +601,13 @@ public final class SessionViewModel {
         abortReturnsQueuedSteering = false
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // A very large prompt takes a visible moment to echo back and lay out;
+        // show the in-app spinner so the app reads as busy rather than
+        // freezing the main thread. Cleared by the turn-start frames (or
+        // below on failure).
+        if trimmed.utf16.count > Self.largePromptThreshold {
+            isPreparingPrompt = true
+        }
         do {
             let response = try await controller.send(.prompt(message: trimmed))
             if response.success == false {
@@ -594,6 +615,7 @@ public final class SessionViewModel {
             }
             lastError = nil
         } catch {
+            isPreparingPrompt = false
             // Surface send failures (auth/preflight/network) to the UI instead
             // of silently swallowing them.
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
