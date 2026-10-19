@@ -27,7 +27,7 @@ public struct RPCRequest: Sendable {
 }
 
 /// Convenience constructors for the commands the native client actually uses.
-/// Field names verified against pi 0.84.1's RPC implementation.
+/// Field names verified against pi 1.3.0's RPC implementation.
 public extension RPCRequest {
     static func getState() -> RPCRequest {
         RPCRequest(type: "get_state")

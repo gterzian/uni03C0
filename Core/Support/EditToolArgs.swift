@@ -14,7 +14,7 @@ public struct EditOperation: Hashable, Sendable {
     }
 }
 
-/// Decodes the edit tool's arguments (pi 0.84.1 `editSchema`):
+/// Decodes the edit tool's arguments (pi 1.3.0 `editSchema`):
 ///
 /// ```json
 /// { "path": "<file>", "edits": [{ "oldText": "...", "newText": "..." }] }
