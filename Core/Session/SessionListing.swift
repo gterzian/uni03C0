@@ -51,7 +51,10 @@ public enum SessionListing {
     /// Peek at a session file: parse the `session` header line, then scan
     /// forward only until we have a title (session name → first user message
     /// → filename), stopping as soon as we have enough.
-    private static func summarize(_ file: URL) -> Summary {
+    ///
+    /// Internal (not private) so tests can parse a fixture file without
+    /// touching `~/.pi`.
+    static func summarize(_ file: URL) -> Summary {
         var id = file.deletingPathExtension().lastPathComponent
         var timestamp: Date = .distantPast
         var title: String?
@@ -80,7 +83,10 @@ public enum SessionListing {
                     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                     timestamp = formatter.date(from: ts) ?? timestamp
                 }
-            case "set_session_name":
+            case "session_info":
+                // pi persists the display name as a `session_info` entry
+                // (`set_session_name` is the RPC command that creates one, not
+                // an entry type). Prefer it over the first user message.
                 if title == nil, let name = json["name"] as? String, !name.isEmpty {
                     title = name
                 }
